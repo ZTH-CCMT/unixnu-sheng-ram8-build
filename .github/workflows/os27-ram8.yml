@@ -1,0 +1,74 @@
+name: UniXNU sheng iPadOS 27 RAM 8 GiB
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sheng-os27-ram8-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: pipeline
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: UniXNU/UniXNU
+          ref: db32481cd5f17c98244a1f96eb00e41753e09987
+          path: UniXNU
+          submodules: recursive
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: UniXNU/UniXNU-sheng
+          ref: c7a034617b94e4f0826b8eb70db6bc612e1aa093
+          path: device
+          submodules: recursive
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: UniXNU/uefi-sheng
+          ref: 66421cb7bb5694843aec8de1ca3d1de4c20cca38
+          path: uefi-sheng
+          submodules: recursive
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: UniXNU/UniXNU-sm8550-common
+          ref: a9f45dc60c035084b95463781538380f4c3606c9
+          path: UniXNU-sm8550-common
+          persist-credentials: false
+      - name: Apply verified local source overlay
+        run: python3 pipeline/ci/materialize.py --top "$GITHUB_WORKSPACE"
+      - name: Install author build dependencies
+        run: |
+          brew install dtc llvm lld cmake mtools ninja glslang shaderc spirv-tools bison pkgconf rustup unifdef
+          brew install --formula blacktop/tap/ipsw
+          {
+            echo "$HOME/.cargo/bin"
+            for formula in llvm lld bison; do
+              echo "$(brew --prefix "$formula")/bin"
+            done
+          } >> "$GITHUB_PATH"
+          rustup toolchain install 1.98.0 --profile minimal --component rust-src
+      - name: Build and verify generic boot handoff
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 pipeline/ci/native_build.py --top "$GITHUB_WORKSPACE"
+      - name: Upload verified generic boot handoff
+        uses: actions/upload-artifact@v4
+        with:
+          name: os27-ram8-handoff-${{ github.run_id }}-${{ github.run_attempt }}
+          path: os27-ram8-handoff/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0

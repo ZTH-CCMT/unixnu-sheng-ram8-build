@@ -1,0 +1,184 @@
+{
+  "schema": "unixnu.sheng.ram8.source-overlay.v1",
+  "base_pins": {
+    "UniXNU": "db32481cd5f17c98244a1f96eb00e41753e09987",
+    "device": "c7a034617b94e4f0826b8eb70db6bc612e1aa093",
+    "uefi-sheng": "66421cb7bb5694843aec8de1ca3d1de4c20cca38",
+    "UniXNU-sm8550-common": "a9f45dc60c035084b95463781538380f4c3606c9",
+    "device/drivers/ShengNovatekTouch": "3b44b1b7603eaadae942ea44ddc51bdcc48ad060",
+    "device/drivers/ShengHidInput": "114061452959a547aaa08f9ca5aa54033394ca2f",
+    "device/drivers/ShengUfs": "57f031c99d7f69ffa611626bebaeab0731e93254"
+  },
+  "data": {
+    "path": "data/data.dbr",
+    "sha256": "e1bfa6971ef9fe6a27b53474c509cd518325459484230daf7f679642a04323b3",
+    "bytes": 1220736,
+    "logical_bytes": 230854492160,
+    "generic_cloud_seed_run": 41767751331,
+    "contains_live_device_data": false
+  },
+  "files": {
+    "UniXNU/patches/xnu-12377/native-4k-bootstrap-capacity.patch": {
+      "repository": "UniXNU",
+      "path": "patches/xnu-12377/native-4k-bootstrap-capacity.patch",
+      "before_sha256": "0f6e27ff7ffaa6daed425b6a57e2edce981f27cc5326845ee76b7b402531957b",
+      "sha256": "f233639595cc25d3defebdb38ce14638700b40f8afb8e2320aebdccca9cf8965"
+    },
+    "UniXNU/scripts/build-sheng-source-drivers.py": {
+      "repository": "UniXNU",
+      "path": "scripts/build-sheng-source-drivers.py",
+      "before_sha256": "e3ca14afe6c14b0745385da7399c4380a90be2237ad331bf64156dde29ddcc73",
+      "sha256": "58410351e584c574bfa313d8bac1c4fac502b9d74ec3615831ed427987509baf"
+    },
+    "device/board.toml": {
+      "repository": "device",
+      "path": "board.toml",
+      "before_sha256": "88b824800753cc7e79ae9dcd4ea4c92f351228126a3147dfc0ee81de0382e8b2",
+      "sha256": "e1a00aed4e32b6e29fc49856009471574d7f74c4332105b8d22d3bff82ee5173"
+    },
+    "device/drivers/ShengHidInput/NativeHidInput.cpp": {
+      "repository": "device/drivers/ShengHidInput",
+      "path": "NativeHidInput.cpp",
+      "before_sha256": "c0964bf7faa0332ce8d6334f2b74a271b269eee14112ae89b4453091604a10f6",
+      "sha256": "447c881b46c9b7829f8d5a040aef0f3b8cf85f7b9499370ea0571db4a38d0179"
+    },
+    "device/drivers/ShengHidInput/NativeHidTouchPlan.h": {
+      "repository": "device/drivers/ShengHidInput",
+      "path": "NativeHidTouchPlan.h",
+      "before_sha256": null,
+      "sha256": "b11592c16e451d7e37c7e3cb8505503e2737659a3c27648a64ec1016f8b2fd07"
+    },
+    "device/drivers/ShengHidInput/README.md": {
+      "repository": "device/drivers/ShengHidInput",
+      "path": "README.md",
+      "before_sha256": "43f6e46ac4f29170473fcd87fe2e42bf9e13041c7ef4568decd207f0a7004a39",
+      "sha256": "e614eae3bd5e236dcf4e6d788395d4878b305b2ea3fdc2e91bda3262baa1d678"
+    },
+    "device/drivers/ShengNovatekTouch/MODIFICATIONS.md": {
+      "repository": "device/drivers/ShengNovatekTouch",
+      "path": "MODIFICATIONS.md",
+      "before_sha256": null,
+      "sha256": "733ac03e317a9b89aafe45a6b31c3058b71759a0d1591a011307a8f3d53e1388"
+    },
+    "device/drivers/ShengNovatekTouch/NvtCoverage.c": {
+      "repository": "device/drivers/ShengNovatekTouch",
+      "path": "NvtCoverage.c",
+      "before_sha256": null,
+      "sha256": "90fc8983092cec95dfd38f8846f164de0070e061881344743d2d4cce918884f2"
+    },
+    "device/drivers/ShengNovatekTouch/NvtCoverage.h": {
+      "repository": "device/drivers/ShengNovatekTouch",
+      "path": "NvtCoverage.h",
+      "before_sha256": null,
+      "sha256": "2248985f573d2220b47cc70d744227b4a1e20778bce8eb323441279d17bd7529"
+    },
+    "device/drivers/ShengNovatekTouch/NvtPartialMathInline.h": {
+      "repository": "device/drivers/ShengNovatekTouch",
+      "path": "NvtPartialMathInline.h",
+      "before_sha256": null,
+      "sha256": "5570490c39f124dcd447ed65e559c57f4a685b211b461612d796371ca178db76"
+    },
+    "device/drivers/ShengNovatekTouch/NvtPartialObservation.c": {
+      "repository": "device/drivers/ShengNovatekTouch",
+      "path": "NvtPartialObservation.c",
+      "before_sha256": null,
+      "sha256": "7f7ea44e52ee01b902d3a417c7fd8290cb56d8954c7f125ac8438b7024406e04"
+    },
+    "device/drivers/ShengNovatekTouch/NvtPartialObservation.h": {
+      "repository": "device/drivers/ShengNovatekTouch",
+      "path": "NvtPartialObservation.h",
+      "before_sha256": null,
+      "sha256": "34bb1a2fe26130dd1efd71ac2727b26d53d6a90d2754f359576b7d811667eed6"
+    },
+    "device/drivers/ShengNovatekTouch/NvtProtocol.c": {
+      "repository": "device/drivers/ShengNovatekTouch",
+      "path": "NvtProtocol.c",
+      "before_sha256": "6c641cce6e6edd320042a7c29fc44722e596e9c212d278ae3f02afed1faa66ba",
+      "sha256": "e36aca444f6fe955325a6a0c43383c209ffd538a2ee1b98042e3ae9a6b0ff6b0"
+    },
+    "device/drivers/ShengNovatekTouch/NvtProtocol.h": {
+      "repository": "device/drivers/ShengNovatekTouch",
+      "path": "NvtProtocol.h",
+      "before_sha256": "c64465269b7a2ebf97b3c426505db91d77170e88a7cc8281e3916b166a0c9ed5",
+      "sha256": "49a2d6b1d021968825685c1f3e0b76dd366e020d53c815cb8b164e6043729553"
+    },
+    "device/drivers/ShengNovatekTouch/NvtShapeMetricsInline.h": {
+      "repository": "device/drivers/ShengNovatekTouch",
+      "path": "NvtShapeMetricsInline.h",
+      "before_sha256": null,
+      "sha256": "9b6d755a41819e1f1666a21da183b8e8ed4da9a0f075ca9315caf6f187524ed7"
+    },
+    "device/drivers/ShengNovatekTouch/NvtTouchCore.c": {
+      "repository": "device/drivers/ShengNovatekTouch",
+      "path": "NvtTouchCore.c",
+      "before_sha256": "9a972542ebcc3e53fc2470f2f4526f16a1f3a144989b1167d22fbbcdf75112b4",
+      "sha256": "a067b9ef18fa9f312732fcfc89890230293f595cb03d09a360b1c1e019f0391b"
+    },
+    "device/drivers/ShengNovatekTouch/NvtTouchCore.h": {
+      "repository": "device/drivers/ShengNovatekTouch",
+      "path": "NvtTouchCore.h",
+      "before_sha256": "d3bb77c1b7e47a00defce855d1c7b2e55c542eb8068a488722afcbcd3201d08e",
+      "sha256": "81a58af8dd0beb99029130842597a27a57269a1bae0a86b5c249b02dd0b05a1e"
+    },
+    "device/drivers/ShengNovatekTouch/README.md": {
+      "repository": "device/drivers/ShengNovatekTouch",
+      "path": "README.md",
+      "before_sha256": "afc1372f12511345d3890d9b1718fdd8b57ff7f710572f6793eb7910a0cb3af7",
+      "sha256": "83f12c534e087f84aa76926f92b9393062386cd8faa6bb4a264f96e86f055f7f"
+    },
+    "device/drivers/ShengNovatekTouch/Test/nvt-protocol.c": {
+      "repository": "device/drivers/ShengNovatekTouch",
+      "path": "Test/nvt-protocol.c",
+      "before_sha256": "e337e690bd04834ed2a7052feda5f07e9efeec185466d654a91516a9880aa65b",
+      "sha256": "fa515bb6008f7909c0ca118fdef0f87d3032fa2c02dc8552852ada9101d8c80a"
+    },
+    "device/drivers/ShengUfs/RootLayout.h": {
+      "repository": "device/drivers/ShengUfs",
+      "path": "RootLayout.h",
+      "before_sha256": "a188e7886917d5b8e02f6e7dbab648f5b6ca798584557f1216f5abfcdde67ea9",
+      "sha256": "385ccd6f5b1f6f1477e1f54c79f19531103f85ecdc422e17e89958b04ca15a85"
+    },
+    "device/package/TouchAstraProfile.h": {
+      "repository": "device",
+      "path": "package/TouchAstraProfile.h",
+      "before_sha256": null,
+      "sha256": "629a0ac74419565b06519c14722082b464280b3036e87d24b790507501744b8f"
+    },
+    "device/package/TouchEngine.h": {
+      "repository": "device",
+      "path": "package/TouchEngine.h",
+      "before_sha256": null,
+      "sha256": "4003ba3fd5cdd8e76b6ebf4263c0e9c86607ad49aa581b57f7278f715495b937"
+    },
+    "device/package/TouchProbe.cpp": {
+      "repository": "device",
+      "path": "package/TouchProbe.cpp",
+      "before_sha256": "4c79c17125fbc7f45ca97fda37dc8e67b30c77b51c3c1fc4721660084cde4902",
+      "sha256": "9c593b84875307a32983d464ee1fc795f5d3e684a2a2473f9335ecbe94502b6d"
+    },
+    "device/package/TouchReportTimeline.h": {
+      "repository": "device",
+      "path": "package/TouchReportTimeline.h",
+      "before_sha256": null,
+      "sha256": "4a654d48aef1930f270b32c16b75d60c8ac2a82d10f9619863e4f8fde128d95d"
+    },
+    "device/scripts/build-gop-legacy-display-27.py": {
+      "repository": "device",
+      "path": "scripts/build-gop-legacy-display-27.py",
+      "before_sha256": "8d2d30b863e53833c55b7d8992e6806df2a2079ecf5893e259a2eb752f0e1fed",
+      "sha256": "dac313ec35744bcf7b221119cac460d52b588028fd78fc10c80f67ad465d5399"
+    },
+    "device/scripts/build-gop-legacy-display.py": {
+      "repository": "device",
+      "path": "scripts/build-gop-legacy-display.py",
+      "before_sha256": "b90c10d1d1b0d07aaacc176727bb02e2b7e79f35fa42ff00af4048d77d5d7db0",
+      "sha256": "fb9f7531756d065d9487716ec4f24162736b6607486d095adb7c4349e755b958"
+    },
+    "uefi-sheng/Platforms/Xiaomi/shengPkg/Library/MemoryMapLib/MemoryMapLib.c": {
+      "repository": "uefi-sheng",
+      "path": "Platforms/Xiaomi/shengPkg/Library/MemoryMapLib/MemoryMapLib.c",
+      "before_sha256": "c162d99e6e5b8baaf48b305b2383ef5ad4aacac866ec72e3efbb3b40bf21280c",
+      "sha256": "bb7254e4f3eee270c9d15903112e14ed0433529be519e1cedea31b33fbe34f93"
+    }
+  }
+}

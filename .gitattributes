@@ -1,0 +1,3 @@
+/build-sources/overlay/** -text
+/build-sources/manifest.json -text
+/data/data.dbr -text
