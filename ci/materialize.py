@@ -54,7 +54,7 @@ def main():
     # The author's feeds.update_submodules leaves modified tracked submodules in place.
     expected = {
         spec['repository'] for spec in lock['files'].values()
-        if '/drivers/' in spec['repository']
+        if '/' in spec['repository']
     }
     dirty = set()
     for parent in ('UniXNU', 'device'):

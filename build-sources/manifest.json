@@ -9,7 +9,8 @@
     "device/drivers/ShengHidInput": "114061452959a547aaa08f9ca5aa54033394ca2f",
     "device/drivers/ShengUfs": "57f031c99d7f69ffa611626bebaeab0731e93254",
     "UniXNU/drivers/Adreno740": "a7c83cf7653f40aabe26f58b32b7e7218ebebd0f",
-    "UniXNU/drivers/RamBlock": "737f6dae119ef11990e77dc06bcead945098865e"
+    "UniXNU/drivers/RamBlock": "737f6dae119ef11990e77dc06bcead945098865e",
+    "UniXNU/kits/XnuPrelink": "8f4f3866545727e2dc3d2c8cb60f8a87a9539c12"
   },
   "data": {
     "path": "data/data.dbr",
@@ -205,6 +206,18 @@
       "path": "NativeRamBlock.cpp",
       "before_sha256": "772d47a069c50c9bf92f6c9292668340e005a61d996651033d9af2b6474b897c",
       "sha256": "e0b81ce526e01f50d7d84db8a251c1710a8c2c918a04bd27da26be1da2e17d04"
+    },
+    "UniXNU/kits/XnuPrelink/fileset_layout.py": {
+      "repository": "UniXNU/kits/XnuPrelink",
+      "path": "fileset_layout.py",
+      "before_sha256": "0799bffc6cbd37d7bcad438a93eb0dc721b05b6c43d2ff9b6cd0559099383cc9",
+      "sha256": "d449e53dc1c28a793c771612349c43c501301eb58a03ef029340abbd8b230370"
+    },
+    "UniXNU/kits/XnuPrelink/test_fileset_layout.py": {
+      "repository": "UniXNU/kits/XnuPrelink",
+      "path": "test_fileset_layout.py",
+      "before_sha256": "db1a60373197338e406eef531a0a76f265d4372b724b63fc6702f3c79750e679",
+      "sha256": "f274176646d2d93390f5c12304f1ab1cd072c55ab4cba9ef588bb117b99f5934"
     }
   }
 }
