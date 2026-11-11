@@ -4,7 +4,7 @@
     "UniXNU": "db32481cd5f17c98244a1f96eb00e41753e09987",
     "device": "c7a034617b94e4f0826b8eb70db6bc612e1aa093",
     "uefi-sheng": "66421cb7bb5694843aec8de1ca3d1de4c20cca38",
-    "UniXNU-sm8550-common": "a9f45dc60c035084b95463781538380f4c3606c9",
+    "UniXNU-sm8550-common": "97665e28578483082b674e8375a8fa65f4cf49cf",
     "device/drivers/ShengNovatekTouch": "3b44b1b7603eaadae942ea44ddc51bdcc48ad060",
     "device/drivers/ShengHidInput": "114061452959a547aaa08f9ca5aa54033394ca2f",
     "device/drivers/ShengUfs": "57f031c99d7f69ffa611626bebaeab0731e93254"

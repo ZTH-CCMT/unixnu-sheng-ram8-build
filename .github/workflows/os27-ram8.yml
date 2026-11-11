@@ -43,11 +43,14 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: UniXNU/UniXNU-sm8550-common
-          ref: a9f45dc60c035084b95463781538380f4c3606c9
+          ref: 97665e28578483082b674e8375a8fa65f4cf49cf
           path: UniXNU-sm8550-common
           persist-credentials: false
       - name: Apply verified local source overlay
-        run: python3 pipeline/ci/materialize.py --top "$GITHUB_WORKSPACE"
+        run: |
+          python3 pipeline/ci/materialize.py --top "$GITHUB_WORKSPACE"
+          python3 device/scripts/check-bluetooth-platform.py
+          python3 device/scripts/extract-files.py --section Keyboard
       - name: Install author build dependencies
         run: |
           brew install dtc llvm lld cmake mtools ninja glslang shaderc spirv-tools bison pkgconf rustup unifdef
