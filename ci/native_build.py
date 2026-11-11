@@ -18,6 +18,11 @@ DUMMY_CHIP = '13579bdf'
 RAM_BYTES = 8 * 1024**3
 DATA_BYTES = 215 * 1024**3
 SEED_SHA = 'e1bfa6971ef9fe6a27b53474c509cd518325459484230daf7f679642a04323b3'
+XNU_DEFAULT_CFLAGS = (
+    '-Wno-reserved-identifier -Wno-pre-c11-compat -Wno-missing-designated-field-initializers '
+    '-Wno-suggest-override -Wno-unnecessary-virtual-specifier '
+    '-Wno-suggest-destructor-override -Wno-ms-bitfield-padding'
+)
 WIFI_BASE = 'https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019'
 WIFI_PREFIX = 'ath12k/WCN7850/hw2.0/'
 WIFI_MANIFEST_SHA = 'f474f2a5a157bc59c804029532231a9a1cee16725018d37212972f11a0868570'
@@ -132,6 +137,10 @@ def main():
     from unixnu.runtime import seed_uuid
     expected_uuid = seed_uuid(core, seed)
     env = dict(os.environ, UNIXNU_UNIQUE_CHIP_ID=DUMMY_CHIP)
+    # The retained 24A446 fileset has a fixed executable window for XNU.
+    cflags = env.get('XNU_EXTRA_CFLAGS') or XNU_DEFAULT_CFLAGS
+    env['XNU_EXTRA_CFLAGS'] = f'{cflags} -Os'
+    print('Native iPadOS XNU optimization: -Os', flush=True)
     env.pop('UNIXNU_WIFI_JOIN', None)
     receipt = top / 'materialized-sources.json'
     require(json_file(receipt)['seed_sha256'] == SEED_SHA, 'Source staging seed identity differs')

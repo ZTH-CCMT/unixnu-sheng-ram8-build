@@ -63,15 +63,24 @@ jobs:
           } >> "$GITHUB_PATH"
           rustup toolchain install 1.98.0 --profile minimal --component rust-src
       - name: Build and verify generic boot handoff
+        id: native
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: python3 pipeline/ci/native_build.py --top "$GITHUB_WORKSPACE"
-      - name: Show final kernel linker diagnostics
-        if: failure()
+      - name: Report kernel linker and prelink geometry
+        if: always()
+        env:
+          NATIVE_OUTCOME: ${{ steps.native.outcome }}
         run: |
-          log=UniXNU/out/sheng/ipados-27.0.1-24A446/sheng_ipados27/logs/kernel.log
-          if [ -f "$log" ]; then
+          build=UniXNU/out/sheng/ipados-27.0.1-24A446/sheng_ipados27
+          log="$build/logs/kernel.log"
+          if [ "$NATIVE_OUTCOME" = failure ] && [ -f "$log" ]; then
             sed -n '/^Undefined symbols for architecture/,/^ld: symbol(s) not found/p' "$log"
+          fi
+          native="$build/tree/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837.unstripped.noctf"
+          cache=UniXNU/out/ipsw/24A446/kernelcache.decompressed
+          if [ -f "$native" ] && [ -f "$cache" ]; then
+            python3 -B pipeline/ci/prelink_budget.py UniXNU device/board.toml "$cache" "$native"
           fi
       - name: Upload verified generic boot handoff
         uses: actions/upload-artifact@v4
