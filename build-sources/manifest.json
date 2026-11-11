@@ -7,7 +7,9 @@
     "UniXNU-sm8550-common": "97665e28578483082b674e8375a8fa65f4cf49cf",
     "device/drivers/ShengNovatekTouch": "3b44b1b7603eaadae942ea44ddc51bdcc48ad060",
     "device/drivers/ShengHidInput": "114061452959a547aaa08f9ca5aa54033394ca2f",
-    "device/drivers/ShengUfs": "57f031c99d7f69ffa611626bebaeab0731e93254"
+    "device/drivers/ShengUfs": "57f031c99d7f69ffa611626bebaeab0731e93254",
+    "UniXNU/drivers/Adreno740": "a7c83cf7653f40aabe26f58b32b7e7218ebebd0f",
+    "UniXNU/drivers/RamBlock": "737f6dae119ef11990e77dc06bcead945098865e"
   },
   "data": {
     "path": "data/data.dbr",
@@ -166,7 +168,7 @@
       "repository": "device",
       "path": "scripts/build-gop-legacy-display-27.py",
       "before_sha256": "8d2d30b863e53833c55b7d8992e6806df2a2079ecf5893e259a2eb752f0e1fed",
-      "sha256": "dac313ec35744bcf7b221119cac460d52b588028fd78fc10c80f67ad465d5399"
+      "sha256": "df896cafd0c0c56f221c38318cd863a7ad5ca571485a55074bc7a3e63e1c0ca7"
     },
     "device/scripts/build-gop-legacy-display.py": {
       "repository": "device",
@@ -179,6 +181,30 @@
       "path": "Platforms/Xiaomi/shengPkg/Library/MemoryMapLib/MemoryMapLib.c",
       "before_sha256": "c162d99e6e5b8baaf48b305b2383ef5ad4aacac866ec72e3efbb3b40bf21280c",
       "sha256": "bb7254e4f3eee270c9d15903112e14ed0433529be519e1cedea31b33fbe34f93"
+    },
+    "device/package/BootLog.c": {
+      "repository": "device",
+      "path": "package/BootLog.c",
+      "before_sha256": "5c880128ff6bd54d60dec13cd9b18acb47d2d801ebfa6aac920b308d74f238c2",
+      "sha256": "d21a20fdd02d8930e302fd03c70fd08422b56f0fb62a88e445665c16f5091dd0"
+    },
+    "device/package/LegacyDisplayProbe.cpp": {
+      "repository": "device",
+      "path": "package/LegacyDisplayProbe.cpp",
+      "before_sha256": "5fdad718efd918cfa7b3e08c7f90fa275b1ccd00227db8587bf2d4f72cd44489",
+      "sha256": "200b2a23e016770a4a8d51ba099cc8367f853811450c55bab81f664f2dd01d8c"
+    },
+    "UniXNU/drivers/Adreno740/NativeAdrenoPublish.cpp": {
+      "repository": "UniXNU/drivers/Adreno740",
+      "path": "NativeAdrenoPublish.cpp",
+      "before_sha256": "ffb7601c5c16a44d2dd4e79bfc22024c985ef60680650c42c899c637ec707a48",
+      "sha256": "f178c5a67ce8329e907a4aedac6e548b964901aad5f1e000d575729b2d45c9d9"
+    },
+    "UniXNU/drivers/RamBlock/NativeRamBlock.cpp": {
+      "repository": "UniXNU/drivers/RamBlock",
+      "path": "NativeRamBlock.cpp",
+      "before_sha256": "772d47a069c50c9bf92f6c9292668340e005a61d996651033d9af2b6474b897c",
+      "sha256": "e0b81ce526e01f50d7d84db8a251c1710a8c2c918a04bd27da26be1da2e17d04"
     }
   }
 }

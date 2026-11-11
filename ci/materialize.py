@@ -8,11 +8,6 @@ import subprocess
 
 STAGE = Path(__file__).resolve().parents[1]
 LOCK = STAGE / 'build-sources/manifest.json'
-TOUCH_SUBMODULES = {
-    'drivers/ShengNovatekTouch',
-    'drivers/ShengHidInput',
-    'drivers/ShengUfs',
-}
 
 
 def digest(data):
@@ -57,10 +52,17 @@ def main():
         target.write_bytes(content)
 
     # The author's feeds.update_submodules leaves modified tracked submodules in place.
-    dirty = git(top / 'device', 'submodule', 'foreach', '--quiet',
-                'git diff --quiet HEAD -- 2>/dev/null || echo "$sm_path"').stdout.split()
-    if not TOUCH_SUBMODULES <= set(dirty):
-        raise SystemExit(f'Overlay submodules missing from update guard: {sorted(TOUCH_SUBMODULES - set(dirty))}')
+    expected = {
+        spec['repository'] for spec in lock['files'].values()
+        if '/drivers/' in spec['repository']
+    }
+    dirty = set()
+    for parent in ('UniXNU', 'device'):
+        paths = git(top / parent, 'submodule', 'foreach', '--quiet',
+                    'git diff --quiet HEAD -- 2>/dev/null || echo "$sm_path"').stdout.split()
+        dirty.update(f'{parent}/{path}' for path in paths)
+    if not expected <= dirty:
+        raise SystemExit(f'Overlay submodules missing from update guard: {sorted(expected - dirty)}')
     for target, content in writes:
         if target.read_bytes() != content:
             raise SystemExit(f'{target.relative_to(top)}: write-back differs')
@@ -70,10 +72,10 @@ def main():
         'seed_sha256': data['sha256'],
         'overlaid_files': len(writes),
         'base_pins': lock['base_pins'],
-        'preserved_dirty_submodules': sorted(TOUCH_SUBMODULES),
+        'preserved_dirty_submodules': sorted(expected),
     }
     (top / 'materialized-sources.json').write_text(json.dumps(receipt, indent=2) + '\n', encoding='utf-8')
-    print(f'Applied and verified {len(writes)} source files; protected {len(TOUCH_SUBMODULES)} submodules.')
+    print(f'Applied and verified {len(writes)} source files; protected {len(expected)} submodules.')
 
 
 if __name__ == '__main__':
