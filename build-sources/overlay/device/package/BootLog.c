@@ -130,7 +130,7 @@ extern void native_ufs_stats_text(char *, size_t) __attribute__((weak_import));
 extern volatile uint64_t native_ufs_block_reads __attribute__((weak_import)), native_ufs_read_ticks __attribute__((weak_import)),
     native_ufs_verify_ticks __attribute__((weak_import));
 extern volatile int native_staged_apps_stage __attribute__((weak_import));
-extern volatile int32_t native_buttons_stats[10] __attribute__((weak_import));
+extern volatile int32_t native_buttons_stats[12] __attribute__((weak_import));
 extern volatile int32_t native_keyboard_stats[17] __attribute__((weak_import));
 extern volatile int32_t native_keyboard_accel[4] __attribute__((weak_import));
 extern volatile int32_t native_keyboard_hid_stats[6] __attribute__((weak_import));
@@ -680,12 +680,12 @@ static size_t compose(char *out, size_t cap, uint32_t slot, unsigned now) {
     }
   }
   // Power and volume buttons (ButtonProbe.cpp): stage (3 armed, negative the failed step), interrupts, reports, pressed mask, the power and
-  // GPIO APIDs, interrupts of other APIDs cleared, PDC version, last error, spurious interrupts.
+  // GPIO APIDs, interrupts of other APIDs cleared, PDC version, last error, spurious interrupts, synthetic reports and failed level reads.
   if (&native_buttons_stats) {
-    char row[120];
-    snprintf(row, sizeof row, "B st=%d irq=%d rep=%d mask=%x apid=%d/%d off=%d pdc=%x err=%d spur=%d", native_buttons_stats[0], native_buttons_stats[1],
+    char row[160];
+    snprintf(row, sizeof row, "B st=%d irq=%d rep=%d mask=%x apid=%d/%d off=%d pdc=%x err=%d spur=%d sim=%d readerr=%d", native_buttons_stats[0], native_buttons_stats[1],
              native_buttons_stats[2], native_buttons_stats[3], native_buttons_stats[4], native_buttons_stats[5], native_buttons_stats[6],
-             native_buttons_stats[7], native_buttons_stats[8], native_buttons_stats[9]);
+             native_buttons_stats[7], native_buttons_stats[8], native_buttons_stats[9], native_buttons_stats[10], native_buttons_stats[11]);
     at = put(out, at, cap, row, sizeof row);
   }
   // Keyboard cover (KeyboardProbe.cpp): stage (7 serving, negative the failed step) and its detail, engine protocol and clock, boot ROM

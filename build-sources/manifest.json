@@ -38,7 +38,7 @@
       "repository": "device",
       "path": "board.toml",
       "before_sha256": "88b824800753cc7e79ae9dcd4ea4c92f351228126a3147dfc0ee81de0382e8b2",
-      "sha256": "e1a00aed4e32b6e29fc49856009471574d7f74c4332105b8d22d3bff82ee5173"
+      "sha256": "3dc994f338364dd3cd575a1ae7d28e284dd8aa5fc7bd22ffe10800d8b3433509"
     },
     "device/drivers/ShengHidInput/NativeHidInput.cpp": {
       "repository": "device/drivers/ShengHidInput",
@@ -188,7 +188,7 @@
       "repository": "device",
       "path": "package/BootLog.c",
       "before_sha256": "5c880128ff6bd54d60dec13cd9b18acb47d2d801ebfa6aac920b308d74f238c2",
-      "sha256": "d21a20fdd02d8930e302fd03c70fd08422b56f0fb62a88e445665c16f5091dd0"
+      "sha256": "197c98ec268bebd9ab8d202b123ba37969dadf6fc1f5e5a197087aebcf296140"
     },
     "device/package/LegacyDisplayProbe.cpp": {
       "repository": "device",
@@ -225,6 +225,12 @@
       "path": "ArmCpu.cpp",
       "before_sha256": "6fedbb45f78690e6c5d50c9f371491f8bb45bac0f676ec23dd87507dd1adf02d",
       "sha256": "edcd0f7b65f7f2dd2e03748f74a1316f7a853b0f24855ee7dc50082a77a540fb"
+    },
+    "device/package/ButtonProbe.cpp": {
+      "repository": "device",
+      "path": "package/ButtonProbe.cpp",
+      "before_sha256": "fe1c39eb478454a0bc8fc169db75f0a94c54d06142ee03315a827e9b7279aa2e",
+      "sha256": "7dffb68e6be26bf0ec2bfbb84cc56b91c48ddb5fe3213a216a62c1e8494abdcc"
     }
   }
 }
