@@ -230,7 +230,7 @@
       "repository": "device",
       "path": "patches/xnu-12377/sheng-cryptex-systemos-identity.patch",
       "before_sha256": null,
-      "sha256": "598f5b4280fe37cdd8225e53165a621a49d5ce8aa4cff7d70160b17542e6e941"
+      "sha256": "6ffccfc5b21c5c5aae2c6d28d57deb408b7f8a5602b5228e5e59ebb27ca558f8"
     },
     "device/patches/xnu-12377/series": {
       "repository": "device",
