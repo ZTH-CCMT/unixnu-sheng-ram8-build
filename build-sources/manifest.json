@@ -236,7 +236,13 @@
       "repository": "device",
       "path": "patches/xnu-12377/series",
       "before_sha256": "15d08ffeafa1d29ece607e4f2913c80cb1f403442b0a0cbf9625f8d60a2d2953",
-      "sha256": "5e31449c2b96826a3493f06a0279e75429796c1b3dd5b05fb2433d37a2138740"
+      "sha256": "8101db0c79418f5e7b38eab72bf3105964fa28b470017c153fb601b1e287889b"
+    },
+    "device/patches/xnu-12377/sheng-cryptex-webkit-native-view.patch": {
+      "repository": "device",
+      "path": "patches/xnu-12377/sheng-cryptex-webkit-native-view.patch",
+      "sha256": "e96a30e94cb919a9736390f8f81500808e8945b54d8e4cf7b19c120b807178ab",
+      "before_sha256": null
     }
   }
 }

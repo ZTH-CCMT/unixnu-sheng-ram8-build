@@ -1,0 +1,219 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -86,6 +86,7 @@
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <sys/filedesc.h>
++#include <sys/dirent.h>
+ #include <sys/kernel.h>
+ #include <sys/proc_internal.h>
+ #include <sys/kauth.h>
+@@ -8495,7 +8496,8 @@
+  * /System and /usr are bound read-only over /private/preboot/Cryptexes/OS/{System,usr}, not as unions, so a lookup there stays on the
+  * SystemOS volume and never meets the root's links again. The two mount points are owner Data directories under
+  * /private/var/ngpu/preboot, shown over the root's empty /private/preboot as a read-only union. Never fatal; stage and status go to the
+- * boot log: 1 mount points made, 2 preboot shown, 3 System bound, 4 usr bound, 5 WebKit visible, 6 the WebContent bundle's SystemOS identity round-trips. */
++ * boot log: 1 mount points made, 2 preboot shown, 3 System bound, 4 usr bound, 5 WebKit visible, 6 the WebContent bundle's SystemOS identity round-trips;
++ * 7 the Cryptex extension directory resolves directly to native SystemOS. */
+ volatile int native_cryptex_os_stage = 0;
+ volatile int native_cryptex_os_status = -1;
+ extern int native_bindfs_systemos_alias_mount;
+@@ -8572,6 +8574,171 @@
+ 	return error;
+ }
+ 
++/* The upper Library view may contribute only the compatibility link. */
++static int
++native_cryptex_webkit_check_source(vnode_t vp, vfs_context_t ctx)
++{
++	char *buffer = kalloc_data(4096, Z_WAITOK);
++	uio_t uio = buffer ? uio_create(1, 0, UIO_SYSSPACE, UIO_READ) : NULL;
++	int error = ENOMEM;
++	if (uio) {
++		int eof = 0;
++		bool found = false;
++		error = 0;
++		while (!error && !eof) {
++			uio_reset(uio, uio_offset(uio), UIO_SYSSPACE, UIO_READ);
++			uio_addiov(uio, CAST_USER_ADDR_T(buffer), 4096);
++			int count = 0;
++			error = VNOP_READDIR(vp, uio, 0, &eof, &count, ctx);
++			size_t used = 4096 - (size_t)uio_resid(uio);
++			if (!used) {
++				break;
++			}
++			for (size_t at = 0; !error && at < used;) {
++				struct dirent *entry = (struct dirent *)(buffer + at);
++				const size_t base = offsetof(struct dirent, d_name);
++				if (used - at < base || entry->d_reclen > used - at ||
++				    entry->d_reclen <= base + entry->d_namlen) {
++					error = EIO;
++					break;
++				}
++				const char *name = entry->d_name;
++				const bool dot = name[0] == '.' && (entry->d_namlen == 1 ||
++				    (entry->d_namlen == 2 && name[1] == '.'));
++				if (!dot) {
++					if (found || entry->d_namlen != sizeof("ExtensionKit") - 1 ||
++					    memcmp(name, "ExtensionKit", sizeof("ExtensionKit")) != 0) {
++						error = ENOTEMPTY;
++					}
++					found = true;
++				}
++				at += entry->d_reclen;
++			}
++		}
++		if (!error && !found) {
++			error = ENOENT;
++		}
++		uio_free(uio);
++	}
++	if (buffer) {
++		kfree_data(buffer, 4096);
++	}
++	return error;
++}
++
++/* Let namei follow the Cryptex ExtensionKit path onto native SystemOS.
++ * This keeps the directory, bundles, and their parents on one filesystem for
++ * LaunchServices' volume URL and bookmark queries. Only the alias Library
++ * gets an extra union layer; its other entries still come from SystemOS. */
++static int
++native_cryptex_webkit_view(proc_t p, user_addr_t scratch, vfs_context_t ctx)
++{
++#if defined(XNU_OWNER_CACHE_MOUNT) && XNU_OWNER_CACHE_MOUNT
++	if (!native_owner_cache_authorized || !native_owner_cache_native_union) {
++		return EPERM;
++	}
++#else
++	return ENOTSUP;
++#endif
++	static const char source[] = "/private/var/ngpu/cryptex-webkit";
++	static const char link[] = "/private/var/ngpu/cryptex-webkit/ExtensionKit";
++	static const char target[] = "/System/Library/ExtensionKit";
++	static const char directory[] = "/System/Library/ExtensionKit/Extensions";
++	static const char mountpoint[] = "/private/preboot/Cryptexes/OS/System/Library";
++	static const char alias[] = "/System/Cryptexes/OS/System/Library/ExtensionKit/Extensions";
++	vnode_t native = NULLVP, vp = NULLVP;
++	int32_t result = 0;
++	int error = vnode_lookup(directory, VNODE_LOOKUP_NOFOLLOW_ANY, &native, ctx);
++	if (error) {
++		return error;
++	}
++	if (!vnode_isdir(native) || vnode_mount(native) != vnode_mount(rootvnode) ||
++	    !(vfs_flags(vnode_mount(native)) & MNT_RDONLY)) {
++		error = EINVAL;
++		goto out;
++	}
++
++	error = native_gpu_addon_parents(p, scratch, link);
++	if (error) {
++		goto out;
++	}
++	error = vnode_lookup(source, VNODE_LOOKUP_NOFOLLOW_ANY, &vp, ctx);
++	if (error) {
++		goto out;
++	}
++	bool source_is_dir = vnode_isdir(vp);
++	vnode_put(vp);
++	if (!source_is_dir) {
++		error = ENOTDIR;
++		goto out;
++	}
++
++	struct symlink_args make_link = {.path = scratch + 0xc00, .link = scratch + 0xd00};
++	error = copyout(target, make_link.path, sizeof(target));
++	if (!error) {
++		error = copyout(link, make_link.link, sizeof(link));
++	}
++	if (!error) {
++		error = symlink(p, &make_link, &result);
++	}
++	if (error && error != EEXIST) {
++		goto out;
++	}
++	error = vnode_lookup(link, VNODE_LOOKUP_NOFOLLOW, &vp, ctx);
++	if (error) {
++		goto out;
++	}
++	bool is_link = vnode_vtype(vp) == VLNK;
++	vnode_put(vp);
++	if (!is_link) {
++		error = EINVAL;
++		goto out;
++	}
++	error = vnode_lookup("/private/var/ngpu/cryptex-webkit/ExtensionKit/Extensions",
++	    VNODE_LOOKUP_NOFOLLOW, &vp, ctx);
++	if (error) {
++		goto out;
++	}
++	error = vp == native ? 0 : EINVAL;
++	vnode_put(vp);
++	if (error) {
++		goto out;
++	}
++
++	error = vnode_lookup(source, VNODE_LOOKUP_NOFOLLOW_ANY, &vp, ctx);
++	if (error) {
++		goto out;
++	}
++	error = native_cryptex_webkit_check_source(vp, ctx);
++	vnode_put(vp);
++	if (error) {
++		goto out;
++	}
++
++	error = native_cryptex_os_bind(p, scratch, source, mountpoint, MNT_UNION, false);
++	if (error) {
++		goto out;
++	}
++	error = vnode_lookup(alias, VNODE_LOOKUP_NOFOLLOW, &vp, ctx);
++	if (!error) {
++		error = vp == native ? 0 : EINVAL;
++		vnode_put(vp);
++	}
++	if (error) {
++		struct unmount_args remove_view = {.path = scratch + 0xc00, .flags = 0};
++		int rollback = copyout(mountpoint, remove_view.path, sizeof(mountpoint));
++		if (!rollback) {
++			rollback = unmount(p, &remove_view, &result);
++		}
++		if (rollback) {
++			printf("[cryptex webkit] could not unmount view: %d\n", rollback);
++		}
++	}
++out:
++	vnode_put(native);
++	return error;
++}
++
+ static void
+ native_cryptex_os_view(proc_t p, user_addr_t scratch)
+ {
+@@ -8602,6 +8769,17 @@
+ 	}
+ 	native_cryptex_os_stage = 4;
+ 	vfs_context_t ctx = vfs_context_current();
++	uint32_t native_webkit_view = 0;
++	if (PE_parse_boot_argn("webkit-native-view", &native_webkit_view, sizeof(native_webkit_view)) &&
++	    native_webkit_view == 1) {
++		int native_error = native_cryptex_webkit_view(p, scratch, ctx);
++		printf("[cryptex webkit] native-view=%d\n", native_error);
++		if (!native_error) {
++			native_cryptex_os_stage = 7;
++			native_cryptex_os_status = 0;
++			return;
++		}
++	}
+ 	error = vnode_lookup("/System/Cryptexes/OS/System/Library/ExtensionKit/Extensions/WebContentExtension.appex/Info.plist",
+ 	    0, &probe, ctx);
+ 	if (!error) {
+@@ -8638,7 +8816,6 @@
+ /* LaunchServices' database of this Data store was built while /System/Cryptexes/OS led nowhere, so it never registered what lies behind
+  * it (WebKit's extensions among them) and lsd does not register system content again on a later boot of the same OS build. Its files
+  * are removed once, so lsd builds the database again with the path in place; the marker file keeps later boots from repeating it. */
+-#include <sys/dirent.h>
+ volatile int native_ls_store_status = -1;
+ static int
+ native_ls_store_names(const char *path, const char *prefix, char (*names)[64], unsigned max, unsigned *found)
