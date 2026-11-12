@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tomllib
 import urllib.request
+import zlib
 
 
 PROFILE = 'ipados-27.0.1-24A446'
@@ -18,6 +19,8 @@ DUMMY_CHIP = '13579bdf'
 RAM_BYTES = 8 * 1024**3
 DATA_BYTES = 215 * 1024**3
 SEED_SHA = 'e1bfa6971ef9fe6a27b53474c509cd518325459484230daf7f679642a04323b3'
+VIDEO_FIRMWARE = 'firmware/qcom/sm8550/sheng/vpu30_4v.mbn'
+VIDEO_FIRMWARE_SHA = '56c41b7b28694d261af67db40fa64a6f7076709171876fcc3abf0ce411506edb'
 XNU_DEFAULT_CFLAGS = (
     '-Wno-reserved-identifier -Wno-pre-c11-compat -Wno-missing-designated-field-initializers '
     '-Wno-suggest-override -Wno-unnecessary-virtual-specifier '
@@ -107,6 +110,30 @@ def fat_readback(image, relative, target):
         env=dict(os.environ, MTOOLS_SKIP_CHECK='1'))
 
 
+def verify_video_firmware(addon):
+    data = addon.read_bytes()
+    require(len(data) >= 24 and data[:8] == b'NGPUADD2', 'Invalid runtime addon header')
+    count, _, total_bytes = struct.unpack_from('<IIQ', data, 8)
+    require(total_bytes == len(data), 'Runtime addon size differs from header')
+    offset = 24
+    verified = False
+    for _ in range(count):
+        require(offset + 24 <= len(data), 'Truncated runtime addon entry')
+        name_size, mode, size, packed_size = struct.unpack_from('<IIQQ', data, offset)
+        name_offset = offset + 24
+        body_offset = name_offset + ((name_size + 7) & ~7)
+        offset = body_offset + ((packed_size + 7) & ~7)
+        require(1 <= name_size <= 160 and offset <= len(data), 'Invalid runtime addon entry bounds')
+        name = data[name_offset:name_offset + name_size]
+        if name == VIDEO_FIRMWARE.encode() + b'\0':
+            require(not verified and mode == 0o644, 'Duplicate or non-data VPU firmware entry')
+            firmware = zlib.decompress(data[body_offset:body_offset + packed_size])
+            require(len(firmware) == size and hashlib.sha256(firmware).hexdigest() == VIDEO_FIRMWARE_SHA,
+                    'Packed VPU firmware differs from the pinned input')
+            verified = True
+    require(verified and offset == len(data), 'VPU firmware missing or runtime addon entries incomplete')
+
+
 def property_bytes(name, value):
     data = struct.pack('<Q', value)
     return struct.pack('<32sI', name.encode(), len(data)) + data
@@ -131,7 +158,8 @@ def main():
             'iPadOS 27 memory selection differs from 8 GiB')
     spec = board['payload']['runtime']
     require(spec['data_gib'] == 215 and spec['wifi_launchd_cache'] and spec['appsync']
-            and spec['bluetooth_tool'], 'Required author runtime features differ')
+            and spec['bluetooth_tool'] and 'scripts/stage-video-firmware.py' in spec['firmware_tools'],
+            'Required author runtime features differ')
 
     sys.path.insert(0, str(core / 'scripts'))
     from unixnu.runtime import seed_uuid
@@ -149,7 +177,7 @@ def main():
     print(f'Available before native package: {shutil.disk_usage(top).free / 1024**3:.1f} GiB', flush=True)
     run('bash', device / 'scripts/package.sh', '--os', '27', '--uefi', uefi,
         '--local-module', f'soc:sm8550={top / "UniXNU-sm8550-common"}',
-        '--data-ramdisk', seed, cwd=device, env=env)
+        '--data-ramdisk', seed, '--kernel-arg', 'log-video=1', cwd=device, env=env)
 
     config_name = board['package']['defconfig'][PROFILE].removesuffix('_defconfig')
     print(f'Available after native package: {shutil.disk_usage(top).free / 1024**3:.1f} GiB', flush=True)
@@ -204,6 +232,12 @@ def main():
     fat_readback(payload, 'Payloads/scratch-data.img', packed_seed)
     require(digest(packed_seed) == SEED_SHA, 'Packed Data seed differs')
     packed_seed.unlink()
+    packed_addon = stage / 'packed-addon-check.bin'
+    fat_readback(payload, 'Payloads/kernel.macho.gpuaddon', packed_addon)
+    require(digest(packed_addon) == inputs['inputs']['gpu_addon']['sha256'], 'Packed runtime addon digest differs')
+    verify_video_firmware(packed_addon)
+    print(f'Verified packed video firmware {VIDEO_FIRMWARE}: SHA-256 {VIDEO_FIRMWARE_SHA}', flush=True)
+    packed_addon.unlink()
     touch = tree / 'build/native-legacy-display/touch-link-evidence.json'
     touch_sources = tree / 'build/sheng-source-drivers/report.json'
     evidence = json_file(touch)

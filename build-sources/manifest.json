@@ -2,9 +2,9 @@
   "schema": "unixnu.sheng.ram8.source-overlay.v1",
   "base_pins": {
     "UniXNU": "db32481cd5f17c98244a1f96eb00e41753e09987",
-    "device": "c7a034617b94e4f0826b8eb70db6bc612e1aa093",
+    "device": "e8937177309d88c93b305a57bad147fd5fac8a86",
     "uefi-sheng": "66421cb7bb5694843aec8de1ca3d1de4c20cca38",
-    "UniXNU-sm8550-common": "97665e28578483082b674e8375a8fa65f4cf49cf",
+    "UniXNU-sm8550-common": "2dc650ca76ae38715cd0712e60a44b14fe251745",
     "device/drivers/ShengNovatekTouch": "3b44b1b7603eaadae942ea44ddc51bdcc48ad060",
     "device/drivers/ShengHidInput": "114061452959a547aaa08f9ca5aa54033394ca2f",
     "device/drivers/ShengUfs": "57f031c99d7f69ffa611626bebaeab0731e93254",
@@ -37,8 +37,8 @@
     "device/board.toml": {
       "repository": "device",
       "path": "board.toml",
-      "before_sha256": "88b824800753cc7e79ae9dcd4ea4c92f351228126a3147dfc0ee81de0382e8b2",
-      "sha256": "e1a00aed4e32b6e29fc49856009471574d7f74c4332105b8d22d3bff82ee5173"
+      "before_sha256": "5da4c4676542fa0db6d208c330661a4eae6e630a33a20a6371ce1ba53e710e2b",
+      "sha256": "85f83e16b1abd82d97807035577bc98d9335e438314a8fe9e68925b186be856c"
     },
     "device/drivers/ShengHidInput/NativeHidInput.cpp": {
       "repository": "device/drivers/ShengHidInput",
@@ -169,8 +169,8 @@
     "device/scripts/build-gop-legacy-display-27.py": {
       "repository": "device",
       "path": "scripts/build-gop-legacy-display-27.py",
-      "before_sha256": "8d2d30b863e53833c55b7d8992e6806df2a2079ecf5893e259a2eb752f0e1fed",
-      "sha256": "df896cafd0c0c56f221c38318cd863a7ad5ca571485a55074bc7a3e63e1c0ca7"
+      "before_sha256": "1aaa180b5edb6a09f7c1858bafc3455080979751c990385279ab5deb0eb96c97",
+      "sha256": "773631f9e34cb77816387b40e67dcabc5e776743a2bc56d0a3f15658b97ba199"
     },
     "device/scripts/build-gop-legacy-display.py": {
       "repository": "device",
@@ -187,14 +187,14 @@
     "device/package/BootLog.c": {
       "repository": "device",
       "path": "package/BootLog.c",
-      "before_sha256": "5c880128ff6bd54d60dec13cd9b18acb47d2d801ebfa6aac920b308d74f238c2",
-      "sha256": "d21a20fdd02d8930e302fd03c70fd08422b56f0fb62a88e445665c16f5091dd0"
+      "before_sha256": "c3898c7bf328b0005701b72bf6aa444951a860dec5c5ebd3d8bd60059424316e",
+      "sha256": "0749fa590740766cd23052cc084227af2faa9ea6d0b01c84d9076af72d9515e1"
     },
     "device/package/LegacyDisplayProbe.cpp": {
       "repository": "device",
       "path": "package/LegacyDisplayProbe.cpp",
-      "before_sha256": "5fdad718efd918cfa7b3e08c7f90fa275b1ccd00227db8587bf2d4f72cd44489",
-      "sha256": "200b2a23e016770a4a8d51ba099cc8367f853811450c55bab81f664f2dd01d8c"
+      "before_sha256": "2710262ae6bcbdaa92cf8b2c40116f3c4b85a02e19233fe92e35ecc6cd3adb1e",
+      "sha256": "b1d45a85b83b963ca9846e40212f79963fd0e683a9e53b75525fd3195b4a46e7"
     },
     "UniXNU/drivers/Adreno740/NativeAdrenoPublish.cpp": {
       "repository": "UniXNU/drivers/Adreno740",
@@ -225,6 +225,18 @@
       "path": "ArmCpu.cpp",
       "before_sha256": "6fedbb45f78690e6c5d50c9f371491f8bb45bac0f676ec23dd87507dd1adf02d",
       "sha256": "edcd0f7b65f7f2dd2e03748f74a1316f7a853b0f24855ee7dc50082a77a540fb"
+    },
+    "UniXNU/scripts/build-boot-runtime.py": {
+      "repository": "UniXNU",
+      "path": "scripts/build-boot-runtime.py",
+      "before_sha256": "a3d15831a8e70308dadac39a82701488f63b760352511245b4d551413a5115b6",
+      "sha256": "e2f1480d76dc1acb1fc0f9e66c0e5e6797fb835f616e9c24358ca7bf7ee9849c"
+    },
+    "UniXNU/scripts/unixnu/runtime.py": {
+      "repository": "UniXNU",
+      "path": "scripts/unixnu/runtime.py",
+      "before_sha256": "466986fe025fa29e6368556aac4dd6b924e98800814ba944266fcdea7cf84ab6",
+      "sha256": "6d60ca8d20ca4db4d82e84d346daa9769280d3993b68b3dcd230fd63e1106ce8"
     }
   }
 }
