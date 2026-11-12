@@ -2,7 +2,7 @@
   "schema": "unixnu.sheng.ram8.source-overlay.v1",
   "base_pins": {
     "UniXNU": "db32481cd5f17c98244a1f96eb00e41753e09987",
-    "device": "e8937177309d88c93b305a57bad147fd5fac8a86",
+    "device": "b9223ad4020a669b1e62b11fb46c8fbcbafd9b1d",
     "uefi-sheng": "66421cb7bb5694843aec8de1ca3d1de4c20cca38",
     "UniXNU-sm8550-common": "2dc650ca76ae38715cd0712e60a44b14fe251745",
     "device/drivers/ShengNovatekTouch": "3b44b1b7603eaadae942ea44ddc51bdcc48ad060",
@@ -187,8 +187,8 @@
     "device/package/BootLog.c": {
       "repository": "device",
       "path": "package/BootLog.c",
-      "before_sha256": "c3898c7bf328b0005701b72bf6aa444951a860dec5c5ebd3d8bd60059424316e",
-      "sha256": "0749fa590740766cd23052cc084227af2faa9ea6d0b01c84d9076af72d9515e1"
+      "before_sha256": "9dda7caa7e6059e4403c6db435fcf6a97680efe9551fb05511600767c087bb81",
+      "sha256": "4160e8c194e42fdb1afce66766c817179b0474a224a0b72a5731fb426dda77cd"
     },
     "device/package/LegacyDisplayProbe.cpp": {
       "repository": "device",
