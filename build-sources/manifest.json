@@ -225,6 +225,18 @@
       "path": "ArmCpu.cpp",
       "before_sha256": "6fedbb45f78690e6c5d50c9f371491f8bb45bac0f676ec23dd87507dd1adf02d",
       "sha256": "edcd0f7b65f7f2dd2e03748f74a1316f7a853b0f24855ee7dc50082a77a540fb"
+    },
+    "device/patches/xnu-12377/sheng-cryptex-systemos-identity.patch": {
+      "repository": "device",
+      "path": "patches/xnu-12377/sheng-cryptex-systemos-identity.patch",
+      "before_sha256": null,
+      "sha256": "598f5b4280fe37cdd8225e53165a621a49d5ce8aa4cff7d70160b17542e6e941"
+    },
+    "device/patches/xnu-12377/series": {
+      "repository": "device",
+      "path": "patches/xnu-12377/series",
+      "before_sha256": "15d08ffeafa1d29ece607e4f2913c80cb1f403442b0a0cbf9625f8d60a2d2953",
+      "sha256": "5e31449c2b96826a3493f06a0279e75429796c1b3dd5b05fb2433d37a2138740"
     }
   }
 }

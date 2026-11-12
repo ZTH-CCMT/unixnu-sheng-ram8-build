@@ -1,0 +1,247 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index cc3c5d3..9624e43 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -8495,11 +8495,13 @@ native_gpu_addon_install(proc_t p, user_addr_t scratch)
+  * /System and /usr are bound read-only over /private/preboot/Cryptexes/OS/{System,usr}, not as unions, so a lookup there stays on the
+  * SystemOS volume and never meets the root's links again. The two mount points are owner Data directories under
+  * /private/var/ngpu/preboot, shown over the root's empty /private/preboot as a read-only union. Never fatal; stage and status go to the
+- * boot log: 1 mount points made, 2 preboot shown, 3 System bound, 4 usr bound, 5 an extension of WebKit visible through the path. */
++ * boot log: 1 mount points made, 2 preboot shown, 3 System bound, 4 usr bound, 5 WebKit visible, 6 its SystemOS identity round-trips. */
+ volatile int native_cryptex_os_stage = 0;
+ volatile int native_cryptex_os_status = -1;
++extern int native_bindfs_systemos_alias_mount;
+ static int
+-native_cryptex_os_bind(proc_t p, user_addr_t scratch, const char *source, const char *point, int flags)
++native_cryptex_os_bind(proc_t p, user_addr_t scratch, const char *source, const char *point, int flags,
++    bool systemos_alias)
+ {
+ 	struct mount_args request = {.type = scratch + 0xa00, .path = scratch + 0xa20, .flags = MNT_RDONLY | flags,
+ 	    .data = scratch + 0xb00};
+@@ -8510,10 +8512,66 @@ native_cryptex_os_bind(proc_t p, user_addr_t scratch, const char *source, const
+ 		return error;
+ 	}
+ 	native_bindfs_boot_mount = 1;
++	bool verified_systemos = false;
++#if defined(XNU_OWNER_CACHE_MOUNT) && XNU_OWNER_CACHE_MOUNT
++	verified_systemos = native_owner_cache_authorized && native_owner_cache_native_union;
++#endif
++	native_bindfs_systemos_alias_mount = systemos_alias && verified_systemos;
+ 	error = mount(p, &request, &result);
++	native_bindfs_systemos_alias_mount = 0;
+ 	native_bindfs_boot_mount = 0;
+ 	return error;
+ }
++
++/* Record whether the WebKit alias resolves to the canonical SystemOS file ID. */
++static int
++native_cryptex_systemos_identity(vnode_t alias, vfs_context_t ctx)
++{
++	static const char extension[] =
++	    "/System/Library/ExtensionKit/Extensions/WebContentExtension.appex/Info.plist";
++	struct vnode_attr attr;
++	vnode_t canonical = NULLVP, resolved = NULLVP, root = NULLVP;
++	int error = vnode_lookup("/", 0, &root, ctx);
++	if (error) {
++		return error;
++	}
++	mount_t systemos = vnode_mount(root);
++	fsid_t fsid = vfs_statfs(systemos)->f_fsid;
++	VATTR_INIT(&attr);
++	VATTR_WANTED(&attr, va_fsid64);
++	error = vnode_getattr(root, &attr, ctx);
++	if (!error && VATTR_IS_SUPPORTED(&attr, va_fsid64) && attr.va_fsid64.val[0] != fsid.val[0]) {
++		error = EINVAL;
++	}
++	if (!error) {
++		VATTR_INIT(&attr);
++		VATTR_WANTED(&attr, va_fsid64);
++		VATTR_WANTED(&attr, va_fileid);
++		error = vnode_getattr(alias, &attr, ctx);
++		if (!error && (!VATTR_ALL_SUPPORTED(&attr) || attr.va_fsid64.val[0] != fsid.val[0] ||
++		    attr.va_fsid64.val[1] != fsid.val[1])) {
++			error = EINVAL;
++		}
++	}
++	if (!error) {
++		error = vnode_getfromid(fsid.val[0], attr.va_fileid, ctx, 0, &resolved);
++	}
++	if (!error) {
++		error = vnode_lookup(extension, 0, &canonical, ctx);
++		if (!error && canonical != resolved) {
++			error = EINVAL;
++		}
++	}
++	if (canonical) {
++		vnode_put(canonical);
++	}
++	if (resolved) {
++		vnode_put(resolved);
++	}
++	vnode_put(root);
++	return error;
++}
++
+ static void
+ native_cryptex_os_view(proc_t p, user_addr_t scratch)
+ {
+@@ -8528,26 +8586,31 @@ native_cryptex_os_view(proc_t p, user_addr_t scratch)
+ 		return;
+ 	}
+ 	native_cryptex_os_stage = 1;
+-	if ((error = native_cryptex_os_bind(p, scratch, "/private/var/ngpu/preboot", "/private/preboot", MNT_UNION))) {
++	if ((error = native_cryptex_os_bind(p, scratch, "/private/var/ngpu/preboot", "/private/preboot", MNT_UNION, false))) {
+ 		native_cryptex_os_status = error;
+ 		return;
+ 	}
+ 	native_cryptex_os_stage = 2;
+-	if ((error = native_cryptex_os_bind(p, scratch, "/System", "/private/preboot/Cryptexes/OS/System", 0))) {
++	if ((error = native_cryptex_os_bind(p, scratch, "/System", "/private/preboot/Cryptexes/OS/System", 0, true))) {
+ 		native_cryptex_os_status = error;
+ 		return;
+ 	}
+ 	native_cryptex_os_stage = 3;
+-	if ((error = native_cryptex_os_bind(p, scratch, "/usr", "/private/preboot/Cryptexes/OS/usr", 0))) {
++	if ((error = native_cryptex_os_bind(p, scratch, "/usr", "/private/preboot/Cryptexes/OS/usr", 0, false))) {
+ 		native_cryptex_os_status = error;
+ 		return;
+ 	}
+ 	native_cryptex_os_stage = 4;
+-	error = vnode_lookup("/System/Cryptexes/OS/System/Library/ExtensionKit/Extensions/WebContentExtension.appex/Info.plist", 0, &probe,
+-	    vfs_context_current());
++	vfs_context_t ctx = vfs_context_current();
++	error = vnode_lookup("/System/Cryptexes/OS/System/Library/ExtensionKit/Extensions/WebContentExtension.appex/Info.plist",
++	    0, &probe, ctx);
+ 	if (!error) {
+-		vnode_put(probe);
+ 		native_cryptex_os_stage = 5;
++		error = native_cryptex_systemos_identity(probe, ctx);
++		vnode_put(probe);
++		if (!error) {
++			native_cryptex_os_stage = 6;
++		}
+ 	}
+ 	native_cryptex_os_status = error;
+ }
+diff --git a/bsd/miscfs/bindfs/bind_vfsops.c b/bsd/miscfs/bindfs/bind_vfsops.c
+index 7ccec6c..49e0f9d 100644
+--- a/bsd/miscfs/bindfs/bind_vfsops.c
++++ b/bsd/miscfs/bindfs/bind_vfsops.c
+@@ -79,6 +79,7 @@
+ #include "bindfs.h"
+ 
+ volatile int native_bindfs_boot_mount = 0;
++int native_bindfs_systemos_alias_mount = 0;
+ 
+ #define BINDFS_ENTITLEMENT "com.apple.private.bindfs-allow"
+ 
+@@ -236,7 +237,19 @@ bindfs_mount(struct mount * mp, __unused vnode_t devvp, user_addr_t user_data, v
+ 		xmp->bindm_flags |= BINDM_FORCE_ROOT;
+ 	}
+ 
+-	error = bindfs_vfs_getlowerattr(vnode_mount(lowerrootvp), &vfa, ctx);
++	/*
++	 * The boot-time Cryptex System view is an alias of the verified SystemOS
++	 * root volume. Keep the private mount ID for real-device lookups.
++	 */
++	mount_t lower_mount = vnode_mount(lowerrootvp);
++	if (native_bindfs_systemos_alias_mount && rootvnode != NULLVP &&
++	    lower_mount == vnode_mount(rootvnode) &&
++	    (vfs_flags(lower_mount) & MNT_RDONLY) &&
++	    (lower_mount->mnt_kern_flag & MNTK_PATH_FROM_ID)) {
++		xmp->bindm_flags |= BINDM_SYSTEMOS_IDENTITY;
++	}
++
++	error = bindfs_vfs_getlowerattr(lower_mount, &vfa, ctx);
+ 	if (error == 0) {
+ 		if (VFSATTR_IS_SUPPORTED(&vfa, f_bsize)) {
+ 			bsize = vfa.f_bsize;
+@@ -561,6 +574,14 @@ bindfs_vget(struct mount * mp, ino64_t ino, struct vnode ** vpp, vfs_context_t c
+ 	if (bindm == NULL || bindm->bindm_rootvp == NULLVP || bindm->bindm_lowerrootvp == NULLVP) {
+ 		return ENOTSUP;
+ 	}
++	if ((bindm->bindm_flags & BINDM_SYSTEMOS_IDENTITY) && ino == BIND_ROOT_INO) {
++		/* Explicit lookup by the bind mount's own FSID retains its root ID. */
++		error = vnode_get(bindm->bindm_rootvp);
++		if (error == 0) {
++			*vpp = bindm->bindm_rootvp;
++		}
++		return error;
++	}
+ 	error = VFS_VGET(vnode_mount(bindm->bindm_lowerrootvp), ino, &lowervp, ctx);
+ 	if (error) {
+ 		return error;
+diff --git a/bsd/miscfs/bindfs/bind_vnops.c b/bsd/miscfs/bindfs/bind_vnops.c
+index 0c659c7..0241c90 100644
+--- a/bsd/miscfs/bindfs/bind_vnops.c
++++ b/bsd/miscfs/bindfs/bind_vnops.c
+@@ -81,8 +81,6 @@
+ 
+ #include "bindfs.h"
+ 
+-#define BIND_ROOT_INO 2
+-
+ vop_t * bindfs_vnodeop_p = NULL;
+ 
+ static int
+@@ -101,11 +99,22 @@ bindfs_getattr(struct vnop_getattr_args * args)
+ 
+ 	error = vnode_getwithref(lowervp);
+ 	if (error == 0) {
+-		error = VNOP_GETATTR(lowervp, args->a_vap, args->a_context);
++		uint64_t flags = MOUNTTOBINDMOUNT(vnode_mount(args->a_vp))->bindm_flags;
++		bool systemos_identity = (flags & BINDM_SYSTEMOS_IDENTITY) &&
++		    !(args->a_vap->va_vaflags & VA_REALFSID);
++		if (systemos_identity) {
++			error = vnode_getattr(lowervp, args->a_vap, args->a_context);
++			if (!error && VATTR_IS_ACTIVE(args->a_vap, va_fsid64) &&
++			    !VATTR_IS_SUPPORTED(args->a_vap, va_fsid64)) {
++				VATTR_RETURN(args->a_vap, va_fsid64, vfs_statfs(vnode_mount(lowervp))->f_fsid);
++			}
++		} else {
++			error = VNOP_GETATTR(lowervp, args->a_vap, args->a_context);
++		}
+ 		vnode_put(lowervp);
+ 
+ 		if (error == 0) {
+-			if (MOUNTTOBINDMOUNT(vnode_mount(args->a_vp))->bindm_flags & BINDM_FORCE_ROOT) {
++			if (flags & BINDM_FORCE_ROOT) {
+ 				if (VATTR_IS_ACTIVE(args->a_vap, va_uid)) {
+ 					VATTR_RETURN(args->a_vap, va_uid, 0);
+ 				}
+@@ -113,6 +122,12 @@ bindfs_getattr(struct vnop_getattr_args * args)
+ 					VATTR_RETURN(args->a_vap, va_gid, 0);
+ 				}
+ 			}
++			/* A logical SystemOS FSID must be paired with its original inode IDs. */
++			if (systemos_identity) {
++				/* Keep the lower st_dev as well as the full ATTR_CMN_FSID. */
++				args->a_vap->va_vaflags |= VA_USEFSID;
++				return 0;
++			}
+ 			if (VATTR_IS_ACTIVE(args->a_vap, va_fsid)) {
+ 				/* fix up fsid so it doesn't say the underlying fs*/
+ 				VATTR_RETURN(args->a_vap, va_fsid, vfs_statfs(vnode_mount(args->a_vp))->f_fsid.val[0]);
+@@ -332,7 +347,8 @@ bindfs_readdir(struct vnop_readdir_args * ap)
+ 		goto lb_end;
+ 	}
+ 
+-	if (vnode_isvroot(vp) || (dvp != NULL && vnode_isvroot(dvp))) {
++	if (!(MOUNTTOBINDMOUNT(vnode_mount(vp))->bindm_flags & BINDM_SYSTEMOS_IDENTITY) &&
++	    (vnode_isvroot(vp) || (dvp != NULL && vnode_isvroot(dvp)))) {
+ 		size_t bufsize;
+ 		void * bufptr;
+ 		uio_t auio;
+diff --git a/bsd/miscfs/bindfs/bindfs.h b/bsd/miscfs/bindfs/bindfs.h
+index 4555530..af239df 100644
+--- a/bsd/miscfs/bindfs/bindfs.h
++++ b/bsd/miscfs/bindfs/bindfs.h
+@@ -84,6 +84,8 @@
+ /* Owner boot overlay (native_bindfs_boot_mount): report every file as owned by root:wheel. The backing directory is owner data made
+  * without root; launchd and the loader expect system-directory content to be root owned. Mode bits are left as they are. */
+ #define BINDM_FORCE_ROOT 0x80000000ULL
++#define BINDM_SYSTEMOS_IDENTITY 0x40000000ULL
++#define BIND_ROOT_INO 2
+ #define BINDM_CASEINSENSITIVE 0x0000000000000002
+ 
+ typedef int (*vop_t)(void *);
