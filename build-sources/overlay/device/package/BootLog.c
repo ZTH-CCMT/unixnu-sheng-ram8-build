@@ -542,7 +542,7 @@ static void prof_sort(uint64_t *v, size_t n) {
       t = v[root]; v[root] = v[c]; v[c] = t; root = c;}}
 }
 
-static uint32_t log_gpu_on, log_display_on;
+static uint32_t log_gpu_on, log_display_on, log_sys_on;
 // diag=1 (the writer sets these once): the slot's head line names it and the diagnostic export's time.
 static uint32_t log_diag_on, log_diag_export_at;
 // Where the writer's round is: the step (set before every call that leaves this file, so a round that never ends names the call it is
@@ -767,7 +767,7 @@ static size_t compose(char *out, size_t cap, uint32_t slot, unsigned now) {
   }
   // Threads stuck in an uninterruptible kernel wait for 20 s or more, in any process (BootUiTraceProbe.c boot_stuck_scan).
   LOG_AT("stuck scan");
-  if (&boot_stuck_scan && &boot_stuck_rows) {
+  if (log_sys_on && &boot_stuck_scan && &boot_stuck_rows) {
     static char rows[40][120];
     boot_stuck_scan(now);
     unsigned n = boot_stuck_rows(rows, 40);
@@ -2461,6 +2461,7 @@ static void log_groups_read(void) {
   for (unsigned g = 0; g < LogGroups; ++g) {uint32_t v = 0; if (PE_parse_boot_argn(log_group_arg[g], &v, sizeof v) && v == 1) log_group_on |= 1u << g;}
   log_gpu_on = !!(log_group_on & (1u << LogGpu));
   log_display_on = !!(log_group_on & (1u << LogDisplay));
+  log_sys_on = !!(log_group_on & (1u << LogSys));
 }
 // Drops, in place, the sections of the groups that are off; returns the new length.
 static size_t log_groups_filter(char *text, size_t length) {

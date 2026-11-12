@@ -188,7 +188,7 @@
       "repository": "device",
       "path": "package/BootLog.c",
       "before_sha256": "5c880128ff6bd54d60dec13cd9b18acb47d2d801ebfa6aac920b308d74f238c2",
-      "sha256": "d21a20fdd02d8930e302fd03c70fd08422b56f0fb62a88e445665c16f5091dd0"
+      "sha256": "57f5c55a895e0b7b2aced55b9eab91a4b9751def2bac8a183f1d2bf85d5af998"
     },
     "device/package/LegacyDisplayProbe.cpp": {
       "repository": "device",
