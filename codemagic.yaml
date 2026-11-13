@@ -1,0 +1,82 @@
+definitions:
+  macos_environment: &macos_environment
+    xcode: "26.6"
+    vars:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+
+  scripts:
+    - &check_runner
+      name: Check the Mac runner and iPhoneOS toolchain
+      script: |
+        set -eu
+        test "$(uname -m)" = arm64
+        sw_vers
+        xcodebuild -version
+        xcrun --sdk iphoneos --show-sdk-version
+        xcrun --sdk macosx --show-sdk-version
+        df -h "$CM_BUILD_DIR"
+        python3 -c 'import hashlib, tomllib'
+        printf '%s\n' 'int unixnu_sdk_probe;' | xcrun --sdk iphoneos clang \
+          -target arm64e-apple-ios27.0 \
+          -isysroot "$(xcrun --sdk iphoneos --show-sdk-path)" \
+          -x c -c -o /dev/null -
+
+    - &stage_sources
+      name: Check out pinned public sources and verify the iSH V4.0.1 overlay
+      script: |
+        set -eu
+        top="$CM_BUILD_DIR/.unixnu-build"
+        mkdir -p "$top"
+        ln -s "$CM_BUILD_DIR" "$top/pipeline"
+
+        checkout() {
+          name="$1"
+          repository="$2"
+          revision="$3"
+          git init -q "$top/$name"
+          git -C "$top/$name" remote add origin "https://github.com/$repository.git"
+          git -C "$top/$name" fetch --no-tags --depth=1 origin "$revision"
+          git -C "$top/$name" checkout --quiet --detach FETCH_HEAD
+          git -C "$top/$name" submodule update --init --recursive --depth=1
+        }
+
+        checkout UniXNU UniXNU/UniXNU db32481cd5f17c98244a1f96eb00e41753e09987
+        checkout device UniXNU/UniXNU-sheng c7a034617b94e4f0826b8eb70db6bc612e1aa093
+        checkout uefi-sheng UniXNU/uefi-sheng 66421cb7bb5694843aec8de1ca3d1de4c20cca38
+        checkout UniXNU-sm8550-common UniXNU/UniXNU-sm8550-common 97665e28578483082b674e8375a8fa65f4cf49cf
+        python3 "$CM_BUILD_DIR/ci/materialize.py" --top "$top"
+        python3 -B -m unittest discover -s "$top/UniXNU/kits/XnuPrelink" -p 'test_*.py'
+        cd "$top"
+        python3 device/scripts/check-bluetooth-platform.py
+        python3 device/scripts/extract-files.py --section Keyboard
+
+    - &build_handoff
+      name: Build and verify the generic boot handoff
+      script: |
+        set -eu
+        top="$CM_BUILD_DIR/.unixnu-build"
+        brew install dtc llvm lld cmake mtools ninja glslang shaderc spirv-tools bison pkgconf rustup unifdef
+        brew install --formula blacktop/tap/ipsw
+        export PATH="$HOME/.cargo/bin:$(brew --prefix llvm)/bin:$(brew --prefix lld)/bin:$(brew --prefix bison)/bin:$PATH"
+        rustup toolchain install 1.98.0 --profile minimal --component rust-src
+        python3 "$CM_BUILD_DIR/ci/native_build.py" --top "$top"
+        (
+          cd "$top/os27-ram8-handoff"
+          zip -0 -q -r "$CM_BUILD_DIR/os27-ram8-ish-v4.0.1-handoff.zip" .
+        )
+        cd "$CM_BUILD_DIR"
+        shasum -a 256 os27-ram8-ish-v4.0.1-handoff.zip > os27-ram8-ish-v4.0.1-handoff.zip.sha256
+
+workflows:
+  unixnu-ish-v401-handoff:
+    name: UniXNU iSH V4.0.1 ARM64e boot handoff
+    instance_type: mac_mini_m2
+    max_build_duration: 120
+    environment: *macos_environment
+    scripts:
+      - *check_runner
+      - *stage_sources
+      - *build_handoff
+    artifacts:
+      - os27-ram8-ish-v4.0.1-handoff.zip
+      - os27-ram8-ish-v4.0.1-handoff.zip.sha256
