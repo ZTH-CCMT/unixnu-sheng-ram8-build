@@ -56,9 +56,19 @@ definitions:
         set -eu
         top="$CM_BUILD_DIR/.unixnu-build"
         brew install dtc llvm lld cmake mtools ninja glslang shaderc spirv-tools bison pkgconf rustup unifdef
-        brew install --formula blacktop/tap/ipsw
-        export PATH="$HOME/.cargo/bin:$(brew --prefix llvm)/bin:$(brew --prefix lld)/bin:$(brew --prefix bison)/bin:$PATH"
+        # Use the same ARM64 extras release as the working GitHub runner.
+        tools="$top/tools"
+        mkdir -p "$tools"
+        archive="$tools/ipsw_3.1.745_macOS_arm64_extras.tar.gz"
+        curl --fail --show-error --silent --location --retry 3 --output "$archive" \
+          https://github.com/blacktop/ipsw/releases/download/v3.1.745/ipsw_3.1.745_macOS_arm64_extras.tar.gz
+        printf '%s  %s\n' dbc517ec63a1f9e0f77dcbd2638525d049ee99f3a936278c9176b4c87dcc1c45 "$archive" \
+          | shasum -a 256 -c -
+        tar -xzf "$archive" -C "$tools" ipsw
+        export PATH="$tools:$(brew --prefix rustup)/bin:$HOME/.cargo/bin:$(brew --prefix llvm)/bin:$(brew --prefix lld)/bin:$(brew --prefix bison)/bin:$PATH"
+        ipsw version
         rustup toolchain install 1.98.0 --profile minimal --component rust-src
+        cargo +1.98.0 --version
         python3 "$CM_BUILD_DIR/ci/native_build.py" --top "$top"
         (
           cd "$top/os27-ram8-handoff"
