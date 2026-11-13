@@ -277,27 +277,34 @@ static void nativeAdrenoHangcheck(void *,wait_result_t)
         IOLockLock(g.lock);
         bool hung=false;
         if(g.submit && !g.submit->hangCheck(&hung) && hung) {
-            native_adreno_recovery[0]=native_adreno_recovery[0]+1;
-            if(g.restart) {
+            if(!g.restart) {
+                native_adreno_recovery[0]=native_adreno_recovery[0]+1;
+            } else {
                 uint32_t fault[4]={};
                 if(g.context && !g.context->endFault(fault) && fault[0]) {
                     native_adreno_recovery_fault[0]=native_adreno_recovery_fault[0]+1;
                     for(unsigned i=0;i<4;++i)native_adreno_recovery_fault[1+i]=fault[i];
                 }
+                const uint32_t dead_reason=g.submit->deadReason();
                 NativeAdrenoRecovery result{};
                 const IOReturn status=g.submit->recover(g.restart,g.restart_cookie,&g.clock,&result);
+                if(result.completed_late) {
+                    IOLockUnlock(g.lock);
+                    fencePass(true);
+                    continue;
+                }
+                native_adreno_recovery[0]=native_adreno_recovery[0]+1;
                 native_adreno_recovery[3]=result.fence;native_adreno_recovery[4]=uint32_t(status?status:result.status);
                 native_adreno_recovery[5]=native_adreno_recovery[5]+result.replayed;
                 if(result.guilty)native_adreno_recovery[6]=native_adreno_recovery[6]+1;
                 if(result.guilty==g.vm)native_adreno_recovery[7]=native_adreno_recovery[7]+1;
                 if(status)native_adreno_recovery[2]=native_adreno_recovery[2]+1;
                 else native_adreno_recovery[1]=native_adreno_recovery[1]+1;
-                /* Only a GPU that did not come back is everyone's loss; after a restart every client goes on, as Metal's do. */
                 {
                     const uint32_t n=native_adreno_recover_log_count;volatile uint32_t *row=native_adreno_recover_log[n&7];
                     const uint64_t now=g.clock.now_us?g.clock.now_us(g.clock.cookie):0;
                     row[0]=n+1;row[1]=uint32_t(now);row[2]=uint32_t(now>>32);row[3]=result.fence;row[4]=uint32_t(status?status:result.status);
-                    row[5]=result.replayed;row[6]=(g.submit->lastRecoveryStranded()?1u:0u)|(result.guilty?2u:0u);row[7]=g.submit->deadReason();
+                    row[5]=result.replayed;row[6]=(g.submit->lastRecoveryStranded()?1u:0u)|(result.guilty?2u:0u);row[7]=dead_reason;
                     for(unsigned i=0;i<4;++i)row[8+i]=g.submit->recoveryInfo(i);
                     native_adreno_recover_log_count=n+1;
                 }

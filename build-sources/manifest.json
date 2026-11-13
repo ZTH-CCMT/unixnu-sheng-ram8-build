@@ -11,7 +11,8 @@
     "UniXNU/drivers/Adreno740": "a7c83cf7653f40aabe26f58b32b7e7218ebebd0f",
     "UniXNU/drivers/RamBlock": "737f6dae119ef11990e77dc06bcead945098865e",
     "UniXNU/kits/XnuPrelink": "8f4f3866545727e2dc3d2c8cb60f8a87a9539c12",
-    "UniXNU/drivers/ArmCpu": "d90e457b8392623853ec85c860feef546c767621"
+    "UniXNU/drivers/ArmCpu": "d90e457b8392623853ec85c860feef546c767621",
+    "UniXNU/drivers/GopFramebuffer": "b0d812d578efa2acb005b66f73168891719af09a"
   },
   "data": {
     "path": "data/data.dbr",
@@ -22,6 +23,96 @@
     "contains_live_device_data": false
   },
   "files": {
+    "UniXNU/drivers/Adreno740/NativeAdrenoPreempt.cpp": {
+      "repository": "UniXNU/drivers/Adreno740",
+      "path": "NativeAdrenoPreempt.cpp",
+      "before_sha256": "62b5bc2078be1b57eccaaf709ed7d66e215c119b98470bb38ae8bd18644ca58a",
+      "sha256": "7000ae4ac74a3313d6638489c1122296ac310792b8769d2c1983633ec5bd2a71"
+    },
+    "UniXNU/drivers/Adreno740/NativeAdrenoPreempt.h": {
+      "repository": "UniXNU/drivers/Adreno740",
+      "path": "NativeAdrenoPreempt.h",
+      "before_sha256": "33b1804ba28d36d5a8aa3c67ec6476f737803e1864c049804bb6fcd3512d91b6",
+      "sha256": "5e887c74a536998e8d427615f5b50384a56b24f611a79ce74d05581d58074b9b"
+    },
+    "UniXNU/drivers/Adreno740/NativeAdrenoPublish.cpp": {
+      "repository": "UniXNU/drivers/Adreno740",
+      "path": "NativeAdrenoPublish.cpp",
+      "before_sha256": "ffb7601c5c16a44d2dd4e79bfc22024c985ef60680650c42c899c637ec707a48",
+      "sha256": "733b97333456a68ee2c282803f5ac434cb7c6a0ccfeb1ffd2e5baa9642d59cb4"
+    },
+    "UniXNU/drivers/Adreno740/NativeAdrenoSubmit.cpp": {
+      "repository": "UniXNU/drivers/Adreno740",
+      "path": "NativeAdrenoSubmit.cpp",
+      "before_sha256": "6343e5fc8fbf8c1d8d1c053b07744372a452021018283da0db9f74ddf566461e",
+      "sha256": "b9cb731b8d8f9bac56f465691b7998f2aeffc316db0be857b5e1230e5768ea0f"
+    },
+    "UniXNU/drivers/Adreno740/NativeAdrenoSubmit.h": {
+      "repository": "UniXNU/drivers/Adreno740",
+      "path": "NativeAdrenoSubmit.h",
+      "before_sha256": "493d849685162d4efa3cd7fe0c0963685e50b11266673f2e56268d984aa4f9bb",
+      "sha256": "5e5e7d0ff19c92c97d44c324ec6441a0943775b18d0fde5f1abda001feb92837"
+    },
+    "UniXNU/drivers/Adreno740/tests/XnuMemoryFixture.h": {
+      "repository": "UniXNU/drivers/Adreno740",
+      "path": "tests/XnuMemoryFixture.h",
+      "before_sha256": "18f716267f696945de407b2927897b572b21f7bb4a6e91df8a63ee857d91a7f0",
+      "sha256": "812dc83cbb16402e004276af157c1b134a897871f75e84bfe510199990447b70"
+    },
+    "UniXNU/drivers/Adreno740/tests/test_preempt.cpp": {
+      "repository": "UniXNU/drivers/Adreno740",
+      "path": "tests/test_preempt.cpp",
+      "before_sha256": "e9be5cead892741646432e069bc26c443e584359ca82b403049ea6a859129cdb",
+      "sha256": "0fec6af938a5f647223078a98a011bb970ca1fbcc16328d188976d1078d5076f"
+    },
+    "UniXNU/drivers/Adreno740/tests/test_submit.cpp": {
+      "repository": "UniXNU/drivers/Adreno740",
+      "path": "tests/test_submit.cpp",
+      "before_sha256": "ea56b6eb4d9cf9936f472ed5bf622d7e9fe74773f2b11a78beb0ba1d7601a4fa",
+      "sha256": "b7d51f24de5ef3f3d98af14994515bf989d749b3e06ed5e027ad5eeecd925b19"
+    },
+    "UniXNU/drivers/ArmCpu/ArmCpu.cpp": {
+      "repository": "UniXNU/drivers/ArmCpu",
+      "path": "ArmCpu.cpp",
+      "before_sha256": "6fedbb45f78690e6c5d50c9f371491f8bb45bac0f676ec23dd87507dd1adf02d",
+      "sha256": "edcd0f7b65f7f2dd2e03748f74a1316f7a853b0f24855ee7dc50082a77a540fb"
+    },
+    "UniXNU/drivers/GopFramebuffer/NativeLegacyDisplay.cpp": {
+      "repository": "UniXNU/drivers/GopFramebuffer",
+      "path": "NativeLegacyDisplay.cpp",
+      "before_sha256": "465f5ebfe1df7228c66ecebd2b17a9971a7af64882efd132a907b1b0abacb78a",
+      "sha256": "03ead711c29455d56789cce279d3bfdbe8bc81bd32faf1073a0c7d30e9afdb07"
+    },
+    "UniXNU/drivers/GopFramebuffer/Test/check-fence-wait.py": {
+      "repository": "UniXNU/drivers/GopFramebuffer",
+      "path": "Test/check-fence-wait.py",
+      "before_sha256": "7815e789ac9f7a6d250fe3e5334b70ad0b879794442d96691593102ef8bdb792",
+      "sha256": "9cd00a50b2360522e4d14ce1be38cea0e0b9811a41c1019a6b21a3966ab96f18"
+    },
+    "UniXNU/drivers/RamBlock/NativeRamBlock.cpp": {
+      "repository": "UniXNU/drivers/RamBlock",
+      "path": "NativeRamBlock.cpp",
+      "before_sha256": "772d47a069c50c9bf92f6c9292668340e005a61d996651033d9af2b6474b897c",
+      "sha256": "e0b81ce526e01f50d7d84db8a251c1710a8c2c918a04bd27da26be1da2e17d04"
+    },
+    "UniXNU/kits/XnuPrelink/fileset_layout.py": {
+      "repository": "UniXNU/kits/XnuPrelink",
+      "path": "fileset_layout.py",
+      "before_sha256": "0799bffc6cbd37d7bcad438a93eb0dc721b05b6c43d2ff9b6cd0559099383cc9",
+      "sha256": "d449e53dc1c28a793c771612349c43c501301eb58a03ef029340abbd8b230370"
+    },
+    "UniXNU/kits/XnuPrelink/test_fileset_layout.py": {
+      "repository": "UniXNU/kits/XnuPrelink",
+      "path": "test_fileset_layout.py",
+      "before_sha256": "db1a60373197338e406eef531a0a76f265d4372b724b63fc6702f3c79750e679",
+      "sha256": "f274176646d2d93390f5c12304f1ab1cd072c55ab4cba9ef588bb117b99f5934"
+    },
+    "UniXNU/patches/mesa/turnip-darwin-kmd.patch": {
+      "repository": "UniXNU",
+      "path": "patches/mesa/turnip-darwin-kmd.patch",
+      "before_sha256": "da264be322fd914ead493fd24f056213d368c49ff800b79d980e68bc686971c6",
+      "sha256": "1d7c0feaffef0bfc87eea3fce68326fc00ba8c7f6b5c26328c392f4db2dd8940"
+    },
     "UniXNU/patches/xnu-12377/native-4k-bootstrap-capacity.patch": {
       "repository": "UniXNU",
       "path": "patches/xnu-12377/native-4k-bootstrap-capacity.patch",
@@ -142,6 +233,18 @@
       "before_sha256": "a188e7886917d5b8e02f6e7dbab648f5b6ca798584557f1216f5abfcdde67ea9",
       "sha256": "385ccd6f5b1f6f1477e1f54c79f19531103f85ecdc422e17e89958b04ca15a85"
     },
+    "device/package/BootLog.c": {
+      "repository": "device",
+      "path": "package/BootLog.c",
+      "before_sha256": "5c880128ff6bd54d60dec13cd9b18acb47d2d801ebfa6aac920b308d74f238c2",
+      "sha256": "d21a20fdd02d8930e302fd03c70fd08422b56f0fb62a88e445665c16f5091dd0"
+    },
+    "device/package/LegacyDisplayProbe.cpp": {
+      "repository": "device",
+      "path": "package/LegacyDisplayProbe.cpp",
+      "before_sha256": "5fdad718efd918cfa7b3e08c7f90fa275b1ccd00227db8587bf2d4f72cd44489",
+      "sha256": "200b2a23e016770a4a8d51ba099cc8367f853811450c55bab81f664f2dd01d8c"
+    },
     "device/package/TouchAstraProfile.h": {
       "repository": "device",
       "path": "package/TouchAstraProfile.h",
@@ -183,48 +286,8 @@
       "path": "Platforms/Xiaomi/shengPkg/Library/MemoryMapLib/MemoryMapLib.c",
       "before_sha256": "c162d99e6e5b8baaf48b305b2383ef5ad4aacac866ec72e3efbb3b40bf21280c",
       "sha256": "bb7254e4f3eee270c9d15903112e14ed0433529be519e1cedea31b33fbe34f93"
-    },
-    "device/package/BootLog.c": {
-      "repository": "device",
-      "path": "package/BootLog.c",
-      "before_sha256": "5c880128ff6bd54d60dec13cd9b18acb47d2d801ebfa6aac920b308d74f238c2",
-      "sha256": "d21a20fdd02d8930e302fd03c70fd08422b56f0fb62a88e445665c16f5091dd0"
-    },
-    "device/package/LegacyDisplayProbe.cpp": {
-      "repository": "device",
-      "path": "package/LegacyDisplayProbe.cpp",
-      "before_sha256": "5fdad718efd918cfa7b3e08c7f90fa275b1ccd00227db8587bf2d4f72cd44489",
-      "sha256": "200b2a23e016770a4a8d51ba099cc8367f853811450c55bab81f664f2dd01d8c"
-    },
-    "UniXNU/drivers/Adreno740/NativeAdrenoPublish.cpp": {
-      "repository": "UniXNU/drivers/Adreno740",
-      "path": "NativeAdrenoPublish.cpp",
-      "before_sha256": "ffb7601c5c16a44d2dd4e79bfc22024c985ef60680650c42c899c637ec707a48",
-      "sha256": "f178c5a67ce8329e907a4aedac6e548b964901aad5f1e000d575729b2d45c9d9"
-    },
-    "UniXNU/drivers/RamBlock/NativeRamBlock.cpp": {
-      "repository": "UniXNU/drivers/RamBlock",
-      "path": "NativeRamBlock.cpp",
-      "before_sha256": "772d47a069c50c9bf92f6c9292668340e005a61d996651033d9af2b6474b897c",
-      "sha256": "e0b81ce526e01f50d7d84db8a251c1710a8c2c918a04bd27da26be1da2e17d04"
-    },
-    "UniXNU/kits/XnuPrelink/fileset_layout.py": {
-      "repository": "UniXNU/kits/XnuPrelink",
-      "path": "fileset_layout.py",
-      "before_sha256": "0799bffc6cbd37d7bcad438a93eb0dc721b05b6c43d2ff9b6cd0559099383cc9",
-      "sha256": "d449e53dc1c28a793c771612349c43c501301eb58a03ef029340abbd8b230370"
-    },
-    "UniXNU/kits/XnuPrelink/test_fileset_layout.py": {
-      "repository": "UniXNU/kits/XnuPrelink",
-      "path": "test_fileset_layout.py",
-      "before_sha256": "db1a60373197338e406eef531a0a76f265d4372b724b63fc6702f3c79750e679",
-      "sha256": "f274176646d2d93390f5c12304f1ab1cd072c55ab4cba9ef588bb117b99f5934"
-    },
-    "UniXNU/drivers/ArmCpu/ArmCpu.cpp": {
-      "repository": "UniXNU/drivers/ArmCpu",
-      "path": "ArmCpu.cpp",
-      "before_sha256": "6fedbb45f78690e6c5d50c9f371491f8bb45bac0f676ec23dd87507dd1adf02d",
-      "sha256": "edcd0f7b65f7f2dd2e03748f74a1316f7a853b0f24855ee7dc50082a77a540fb"
     }
-  }
+  },
+  "candidate_version": "V4.1",
+  "base_actions_run": 43140807984
 }

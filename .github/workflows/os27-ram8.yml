@@ -1,4 +1,4 @@
-name: UniXNU sheng iPadOS 27 RAM 8 GiB
+name: UniXNU sheng iPadOS 27 RAM 8 GiB GPU V4.1
 
 on:
   workflow_dispatch:

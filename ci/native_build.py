@@ -17,6 +17,9 @@ PROFILE = 'ipados-27.0.1-24A446'
 DUMMY_CHIP = '13579bdf'
 RAM_BYTES = 8 * 1024**3
 DATA_BYTES = 215 * 1024**3
+VERSION = 'V4.1'
+TURNIP_KMD = 'src/freedreno/vulkan/tu_knl_darwin.cc'
+TURNIP_KMD_SHA = '28dbfb342333cbfc70da733ad26102ed64ec502ca002f12c0940a7175627df1c'
 SEED_SHA = 'e1bfa6971ef9fe6a27b53474c509cd518325459484230daf7f679642a04323b3'
 XNU_DEFAULT_CFLAGS = (
     '-Wno-reserved-identifier -Wno-pre-c11-compat -Wno-missing-designated-field-initializers '
@@ -112,6 +115,25 @@ def property_bytes(name, value):
     return struct.pack('<32sI', name.encode(), len(data)) + data
 
 
+
+def gpu_reset_symbol(tree, kernel):
+    sys.path.insert(0, str(tree / 'kits/XnuPrelink'))
+    from kc_image import Image
+
+    raw = kernel.read_bytes()
+    fileset = Image(raw)
+    image = Image(raw, fileset.entries['com.apple.kernel'][1])
+    name = '_native_adreno_reset_epoch'
+    matches = [address for address, names in image.symbols().items() if name in names]
+    require(len(matches) == 1, f'Packaged kernel must define {name} exactly once')
+    address, = matches
+    section = image.section(address)
+    require(section and (section['segment'], section['name']) == ('__TEXT_EXEC', '__text'),
+            f'{name} is not executable kernel code')
+    image.offset(address, 4)
+    return hex(address)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--top', type=Path, required=True)
@@ -184,6 +206,13 @@ def main():
         runtime_files[key] = path
     require(digest(runtime_files['data_ramdisk']) == SEED_SHA, 'Runtime repacked the original Data seed')
 
+    turnip = json_file(tree / 'build/mesa-tu-ios27/builtin-build-profile.json')
+    plugin = json_file(tree / 'build/adreno-metal-plugin27/NativeAdrenoMetal.bundle/gpu-build.json')
+    require(plugin['target'] == 'ios27' and plugin['turnip'] == turnip
+            and turnip['profile']['extra_sources'][TURNIP_KMD] == TURNIP_KMD_SHA,
+            'GPU addon did not use the V4.1 Turnip source')
+    print(f'Turnip ios27 source profile {turnip["source_id"]}', flush=True)
+
     stage = top / 'os27-ram8-handoff.partial'
     stage.mkdir()
     adt = stage / 'kernel.macho.adt'
@@ -199,7 +228,15 @@ def main():
     payload_kernel = stage / 'payload-kernel-check.macho'
     fat_readback(payload, 'Payloads/kernel.macho', payload_kernel)
     require(digest(payload_kernel) == payload_info['payload_kernel_sha256'], 'Packed kernel digest differs')
+    gpu_reset_address = gpu_reset_symbol(tree, payload_kernel)
+    print(f'GPU reset generation linked in packaged kernel at {gpu_reset_address}', flush=True)
     payload_kernel.unlink()
+    for label, member in (('gpu_addon', 'kernel.macho.gpuaddon'),
+                          ('trust_cache', 'kernel.macho.trustcache')):
+        packed = stage / 'gpu-runtime-check.bin'
+        fat_readback(payload, f'Payloads/{member}', packed)
+        require(digest(packed) == digest(runtime_files[label]), f'Packed {label} differs')
+        packed.unlink()
     packed_seed = stage / 'packed-seed-check.dbr'
     fat_readback(payload, 'Payloads/scratch-data.img', packed_seed)
     require(digest(packed_seed) == SEED_SHA, 'Packed Data seed differs')
@@ -236,6 +273,8 @@ def main():
     handoff = {
         'status': 'PROVISIONAL_DO_NOT_BOOT_OR_FLASH',
         'profile': PROFILE, 'synthetic_platform_seed': DUMMY_CHIP,
+        'candidate_version': VERSION, 'gpu_reset_epoch_symbol': gpu_reset_address,
+        'turnip_source_id': turnip['source_id'], 'turnip_kmd_sha256': TURNIP_KMD_SHA,
         'personalization_required': True, 'hardware_tested': False,
         'memory_request_bytes': RAM_BYTES, 'data_logical_bytes': DATA_BYTES,
         'data_volume_uuid': expected_uuid,
