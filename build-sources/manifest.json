@@ -38,7 +38,7 @@
       "repository": "device",
       "path": "board.toml",
       "before_sha256": "88b824800753cc7e79ae9dcd4ea4c92f351228126a3147dfc0ee81de0382e8b2",
-      "sha256": "e1a00aed4e32b6e29fc49856009471574d7f74c4332105b8d22d3bff82ee5173"
+      "sha256": "94f3cbe26bcc769482a199cab5a3c4e477bf928c7cb2e49a8a575d6ebd202fcb"
     },
     "device/drivers/ShengHidInput/NativeHidInput.cpp": {
       "repository": "device/drivers/ShengHidInput",
@@ -225,6 +225,18 @@
       "path": "ArmCpu.cpp",
       "before_sha256": "6fedbb45f78690e6c5d50c9f371491f8bb45bac0f676ec23dd87507dd1adf02d",
       "sha256": "edcd0f7b65f7f2dd2e03748f74a1316f7a853b0f24855ee7dc50082a77a540fb"
+    },
+    "device/patches/xnu-12377/sheng-cryptex-webkit-v4.0.2.patch": {
+      "repository": "device",
+      "path": "patches/xnu-12377/sheng-cryptex-webkit-v4.0.2.patch",
+      "before_sha256": null,
+      "sha256": "5113c90d2ad3e5d49893a200ba2b0e1f77d516becc85a145529c5bdf18b802f1"
+    },
+    "device/patches/xnu-12377/series": {
+      "repository": "device",
+      "path": "patches/xnu-12377/series",
+      "before_sha256": "15d08ffeafa1d29ece607e4f2913c80cb1f403442b0a0cbf9625f8d60a2d2953",
+      "sha256": "bcfb673d5ea3e14513d31b68066f8c2d3a70d7ff46706aca54da9fd913d5eff3"
     }
   }
 }

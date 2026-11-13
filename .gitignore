@@ -1,0 +1,5 @@
+/.unixnu-build/
+/os27-ram8-*.zip
+/os27-ram8-*.zip.sha256
+/tests/**/out/
+**/__pycache__/

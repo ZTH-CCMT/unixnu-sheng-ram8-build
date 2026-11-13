@@ -1,0 +1,113 @@
+{
+  "candidate": "iSH V4.0.2",
+  "stable_build_commit": "545526b03857c35979360975afdc5fc527364d61",
+  "status": "HOST_VALIDATED_NOT_NATIVE_COMPILED",
+  "patch_sha256": "5113c90d2ad3e5d49893a200ba2b0e1f77d516becc85a145529c5bdf18b802f1",
+  "baseline_tree": "24b742123ebdf8b88638ab6b8bba4facb128523a",
+  "candidate_tree": "5de5deaab8b15904eec7a678c0f655c1ac844828",
+  "reverse_restores_baseline": true,
+  "all_baseline_origins_pinned": true,
+  "changed_files": [
+    "bsd/kern/kern_exec.c",
+    "bsd/miscfs/bindfs/bind_subr.c",
+    "bsd/miscfs/bindfs/bind_vfsops.c",
+    "bsd/miscfs/bindfs/bind_vnops.c",
+    "bsd/miscfs/bindfs/bindfs.h"
+  ],
+  "files": [
+    {
+      "path": "bsd/kern/kern_exec.c",
+      "sha256": "84bda6fb9ee72754c5d304baa17de07551b086ff1fcb0865a5a3e72058149a9f",
+      "bytes": 338896,
+      "matches_source": true
+    },
+    {
+      "path": "bsd/miscfs/bindfs/bindfs.h",
+      "sha256": "985a8b462a0aafbea1b9e690d386e03dba5efc828d9a06a1bfd3d68325f17f94",
+      "bytes": 6279,
+      "matches_source": true
+    },
+    {
+      "path": "bsd/miscfs/bindfs/bind_subr.c",
+      "sha256": "200a315827c827787477c43479e02fb760306021c5af41423358e71e3300b2af",
+      "bytes": 10998,
+      "matches_source": true
+    },
+    {
+      "path": "bsd/miscfs/bindfs/bind_vfsops.c",
+      "sha256": "1a20331aa304384cd7efc10119517d6366979163983d5c2a63edba9a2324ca79",
+      "bytes": 27318,
+      "matches_source": true
+    },
+    {
+      "path": "bsd/miscfs/bindfs/bind_vnops.c",
+      "sha256": "fc4de0323bbc812f67fcdbe23478ae90d6903d527af61e18c7d8205b47e55a79",
+      "bytes": 22979,
+      "matches_source": true
+    }
+  ],
+  "host": {
+    "cases": 147,
+    "assertions": 81167,
+    "compile_exit": 0,
+    "run_exit": 0,
+    "functions": [
+      {
+        "path": "bsd/miscfs/bindfs/bind_vfsops.c",
+        "function": "bindfs_webkit_fileid",
+        "source_sha256": "1a20331aa304384cd7efc10119517d6366979163983d5c2a63edba9a2324ca79",
+        "extracted_sha256": "39adc8aa121c6b930ad218206cfda005e3893999f5df9dc16fe6f64b4edf81f1"
+      },
+      {
+        "path": "bsd/miscfs/bindfs/bind_vfsops.c",
+        "function": "bindfs_prepare_webkit_identity",
+        "source_sha256": "1a20331aa304384cd7efc10119517d6366979163983d5c2a63edba9a2324ca79",
+        "extracted_sha256": "d0f6643de4f6450de72a8c39961f94dada14704b9034312a58a7374e78e94975"
+      },
+      {
+        "path": "bsd/miscfs/bindfs/bind_vnops.c",
+        "function": "bindfs_getattr",
+        "source_sha256": "fc4de0323bbc812f67fcdbe23478ae90d6903d527af61e18c7d8205b47e55a79",
+        "extracted_sha256": "4af03e413ef9d19436b5db8ad72160a1b37a5e99e031931f8f3ee31da2b26bf6"
+      },
+      {
+        "path": "bsd/miscfs/bindfs/bind_vnops.c",
+        "function": "bindfs_webkit_native_lookup",
+        "source_sha256": "fc4de0323bbc812f67fcdbe23478ae90d6903d527af61e18c7d8205b47e55a79",
+        "extracted_sha256": "472a358a454ce1d55a9ed4e499474ee75002b1fee4d4e038a88fc3d960c3710b"
+      },
+      {
+        "path": "bsd/miscfs/bindfs/bind_vnops.c",
+        "function": "bind_lookup",
+        "source_sha256": "fc4de0323bbc812f67fcdbe23478ae90d6903d527af61e18c7d8205b47e55a79",
+        "extracted_sha256": "7aa1e8b56a9297ed5e8d29dc723069a3d4969c7b07f55b316c8d5b60306f537d"
+      },
+      {
+        "path": "bsd/miscfs/bindfs/bind_vfsops.c",
+        "function": "bindfs_webkit_identity_check",
+        "source_sha256": "1a20331aa304384cd7efc10119517d6366979163983d5c2a63edba9a2324ca79",
+        "extracted_sha256": "d3da9a2fa037f675416a243624cd12991039552d2d717e18aa5cb7b89dce0f26"
+      },
+      {
+        "path": "bsd/miscfs/bindfs/bind_vfsops.c",
+        "function": "bindfs_vget",
+        "source_sha256": "1a20331aa304384cd7efc10119517d6366979163983d5c2a63edba9a2324ca79",
+        "extracted_sha256": "558268d1a3ba5d771ad5187528586c2d76b0faadc8d3c430b0f1b459bb802f59"
+      }
+    ],
+    "negative_controls": [
+      {
+        "name": "released-prepare-root",
+        "detected": true
+      },
+      {
+        "name": "last-component-gate",
+        "detected": true
+      }
+    ],
+    "scope": "Windows host model; exact extracted C functions; no XNU kernel, APFS, real namei, MAC, namecache or LaunchServices execution"
+  },
+  "complete_kernel_build": false,
+  "device_tested": false,
+  "cloud_started": false
+}

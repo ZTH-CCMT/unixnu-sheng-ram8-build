@@ -1,0 +1,22 @@
+{
+  "status": "PASSED",
+  "local_only": true,
+  "source_runtime_unchanged_since_host_tests": true,
+  "patch_sha256": "5113c90d2ad3e5d49893a200ba2b0e1f77d516becc85a145529c5bdf18b802f1",
+  "overlay_changes": [
+    "device/board.toml",
+    "device/patches/xnu-12377/series",
+    "device/patches/xnu-12377/sheng-cryptex-webkit-v4.0.2.patch"
+  ],
+  "all_overlay_hashes_verified": true,
+  "pins_and_data_preserved": true,
+  "boot_argument_bytes": {
+    "/payload/kernel_args": 796
+  },
+  "native_build_and_materialize_equal_stable": true,
+  "git_diff_check": "passed with cr-at-eol for preserved CRLF manifest",
+  "git_remote_count": 0,
+  "new_commit_created": false,
+  "cloud_build_started": false,
+  "device_actions": false
+}
