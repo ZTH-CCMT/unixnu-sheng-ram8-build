@@ -1,0 +1,348 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index b3b4e51..b6e6fb5 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -8495,7 +8495,8 @@ native_gpu_addon_install(proc_t p, user_addr_t scratch)
+  * /System and /usr are bound read-only over /private/preboot/Cryptexes/OS/{System,usr}, not as unions, so a lookup there stays on the
+  * SystemOS volume and never meets the root's links again. The two mount points are owner Data directories under
+  * /private/var/ngpu/preboot, shown over the root's empty /private/preboot as a read-only union. Never fatal; stage and status go to the
+- * boot log: 1 mount points made, 2 preboot shown, 3 System bound, 4 usr bound, 5 WebKit visible, 6 the WebContent bundle's SystemOS identity round-trips. */
++ * boot log: 1 mount points made, 2 preboot shown, 3 System bound, 4 usr bound, 5 WebKit visible, 6 the WebContent bundle's SystemOS identity round-trips,
++ * 7 Extensions has native identity and Library and Frameworks still use bindfs. */
+ volatile int native_cryptex_os_stage = 0;
+ volatile int native_cryptex_os_status = -1;
+ extern int native_bindfs_systemos_alias_mount;
+@@ -8572,6 +8573,43 @@ native_cryptex_systemos_identity(vnode_t alias, vfs_context_t ctx)
+ 	return error;
+ }
+ 
++static bool
++native_cryptex_webkit_view(vfs_context_t ctx)
++{
++	static const char library[] = "/System/Cryptexes/OS/System/Library";
++	static const char extensions[] = "/System/Cryptexes/OS/System/Library/ExtensionKit/Extensions";
++	static const char canonical[] = "/System/Library/ExtensionKit/Extensions";
++	static const char sibling[] = "/System/Cryptexes/OS/System/Library/Frameworks";
++	vnode_t parent = NULLVP, native = NULLVP, alias = NULLVP, peer = NULLVP;
++	int error = vnode_lookup(library, VNODE_LOOKUP_NOFOLLOW, &parent, ctx);
++	if (!error) {
++		error = vnode_lookup(canonical, VNODE_LOOKUP_NOFOLLOW_ANY, &native, ctx);
++	}
++	if (!error) {
++		error = vnode_lookup(extensions, VNODE_LOOKUP_NOFOLLOW, &alias, ctx);
++	}
++	if (!error) {
++		error = vnode_lookup(sibling, VNODE_LOOKUP_NOFOLLOW, &peer, ctx);
++	}
++	const bool valid = !error && vnode_isdir(peer) && vnode_mount(peer) == vnode_mount(parent) &&
++	    alias == native && vnode_isdir(native) &&
++	    vnode_tag(parent) == VT_BINDFS && vnode_mount(parent) != vnode_mount(native) &&
++	    vnode_mount(native) == vnode_mount(rootvnode);
++	if (peer) {
++		vnode_put(peer);
++	}
++	if (alias) {
++		vnode_put(alias);
++	}
++	if (native) {
++		vnode_put(native);
++	}
++	if (parent) {
++		vnode_put(parent);
++	}
++	return valid;
++}
++
+ static void
+ native_cryptex_os_view(proc_t p, user_addr_t scratch)
+ {
+@@ -8613,7 +8651,10 @@ native_cryptex_os_view(proc_t p, user_addr_t scratch)
+ 			error = native_cryptex_systemos_identity(probe, ctx);
+ 			vnode_put(probe);
+ 			if (!error) {
+-				native_cryptex_os_stage = 6;
++				uint32_t native_view = 0;
++				const bool scoped = PE_parse_boot_argn("webkit-native-view", &native_view, sizeof(native_view)) &&
++				    native_view == 1 && native_cryptex_webkit_view(ctx);
++				native_cryptex_os_stage = scoped ? 7 : 6;
+ 			}
+ 		}
+ 	}
+diff --git a/bsd/miscfs/bindfs/bind_subr.c b/bsd/miscfs/bindfs/bind_subr.c
+index 5665285..7c69f5e 100644
+--- a/bsd/miscfs/bindfs/bind_subr.c
++++ b/bsd/miscfs/bindfs/bind_subr.c
+@@ -257,7 +257,7 @@ bind_nodecreate(struct vnode * lowervp)
+ /* assumption is that vnode has iocount on it after vnode create */
+ int
+ bind_getnewvnode(
+-	struct mount * mp, struct vnode * lowervp, struct vnode * dvp, struct vnode ** vpp, struct componentname * cnp, int root)
++	struct mount * mp, struct vnode * lowervp, struct vnode * dvp, struct vnode ** vpp, struct componentname * cnp, int node_flags)
+ {
+ 	struct vnode_fsparam vnfs_param;
+ 	int error             = 0;
+@@ -278,12 +278,15 @@ bind_getnewvnode(
+ 	vnfs_param.vnfs_dvp        = dvp;
+ 	vnfs_param.vnfs_fsnode     = (void *)xp;
+ 	vnfs_param.vnfs_vops       = bindfs_vnodeop_p;
+-	vnfs_param.vnfs_markroot   = root;
++	vnfs_param.vnfs_markroot   = (node_flags & BIND_NODE_ROOT) != 0;
+ 	vnfs_param.vnfs_marksystem = 0;
+ 	vnfs_param.vnfs_rdev       = 0;
+ 	vnfs_param.vnfs_filesize   = 0; // set this to 0 since we should only be shadowing non-regular files
+ 	vnfs_param.vnfs_cnp        = cnp;
+ 	vnfs_param.vnfs_flags      = VNFS_ADDFSREF;
++	if (node_flags & BIND_NODE_NOCACHE) {
++		vnfs_param.vnfs_flags |= VNFS_NOCACHE;
++	}
+ 
+ 	error = vnode_create_ext(VNCREATE_FLAVOR, VCREATESIZE, &vnfs_param, vpp, VNODE_CREATE_DEFAULT);
+ 	if (error == 0) {
+@@ -304,7 +307,7 @@ bind_getnewvnode(
+  */
+ int
+ bind_nodeget(
+-	struct mount * mp, struct vnode * lowervp, struct vnode * dvp, struct vnode ** vpp, struct componentname * cnp, int root)
++	struct mount * mp, struct vnode * lowervp, struct vnode * dvp, struct vnode ** vpp, struct componentname * cnp, int node_flags)
+ {
+ 	struct vnode * vp;
+ 	int error;
+@@ -331,7 +334,7 @@ bind_nodeget(
+ 		return error;
+ 	}
+ 
+-	error = bind_getnewvnode(mp, lowervp, dvp, &vp, cnp, root);
++	error = bind_getnewvnode(mp, lowervp, dvp, &vp, cnp, node_flags);
+ 
+ 	if (error) {
+ 		vnode_rele(lowervp);
+diff --git a/bsd/miscfs/bindfs/bind_vfsops.c b/bsd/miscfs/bindfs/bind_vfsops.c
+index 4492efb..7db3d09 100644
+--- a/bsd/miscfs/bindfs/bind_vfsops.c
++++ b/bsd/miscfs/bindfs/bind_vfsops.c
+@@ -71,6 +71,7 @@
+ #include <sys/vnode.h>
+ #include <sys/vnode_internal.h>
+ #include <security/mac_internal.h>
++#include <pexpert/pexpert.h>
+ 
+ #include <sys/param.h>
+ 
+@@ -104,7 +105,7 @@ bindfs_vfs_getlowerattr(mount_t mp, struct vfs_attr * vfap, vfs_context_t ctx)
+ /*
+  * Mount bind layer
+  */
+-static uint64_t
++uint64_t
+ bindfs_webkit_fileid(vnode_t vp, vfs_context_t ctx)
+ {
+ 	struct vnode_attr attr;
+@@ -126,7 +127,7 @@ bindfs_webkit_fileid(vnode_t vp, vfs_context_t ctx)
+  * directories get a logical SystemOS volume ID for LaunchServices.
+  */
+ static void
+-bindfs_prepare_webkit_identity(struct bind_mount *bindm, vnode_t lowerrootvp, vfs_context_t ctx)
++bindfs_prepare_webkit_identity(struct bind_mount *bindm, mount_t alias_mount, vnode_t lowerrootvp, vfs_context_t ctx)
+ {
+ 	static const char *const bundle_names[BIND_WEBKIT_BUNDLE_COUNT] = {
+ 		"WebContentExtension.appex",
+@@ -172,8 +173,37 @@ bindfs_prepare_webkit_identity(struct bind_mount *bindm, vnode_t lowerrootvp, vf
+ 		bindm->bindm_webkit_fileids[i] = id;
+ 	}
+ 	vnode_put(directory);
+-	if (!error) {
+-		bindm->bindm_flags |= BINDM_WEBKIT_SYSTEMOS;
++	if (error) {
++		return;
++	}
++	bindm->bindm_flags |= BINDM_WEBKIT_SYSTEMOS;
++
++	/* Publish the opt-in before the alias is visible. The native subtree must
++	 * retain the alias mount's execution restrictions. */
++	uint32_t native_view = 0;
++	const uint64_t exec_flags = MNT_NOSUID | MNT_NOEXEC | MNT_NODEV | MNT_QUARANTINE;
++	const uint64_t required_flags = vfs_flags(alias_mount) & exec_flags;
++	if (!PE_parse_boot_argn("webkit-native-view", &native_view, sizeof(native_view)) ||
++	    native_view != 1) {
++		return;
++	}
++	const uint64_t lower_flags = vfs_flags(lower_mount);
++	if ((lower_flags & required_flags) != required_flags) {
++		printf("[cryptex webkit] native mount flags=%llx require=%llx\n",
++		    (unsigned long long)lower_flags, (unsigned long long)required_flags);
++		return;
++	}
++
++	vnode_t library = NULLVP;
++	if (vnode_lookupat("Library", lookup_flags, &library, ctx, lowerrootvp)) {
++		return;
++	}
++	if (vnode_mount(library) == lower_mount) {
++		bindm->bindm_webkit_library_id = bindfs_webkit_fileid(library, ctx);
++	}
++	vnode_put(library);
++	if (bindm->bindm_webkit_library_id) {
++		bindm->bindm_flags |= BINDM_WEBKIT_NATIVE;
+ 	}
+ }
+ 
+@@ -286,7 +316,7 @@ bindfs_mount(struct mount * mp, __unused vnode_t devvp, user_addr_t user_data, v
+ 	xmp->bindm_lowerrootvp  = lowerrootvp;
+ 	xmp->bindm_lowerrootvid = vnode_vid(lowerrootvp);
+ 
+-	error = bind_nodeget(mp, lowerrootvp, NULL, &vp, NULL, 1);
++	error = bind_nodeget(mp, lowerrootvp, NULL, &vp, NULL, BIND_NODE_ROOT);
+ 	if (error) {
+ 		goto error;
+ 	}
+@@ -338,7 +368,7 @@ bindfs_mount(struct mount * mp, __unused vnode_t devvp, user_addr_t user_data, v
+ 	if (native_bindfs_systemos_alias_mount && rootvnode != NULLVP &&
+ 	    lower_mount == vnode_mount(rootvnode) && (vfs_flags(lower_mount) & MNT_RDONLY) &&
+ 	    (lower_mount->mnt_kern_flag & MNTK_PATH_FROM_ID)) {
+-		bindfs_prepare_webkit_identity(xmp, lowerrootvp, ctx);
++		bindfs_prepare_webkit_identity(xmp, mp, lowerrootvp, ctx);
+ 	}
+ 
+ 	error = bindfs_vfs_getlowerattr(lower_mount, &vfa, ctx);
+diff --git a/bsd/miscfs/bindfs/bind_vnops.c b/bsd/miscfs/bindfs/bind_vnops.c
+index 92307e7..3667c31 100644
+--- a/bsd/miscfs/bindfs/bind_vnops.c
++++ b/bsd/miscfs/bindfs/bind_vnops.c
+@@ -190,6 +190,59 @@ bindfs_close(struct vnop_close_args * args)
+ 	return error;
+ }
+ 
++/* Only the ExtensionKit/Extensions route needs native vnode identity.
++ * A relative lookup from its native parent reuses the caller's authorization
++ * and MAC checks without assigning the alias parent to the native vnode. */
++static int
++bindfs_webkit_native_lookup(vnode_t lower_library, struct componentname *cnp, vnode_t *result, vfs_context_t ctx)
++{
++	static const char next_component[] = "Extensions";
++	struct nameidata *ndp = cnp->cn_ndp;
++	if (ndp == NULL || ndp->ni_rootdir != rootvnode ||
++	    (cnp->cn_flags & (ISLASTCN | NOCROSSMOUNT | CN_NBMOUNTLOOK | CN_FIRMLINK_NOFOLLOW |
++	    CN_RAW_ENCRYPTED | USEDVP | SAVESTART)) ||
++	    (ndp->ni_flag & (NAMEI_ROOTDIR | NAMEI_RESOLVE_BENEATH | NAMEI_NODOTDOT | NAMEI_NOUNION | NAMEI_UNIQUE))) {
++		return 0;
++	}
++
++	const char *next = ndp->ni_next;
++	if (next == NULL || *next != '/') {
++		return 0;
++	}
++	while (*next == '/') {
++		next++;
++	}
++	if (strncmp(next, next_component, sizeof(next_component) - 1) ||
++	    (next[sizeof(next_component) - 1] != '/' && next[sizeof(next_component) - 1] != '\0')) {
++		return 0;
++	}
++
++	const int flags = VNODE_LOOKUP_NOFOLLOW | VNODE_LOOKUP_NOFOLLOW_ANY | VNODE_LOOKUP_NOCROSSMOUNT;
++	vnode_t native = NULLVP;
++	int error = vnode_lookupat("ExtensionKit", flags, &native, ctx, lower_library);
++	if (error) {
++		return error;
++	}
++
++	vnode_t parent = NULLVP;
++	const char *name = NULL;
++	vnode_getparent_and_name(native, &parent, &name);
++	const bool canonical = parent == lower_library && name && !strcmp(name, "ExtensionKit");
++	if (parent) {
++		vnode_put(parent);
++	}
++	if (name) {
++		vnode_putname(name);
++	}
++	if (canonical && vnode_isdir(native) && !vnode_isvroot(native) &&
++	    vnode_mount(native) == vnode_mount(lower_library) && !vnode_mountedhere(native)) {
++		*result = native;
++	} else {
++		vnode_put(native);
++	}
++	return 0;
++}
++
+ /*
+  * We have to carry on the locking protocol on the bind layer vnodes
+  * as we progress through the tree. We also have to enforce read-only
+@@ -246,16 +299,36 @@ notdot:
+ 		return error;
+ 	}
+ 
+-	error = VNOP_LOOKUP(ldvp, &lvp, cnp, ap->a_context);
++	/* Leave ordinary bindfs behavior outside the one verified Library edge. */
++	static const char extension_kit[] = "ExtensionKit";
++	const bool webkit_edge = (bind_mp->bindm_flags & BINDM_WEBKIT_NATIVE) &&
++	    cnp->cn_nameiop == LOOKUP &&
++	    cnp->cn_namelen == sizeof(extension_kit) - 1 &&
++	    !memcmp(cnp->cn_nameptr, extension_kit, sizeof(extension_kit) - 1) &&
++	    vnode_mount(ldvp) == vnode_mount(bind_mp->bindm_lowerrootvp) &&
++	    bindfs_webkit_fileid(ldvp, ap->a_context) == bind_mp->bindm_webkit_library_id;
++	if (webkit_edge) {
++		error = bindfs_webkit_native_lookup(ldvp, cnp, &vp, ap->a_context);
++		if (error || vp) {
++			cnp->cn_flags &= ~MAKEENTRY;
++			vnode_put(ldvp);
++			*ap->a_vpp = vp;
++			return error;
++		}
++	}
+ 
++	error = VNOP_LOOKUP(ldvp, &lvp, cnp, ap->a_context);
+ 	vnode_put(ldvp);
++	if (webkit_edge) {
++		cnp->cn_flags &= ~MAKEENTRY;
++	}
+ 
+ 	if ((error == 0 || error == EJUSTRETURN) && lvp != NULL) {
+ 		if (ldvp == lvp) {
+ 			vp    = dvp;
+ 			error = vnode_get(vp);
+ 		} else {
+-			error = bind_nodeget(mp, lvp, dvp, &vp, cnp, 0);
++			error = bind_nodeget(mp, lvp, dvp, &vp, cnp, webkit_edge ? BIND_NODE_NOCACHE : 0);
+ 		}
+ 		if (error == 0) {
+ 			*ap->a_vpp = vp;
+diff --git a/bsd/miscfs/bindfs/bindfs.h b/bsd/miscfs/bindfs/bindfs.h
+index 34f7f70..9c7551c 100644
+--- a/bsd/miscfs/bindfs/bindfs.h
++++ b/bsd/miscfs/bindfs/bindfs.h
+@@ -85,6 +85,9 @@
+  * without root; launchd and the loader expect system-directory content to be root owned. Mode bits are left as they are. */
+ #define BINDM_FORCE_ROOT 0x80000000ULL
+ #define BINDM_WEBKIT_SYSTEMOS 0x40000000ULL
++#define BINDM_WEBKIT_NATIVE 0x20000000ULL
++#define BIND_NODE_ROOT 0x01
++#define BIND_NODE_NOCACHE 0x02
+ #define BIND_WEBKIT_BUNDLE_COUNT 5
+ #define BINDM_CASEINSENSITIVE 0x0000000000000002
+ 
+@@ -98,6 +101,7 @@ struct bind_mount {
+ 	                                    * before we build the shadow vnode lazily */
+ 	uint64_t bindm_flags;
+ 	uint64_t bindm_webkit_fileids[BIND_WEBKIT_BUNDLE_COUNT];
++	uint64_t bindm_webkit_library_id;
+ };
+ 
+ #ifdef KERNEL
+@@ -135,13 +139,14 @@ __BEGIN_DECLS
+ int bindfs_init(struct vfsconf * vfsp);
+ int bindfs_destroy(void);
+ int bind_nodeget(
+-	struct mount * mp, struct vnode * lowervp, struct vnode * dvp, struct vnode ** vpp, struct componentname * cnp, int root);
++	struct mount * mp, struct vnode * lowervp, struct vnode * dvp, struct vnode ** vpp, struct componentname * cnp, int node_flags);
+ int bind_hashget(struct mount * mp, struct vnode * lowervp, struct vnode ** vpp);
+ int bind_getnewvnode(
+-	struct mount * mp, struct vnode * lowervp, struct vnode * dvp, struct vnode ** vpp, struct componentname * cnp, int root);
++	struct mount * mp, struct vnode * lowervp, struct vnode * dvp, struct vnode ** vpp, struct componentname * cnp, int node_flags);
+ void bind_hashrem(struct bind_node * xp);
+ 
+ int bindfs_getbackingvnode(vnode_t in_vp, vnode_t* out_vpp);
++uint64_t bindfs_webkit_fileid(vnode_t, vfs_context_t);
+ bool bindfs_webkit_systemos_fsid(struct bind_mount *, vnode_t, fsid_t *, vfs_context_t);
+ 
+ #define BINDVPTOLOWERVP(vp) (VTOBIND(vp)->bind_lowervp)
