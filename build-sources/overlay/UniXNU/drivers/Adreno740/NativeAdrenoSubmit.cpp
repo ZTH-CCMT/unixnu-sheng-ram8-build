@@ -258,7 +258,7 @@ NativeAdrenoRing *NativeAdrenoSubmit::ringOfFence(uint32_t fence) const
  * A ring alone takes everything. */
 unsigned NativeAdrenoSubmit::ringForPriority() const
 {
-    if(!preemption() || preempt_dead_ || table_mode_!=2)return 0;
+    if(!preemption() || single_ring_after_reset_ || preempt_dead_ || table_mode_!=2)return 0;
     /* Mode 2 separates normal work from requested high priorities. */
     const int32_t p=next_priority_;
     return p==2 || p==3 || (preempt_setup_.mode>=2 && (p==1 || p<0))?1:0;
@@ -278,7 +278,7 @@ const NativeAdrenoSubmit::Job *NativeAdrenoSubmit::pendingOn(unsigned index)
 void NativeAdrenoSubmit::driveSwitch(const NativeAdrenoRingClock *clock)
 {
     (void)clock;
-    if(!preemption())return;
+    if(!preemption() || single_ring_after_reset_)return;
     /* Only the periodic watchdog declares an in-flight switch timed out. */
     if(preempt_.inFlight() && !completeSwitch())return;
     if(preempt_dead_)return;
@@ -1108,6 +1108,10 @@ IOReturn NativeAdrenoSubmit::recoverDual(NativeAdrenoRestart restart,void *cooki
     }
     if(preempt_.restart(0))return poison();
     preempt_dead_=false;dead_reason_=0;
+    // Clearing the in-flight failure does not make the reset CP preemptible.
+    // A low-priority first job must execute on ring 0, not trigger a switch
+    // from its bare initialization stream. Keep the dual-ring fence ledger.
+    single_ring_after_reset_=true;
     if(table_mode_) {
         if(!write_table_ || write_table_(table_cookie_,vm_->ttbr0()))return poison();
         table_vm_=vm_;

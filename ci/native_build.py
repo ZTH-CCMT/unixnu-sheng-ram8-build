@@ -17,7 +17,8 @@ PROFILE = 'ipados-27.0.1-24A446'
 DUMMY_CHIP = '13579bdf'
 RAM_BYTES = 8 * 1024**3
 DATA_BYTES = 215 * 1024**3
-VERSION = 'V4.1'
+VERSION = 'V4.2'
+GPU_SOURCE_SHA = '894ee670d07078b8c05c4530c7b0377e318d10e5671b2174035e3eb8e103d53a'
 TURNIP_KMD = 'src/freedreno/vulkan/tu_knl_darwin.cc'
 TURNIP_KMD_SHA = '28dbfb342333cbfc70da733ad26102ed64ec502ca002f12c0940a7175627df1c'
 SEED_SHA = 'e1bfa6971ef9fe6a27b53474c509cd518325459484230daf7f679642a04323b3'
@@ -213,6 +214,14 @@ def main():
             'GPU addon did not use the V4.1 Turnip source')
     print(f'Turnip ios27 source profile {turnip["source_id"]}', flush=True)
 
+    gpu_trace_path = tree / 'build/adreno740/gpu-trace-build.json'
+    gpu_trace = json_file(gpu_trace_path)
+    require(gpu_trace['source_sha256'] == GPU_SOURCE_SHA
+            and gpu_trace['trace_source_id'] == GPU_SOURCE_SHA[:16]
+            and gpu_trace['target'] == 'arm64e-apple-ios27.0',
+            'Compiled Adreno source identity differs from the V4.2 candidate')
+    print(f'Adreno V4.2 source ID {gpu_trace["trace_source_id"]}', flush=True)
+
     stage = top / 'os27-ram8-handoff.partial'
     stage.mkdir()
     adt = stage / 'kernel.macho.adt'
@@ -255,6 +264,7 @@ def main():
         'author-package.manifest.json': manifest,
         'author-boot-report.json': boot_report,
         'author-payload-report.json': payload_report,
+        'gpu-trace-build.json': gpu_trace_path,
         'touch-link-evidence.json': touch,
         'touch-source-report.json': touch_sources,
         'data.dbr': runtime_files['data_ramdisk'],
@@ -274,6 +284,8 @@ def main():
         'status': 'PROVISIONAL_DO_NOT_BOOT_OR_FLASH',
         'profile': PROFILE, 'synthetic_platform_seed': DUMMY_CHIP,
         'candidate_version': VERSION, 'gpu_reset_epoch_symbol': gpu_reset_address,
+        'gpu_source_sha256': GPU_SOURCE_SHA,
+        'gpu_trace_source_id': gpu_trace['trace_source_id'],
         'turnip_source_id': turnip['source_id'], 'turnip_kmd_sha256': TURNIP_KMD_SHA,
         'personalization_required': True, 'hardware_tested': False,
         'memory_request_bytes': RAM_BYTES, 'data_logical_bytes': DATA_BYTES,

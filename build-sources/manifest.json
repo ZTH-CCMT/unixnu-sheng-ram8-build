@@ -45,13 +45,13 @@
       "repository": "UniXNU/drivers/Adreno740",
       "path": "NativeAdrenoSubmit.cpp",
       "before_sha256": "6343e5fc8fbf8c1d8d1c053b07744372a452021018283da0db9f74ddf566461e",
-      "sha256": "b9cb731b8d8f9bac56f465691b7998f2aeffc316db0be857b5e1230e5768ea0f"
+      "sha256": "a2e6f0cf519bf181f05375b7fa48986d2ce132685ef8802a63a343e46a57ca76"
     },
     "UniXNU/drivers/Adreno740/NativeAdrenoSubmit.h": {
       "repository": "UniXNU/drivers/Adreno740",
       "path": "NativeAdrenoSubmit.h",
       "before_sha256": "493d849685162d4efa3cd7fe0c0963685e50b11266673f2e56268d984aa4f9bb",
-      "sha256": "5e5e7d0ff19c92c97d44c324ec6441a0943775b18d0fde5f1abda001feb92837"
+      "sha256": "3aa3795debe8f19c2dbba069269be808f50900ce007c52adc4e6e4d5fc998b51"
     },
     "UniXNU/drivers/Adreno740/tests/XnuMemoryFixture.h": {
       "repository": "UniXNU/drivers/Adreno740",
@@ -69,7 +69,7 @@
       "repository": "UniXNU/drivers/Adreno740",
       "path": "tests/test_submit.cpp",
       "before_sha256": "ea56b6eb4d9cf9936f472ed5bf622d7e9fe74773f2b11a78beb0ba1d7601a4fa",
-      "sha256": "b7d51f24de5ef3f3d98af14994515bf989d749b3e06ed5e027ad5eeecd925b19"
+      "sha256": "c1caaa951218a0c762a1ab512fee18af0fc43b7721ef7eafe0c71f0d540378b3"
     },
     "UniXNU/drivers/ArmCpu/ArmCpu.cpp": {
       "repository": "UniXNU/drivers/ArmCpu",
@@ -286,8 +286,14 @@
       "path": "Platforms/Xiaomi/shengPkg/Library/MemoryMapLib/MemoryMapLib.c",
       "before_sha256": "c162d99e6e5b8baaf48b305b2383ef5ad4aacac866ec72e3efbb3b40bf21280c",
       "sha256": "bb7254e4f3eee270c9d15903112e14ed0433529be519e1cedea31b33fbe34f93"
+    },
+    "UniXNU/drivers/Adreno740/README.md": {
+      "repository": "UniXNU/drivers/Adreno740",
+      "path": "README.md",
+      "before_sha256": "49d084dff45013dc1a50bfd22314e14da8345de8c12f548d2fa55597ac98d6c4",
+      "sha256": "81932dde82ab5419462487ca754fe6778e0224a2d51723e6b43194c091c21a33"
     }
   },
-  "candidate_version": "V4.1",
+  "candidate_version": "V4.2",
   "base_actions_run": 43140807984
 }

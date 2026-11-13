@@ -148,6 +148,11 @@ private:
      * the first ring (stranded_: recover() starts from the oldest job that never ran). */
     enum : uint32_t {PreemptSwitchTimeoutUs=1000000,PreemptStrandedUs=2000000,PreemptAgingUs=250000,PreemptAgingSliceUs=2000};   /* switch watchdog 1 s; a ring-1 job unreached for 2 s */
     bool preempt_dead_=false,stranded_=false,aging_grant_=false;
+    /* A full reset may leave ring 0 with only CP init/secure-mode packets and
+     * no executed preemption prologue/yield. Keep new work on ring 0 for this
+     * submitter's lifetime. This is routing policy, not a change to the dual
+     * ring fence ledger or recovery/error semantics. */
+    bool single_ring_after_reset_=false;
     uint64_t low_service_us_=0,low_slice_until_=0;
     uint32_t dead_reason_=0,rescues_=0;
     void markPreemptDead(uint32_t reason);
@@ -196,7 +201,8 @@ public:
     void nextRole(int32_t role) {next_role_=role;}
     bool lastRecoveryStranded() const {return last_stranded_;}
     uint32_t recoveryInfo(unsigned i) const {return i<4?recovery_info_[i]:0;}
-    uint32_t deadReason() const {return preempt_dead_?dead_reason_:0;}
+    /* 9: post-reset ring-0 routing selected, not a recovery success status. */
+    uint32_t deadReason() const {return preempt_dead_?dead_reason_:(single_ring_after_reset_?9:0);}
     /* The second ring and the switch between them. Both rings must be attached, their records and SMMU info pages mapped; the
      * caller keeps those buffers alive. `on` false keeps the second ring out of use (the first ring alone, as before). The rings
      * must have been given their own preemption state (NativeAdrenoRing::setPreempt). */
@@ -222,7 +228,7 @@ public:
     bool preemptStats(NativeAdrenoPreemptStats *stats,uint32_t *loaded,bool *in_flight,uint32_t *cntl,uint32_t *dead=nullptr,uint32_t *rescues=nullptr) const
     {
         if(!preemption())return false;
-        if(dead)*dead=preempt_dead_?dead_reason_:0;
+        if(dead)*dead=deadReason();
         if(rescues)*rescues=rescues_;
         *stats=preempt_.stats();*loaded=preempt_.loaded();*in_flight=preempt_.inFlight();*cntl=preempt_.readCntl();
         return true;

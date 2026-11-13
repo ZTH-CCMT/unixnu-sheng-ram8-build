@@ -22,7 +22,7 @@ definitions:
           -x c -c -o /dev/null -
 
     - &stage_sources
-      name: Check out pinned public sources and verify the V4.1 overlay
+      name: Check out pinned public sources and verify the V4.2 overlay
       script: |
         set -eu
         top="$CM_BUILD_DIR/.unixnu-build"
@@ -56,20 +56,30 @@ definitions:
         set -eu
         top="$CM_BUILD_DIR/.unixnu-build"
         brew install dtc llvm lld cmake mtools ninja glslang shaderc spirv-tools bison pkgconf rustup unifdef
-        brew install --formula blacktop/tap/ipsw
-        export PATH="$HOME/.cargo/bin:$(brew --prefix llvm)/bin:$(brew --prefix lld)/bin:$(brew --prefix bison)/bin:$PATH"
+        # Use the same ARM64 extras release as the working GitHub runner.
+        tools="$top/tools"
+        mkdir -p "$tools"
+        archive="$tools/ipsw_3.1.745_macOS_arm64_extras.tar.gz"
+        curl --fail --show-error --silent --location --retry 3 --output "$archive" \
+          https://github.com/blacktop/ipsw/releases/download/v3.1.745/ipsw_3.1.745_macOS_arm64_extras.tar.gz
+        printf '%s  %s\n' dbc517ec63a1f9e0f77dcbd2638525d049ee99f3a936278c9176b4c87dcc1c45 "$archive" \
+          | shasum -a 256 -c -
+        tar -xzf "$archive" -C "$tools" ipsw
+        export PATH="$tools:$(brew --prefix rustup)/bin:$HOME/.cargo/bin:$(brew --prefix llvm)/bin:$(brew --prefix lld)/bin:$(brew --prefix bison)/bin:$PATH"
+        ipsw version
         rustup toolchain install 1.98.0 --profile minimal --component rust-src
+        cargo +1.98.0 --version
         python3 "$CM_BUILD_DIR/ci/native_build.py" --top "$top"
         (
           cd "$top/os27-ram8-handoff"
-          zip -0 -q -r "$CM_BUILD_DIR/os27-ram8-adreno-v4.1-handoff.zip" .
+          zip -0 -q -r "$CM_BUILD_DIR/os27-ram8-adreno-v4.2-handoff.zip" .
         )
         cd "$CM_BUILD_DIR"
-        shasum -a 256 os27-ram8-adreno-v4.1-handoff.zip > os27-ram8-adreno-v4.1-handoff.zip.sha256
+        shasum -a 256 os27-ram8-adreno-v4.2-handoff.zip > os27-ram8-adreno-v4.2-handoff.zip.sha256
 
 workflows:
-  unixnu-gpu-v41-preflight:
-    name: UniXNU GPU V4.1 source and toolchain preflight
+  unixnu-gpu-v42-preflight:
+    name: UniXNU GPU V4.2 source and toolchain preflight
     instance_type: mac_mini_m2
     max_build_duration: 20
     environment: *macos_environment
@@ -79,8 +89,8 @@ workflows:
     artifacts:
       - .unixnu-build/materialized-sources.json
 
-  unixnu-gpu-v41-handoff:
-    name: UniXNU GPU V4.1 ARM64e boot handoff
+  unixnu-gpu-v42-handoff:
+    name: UniXNU GPU V4.2 ARM64e boot handoff
     instance_type: mac_mini_m2
     max_build_duration: 120
     environment: *macos_environment
@@ -89,5 +99,5 @@ workflows:
       - *stage_sources
       - *build_handoff
     artifacts:
-      - os27-ram8-adreno-v4.1-handoff.zip
-      - os27-ram8-adreno-v4.1-handoff.zip.sha256
+      - os27-ram8-adreno-v4.2-handoff.zip
+      - os27-ram8-adreno-v4.2-handoff.zip.sha256

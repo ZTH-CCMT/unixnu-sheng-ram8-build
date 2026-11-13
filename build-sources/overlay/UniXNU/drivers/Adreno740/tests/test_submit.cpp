@@ -2,6 +2,7 @@
 /* Real VM, ring and execbuf code over two software register peers. */
 #include "XnuMemoryFixture.h"
 #include "NativeAdrenoSubmit.h"
+#include "AdrenoPM4.h"
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -193,6 +194,34 @@ struct DualRingPath : Path {
             return ring->restart(completed);
         },this,&ringclock,&out);
     }
+
+    IOReturn recoverBoard(NativeAdrenoRecovery &out)
+    {
+        return submit.recover([](void *cookie,NativeAdrenoRing *ring,uint32_t completed)->IOReturn {
+            auto &path=*static_cast<DualRingPath *>(cookie);
+            ++path.restart_count;path.restart_fence=completed;
+            for(auto &reg:cp.regs)reg=0; // Full reset loses CP state, including the pseudo save address.
+            IOReturn status=ring->restart(completed);
+            if(status)return status;
+            // gpuRestart's real post-reset path: ten CP init words, then two
+            // secure-mode words. Neither command installs a preemption record
+            // in the CP, emits a yield, or consumes a user fence number.
+            uint32_t init[10]={};
+            CHECK(AdrenoPM4Type7(0x17,1,&init[0])==AdrenoPM4Success);
+            CHECK(AdrenoPM4Type7(0x48,7,&init[2])==AdrenoPM4Success);
+            init[1]=1u<<27;init[3]=0x14b;init[4]=3;init[5]=0x20000000;
+            init[6]=2;init[7]=0x700000;init[9]=1u<<31;
+            status=ring->submitUnfenced(init,10);if(status)return status;
+            fencemem[0]=cp.regs[0x0806]=ring->writePointer();
+            uint32_t secure[2]={};
+            CHECK(AdrenoPM4Type7(0x66,1,&secure[0])==AdrenoPM4Success);
+            status=ring->submitUnfenced(secure,2);if(status)return status;
+            fencemem[0]=cp.regs[0x0806]=ring->writePointer();
+            CHECK(cp.regs[0x0806]==12 && cp.regs[0x0807]==12);
+            CHECK(fencemem[1]==completed && ring->lastSubmitted()==completed);
+            return ring->idle(&ringclock,0);
+        },this,&ringclock,&out);
+    }
 };
 
 static void testHiddenActiveFence()
@@ -258,10 +287,24 @@ static void testSwitchCompletesBeforeRecovery()
     CHECK(p.restart_count==0 && p.submit.stats().restarts==0);
     CHECK(p.ring.current() && !p.low.current() && !p.keepalive);
     CHECK(p.submit.deadReason()==0 && p.submit.preemptStats().completed==2);
+    NativeAdrenoPreemptStats late_stats{};
+    uint32_t late_loaded=~0u,late_cntl=~0u,late_dead=~0u;
+    bool late_flight=true;
+    CHECK(p.submit.preemptStats(&late_stats,&late_loaded,&late_flight,&late_cntl,&late_dead));
+    CHECK(late_dead==0 && late_loaded==0 && !late_flight);
     CHECK(p.submit.wait(blocked,&ringclock,0)==kIOReturnTimeout);
     fencemem[1]=blocked;
     CHECK(p.submit.wait(blocked,&ringclock,0)==kIOReturnSuccess);
     CHECK(p.submit.wait(completed,&ringclock,0)==kIOReturnSuccess);
+    // A late completion did not reset the hardware. It must not permanently
+    // disable scheduling on ring 1 merely because the watchdog had timed out.
+    const uint32_t before_triggers=p.submit.preemptStats().triggers;
+    const uint32_t low_after_late=p.enqueue(1,19);
+    CHECK(p.low.lastSubmitted()==low_after_late && (cp.regs[0x08a0]&1));
+    CHECK(p.submit.preemptStats().triggers==before_triggers+1);
+    p.signalSwitch();
+    p.low_fences[1]=low_after_late;
+    CHECK(p.submit.wait(low_after_late,&ringclock,0)==kIOReturnSuccess);
     std::puts("PASS switch completion between watchdog and recovery avoids a restart");
 }
 
@@ -442,6 +485,147 @@ static void testStalledWaitDoesNotTouchInactiveRing()
     waitWithoutUnstick(low);
     CHECK(p.keepalive && (cp.regs[0x08a0]&1));
     std::puts("PASS waiting on an inactive ring cannot kick or drain the GPU");
+}
+
+static void completePrimary(DualRingPath &p,uint32_t fence)
+{
+    CHECK(p.ring.current() && !p.low.current() && !(cp.regs[0x08a0]&1));
+    CHECK(cp.regs[0x0807]==p.ring.writePointer());
+    fencemem[0]=cp.regs[0x0806]=p.ring.writePointer();
+    fencemem[1]=fence;
+    CHECK(p.submit.wait(fence,&ringclock,0)==kIOReturnSuccess);
+    CHECK(p.submit.retireCompleted()==kIOReturnSuccess);
+}
+
+static void checkFallbackReported(DualRingPath &p)
+{
+    NativeAdrenoPreemptStats stats{};
+    uint32_t loaded=~0u,cntl=~0u,dead=~0u;
+    bool flight=true;
+    CHECK(p.submit.deadReason()==9);
+    CHECK(p.submit.preemptStats(&stats,&loaded,&flight,&cntl,&dead));
+    CHECK(dead==9 && loaded==0 && !flight && !(cntl&1));
+}
+
+static void checkIdleAfterReset(DualRingPath &p,uint32_t triggers)
+{
+    CHECK(p.submit.outstanding()==0);
+    checkFallbackReported(p);
+    for(unsigned tick=0;tick<6;++tick) {
+        clock_us+=500000;
+        bool hung=true;
+        CHECK(p.submit.hangCheck(&hung)==kIOReturnSuccess && !hung);
+        CHECK(p.submit.retireCompleted()==kIOReturnSuccess);
+        CHECK(p.submit.preemptStats().triggers==triggers);
+        CHECK(!(cp.regs[0x08a0]&1) && !p.keepalive);
+    }
+}
+
+static void testBoardResetKeepsFirstLowWorkOnPrimary(bool reverse)
+{
+    DualRingPath p;p.setup();
+    uint32_t failed=0,finished=0;
+    if(reverse)p.beginReverseSwitch(failed,finished);
+    else failed=p.enqueue(1,7);
+    clock_us+=1000001;
+    bool hung=false;
+    CHECK(p.submit.hangCheck(&hung)==kIOReturnSuccess && hung);
+    NativeAdrenoRecovery result{};
+    CHECK(p.recoverBoard(result)==kIOReturnSuccess && !result.completed_late);
+    CHECK(result.replayed==0 && p.restart_count==1);
+    CHECK(p.ring.writePointer()==12 && cp.regs[0x0807]==12);
+    const uint32_t triggers=p.submit.preemptStats().triggers;
+    checkIdleAfterReset(p,triggers);
+    // A normal-priority queue in mode 2 formerly selected ring 1 here. With
+    // the CP parked at 0xc there is no yield to honor a new STOP request.
+    const uint32_t fresh=p.enqueue(1,17);
+    CHECK(p.ring.lastSubmitted()==fresh && p.low.lastSubmitted()<fresh);
+    CHECK(p.ring.current() && !p.low.current() && !(cp.regs[0x08a0]&1));
+    CHECK(p.submit.preemptStats().triggers==triggers);
+    CHECK(p.ring.writePointer()>12 && cp.regs[0x0807]==p.ring.writePointer());
+    CHECK(p.submit.fencePending(fresh));
+    completePrimary(p,fresh);
+    CHECK(p.submit.wait(failed,&ringclock,0)==kIOReturnAborted);
+    CHECK(p.submit.observeFence(failed,nullptr,0)==kIOReturnAborted);
+    if(finished)CHECK(p.submit.wait(finished,&ringclock,0)==kIOReturnSuccess);
+    checkIdleAfterReset(p,triggers);
+    std::puts(reverse?"PASS board 1->0 reset runs first new low work on ring 0 without another STOP":
+        "PASS board 0->1 reset runs first new low work on ring 0 without another STOP");
+}
+
+static void testBoardResetReplayAndLowQueueContinuation()
+{
+    DualRingPath p;p.setup();
+    const uint32_t high_first=p.enqueue(0,8);
+    const uint32_t replay_first=p.enqueue(1,7);
+    const uint32_t high_second=p.enqueue(0,8);
+    const uint32_t replay_second=p.enqueue(1,7);
+    CHECK(high_first<replay_first && replay_first<high_second && high_second<replay_second);
+    fencemem[1]=high_second;
+    clock_us+=2000001;
+    bool hung=false;
+    CHECK(p.submit.hangCheck(&hung)==kIOReturnSuccess && hung);
+    NativeAdrenoRecovery result{};
+    CHECK(p.recoverBoard(result)==kIOReturnSuccess && result.replayed==2);
+    checkFallbackReported(p);
+    const uint32_t triggers=p.submit.preemptStats().triggers;
+    CHECK(p.ring.lastSubmitted()==replay_second && p.submit.fencePending(replay_first));
+    CHECK(p.submit.wait(high_second,&ringclock,0)==kIOReturnSuccess);
+    const uint32_t same_queue=p.enqueue(1,7);
+    CHECK(p.ring.lastSubmitted()==same_queue && p.low.lastSubmitted()<replay_first);
+    CHECK(p.submit.preemptStats().triggers==triggers && !(cp.regs[0x08a0]&1));
+    completePrimary(p,same_queue);
+    CHECK(p.submit.wait(replay_first,&ringclock,0)==kIOReturnSuccess);
+    CHECK(p.submit.wait(replay_second,&ringclock,0)==kIOReturnSuccess);
+    // Once that queue has drained, neither it nor a different low queue may
+    // re-enter ring 1. Moving only the replayed jobs is not sufficient.
+    const uint32_t after_drain=p.enqueue(1,7);
+    const uint32_t another_queue=p.enqueue(2,31);
+    CHECK(p.ring.lastSubmitted()==another_queue && p.low.lastSubmitted()<after_drain);
+    CHECK(p.submit.preemptStats().triggers==triggers && !(cp.regs[0x08a0]&1));
+    completePrimary(p,another_queue);
+    checkIdleAfterReset(p,triggers);
+    std::puts("PASS unexposed low work replays with original fences and both same/new low queues stay on ring 0");
+}
+
+static void testBoardExecutionResetAndSecondHangKeepFenceHistory()
+{
+    DualRingPath p;p.setup();
+    const uint32_t first_failed=p.enqueue(0,8);
+    // This is an execution hang with no switch fault, so fallback must apply
+    // to every full reset, not only dead_reason 2 or an in-flight switch.
+    bool hung=false;
+    for(unsigned tick=0;tick<6 && !hung;++tick) {
+        clock_us+=500000;CHECK(p.submit.hangCheck(&hung)==kIOReturnSuccess);
+    }
+    CHECK(hung && p.submit.preemptStats().triggers==0);
+    NativeAdrenoRecovery first{};
+    CHECK(p.recoverBoard(first)==kIOReturnSuccess && first.replayed==0);
+    checkFallbackReported(p);
+    const uint32_t successful=p.enqueue(1,17);
+    CHECK(p.ring.lastSubmitted()==successful && !(cp.regs[0x08a0]&1));
+    completePrimary(p,successful);
+    const uint32_t second_failed=p.enqueue(2,18);
+    CHECK(p.ring.lastSubmitted()==second_failed && !(cp.regs[0x08a0]&1));
+    hung=false;
+    for(unsigned tick=0;tick<6 && !hung;++tick) {
+        clock_us+=500000;CHECK(p.submit.hangCheck(&hung)==kIOReturnSuccess);
+    }
+    CHECK(hung); // Fallback must not turn off execution hang detection.
+    NativeAdrenoRecovery second{};
+    CHECK(p.recoverBoard(second)==kIOReturnSuccess && second.replayed==0);
+    checkFallbackReported(p);
+    CHECK(p.restart_count==2 && p.submit.stats().restarts==2);
+    CHECK(p.submit.wait(first_failed,&ringclock,0)==kIOReturnAborted);
+    CHECK(p.submit.observeFence(second_failed,nullptr,0)==kIOReturnAborted);
+    CHECK(p.submit.wait(successful,&ringclock,0)==kIOReturnSuccess);
+    const uint32_t fresh=p.enqueue(3,19);
+    CHECK(fresh==second_failed+1 && p.ring.lastSubmitted()==fresh);
+    completePrimary(p,fresh);
+    CHECK(p.submit.wait(first_failed,&ringclock,0)==kIOReturnAborted);
+    CHECK(p.submit.wait(second_failed,&ringclock,0)==kIOReturnAborted);
+    checkIdleAfterReset(p,p.submit.preemptStats().triggers);
+    std::puts("PASS execution reset falls back, second real hang recovers, and failed/successful fence history survives");
 }
 
 int main()
@@ -830,6 +1014,10 @@ int main()
     testRecoveryReplaysOnlyUnexposedWork();
     testSwitchRestartFailureRetainsReferences();
     testStalledWaitDoesNotTouchInactiveRing();
+    testBoardResetKeepsFirstLowWorkOnPrimary(false);
+    testBoardResetKeepsFirstLowWorkOnPrimary(true);
+    testBoardResetReplayAndLowQueueContinuation();
+    testBoardExecutionResetAndSecondHangKeepFenceHistory();
 }
 /* Physical-page maintenance (imported BOs): record it; no host page is touched. */
 /* Host double: the page attribute change of user BOs has no host equivalent (no host page is touched). */
