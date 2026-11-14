@@ -12,7 +12,8 @@
     "UniXNU/drivers/RamBlock": "737f6dae119ef11990e77dc06bcead945098865e",
     "UniXNU/kits/XnuPrelink": "8f4f3866545727e2dc3d2c8cb60f8a87a9539c12",
     "UniXNU/drivers/ArmCpu": "d90e457b8392623853ec85c860feef546c767621",
-    "UniXNU/drivers/GopFramebuffer": "b0d812d578efa2acb005b66f73168891719af09a"
+    "UniXNU/drivers/GopFramebuffer": "b0d812d578efa2acb005b66f73168891719af09a",
+    "UniXNU/drivers/AdrenoMetal": "ed8386e6b2966bc5535921d15bf5eeeb63f8ad46"
   },
   "data": {
     "path": "data/data.dbr",
@@ -352,6 +353,60 @@
       "path": "scripts/fetch-adreno-inputs.py",
       "before_sha256": "a854723a3a5530811aa628172b09096def25b6f319609b5f35dc29fe54b2fa15",
       "sha256": "aa264d5df189a96563bcd80954d9cc1f86082b2ab6631af0634bdbe534105d2d"
+    },
+    "UniXNU/drivers/AdrenoMetal/bridge/FrontendChecks.h": {
+      "repository": "UniXNU/drivers/AdrenoMetal",
+      "path": "bridge/FrontendChecks.h",
+      "before_sha256": "f13281e96fdbb4b1f6633bf0648df146c8bf5d6db5648b319f19466257838217",
+      "sha256": "ccb0d5502728d638c8619394d39a7f3c7e4717bc3a2e815338e20a346f02ef61"
+    },
+    "UniXNU/drivers/AdrenoMetal/GpuScanoutClient.h": {
+      "repository": "UniXNU/drivers/AdrenoMetal",
+      "path": "GpuScanoutClient.h",
+      "before_sha256": "4a217d50c87809037cde33eeb7943c2cf719bdff5ac8c44dde3dc2621dcd4416",
+      "sha256": "0f9beb9516db5d323d7182718c76e7d5ad62280d7fee77a98b5d40c417051b17"
+    },
+    "UniXNU/drivers/AdrenoMetal/MetalDiagnosticOrigin.h": {
+      "repository": "UniXNU/drivers/AdrenoMetal",
+      "path": "MetalDiagnosticOrigin.h",
+      "before_sha256": null,
+      "sha256": "8cb2e2b96525327663d2d410550ebc68fd01db14bd6482c763e6c6bf7d5dcdae"
+    },
+    "UniXNU/drivers/AdrenoMetal/MetalTraceFile.h": {
+      "repository": "UniXNU/drivers/AdrenoMetal",
+      "path": "MetalTraceFile.h",
+      "before_sha256": null,
+      "sha256": "7e49ddb3be9b78c6412d0c6c59d913e149c1338c9afc9e849304259df16773a5"
+    },
+    "UniXNU/drivers/AdrenoMetal/MetalTraceQueue.h": {
+      "repository": "UniXNU/drivers/AdrenoMetal",
+      "path": "MetalTraceQueue.h",
+      "before_sha256": null,
+      "sha256": "7056286d89efff4ba4a8e81a8cfcbc64f2d527a8480baa05fd136675d12d7b69"
+    },
+    "UniXNU/drivers/AdrenoMetal/NativeAdrenoMetalPlugin.mm": {
+      "repository": "UniXNU/drivers/AdrenoMetal",
+      "path": "NativeAdrenoMetalPlugin.mm",
+      "before_sha256": "ade7f1657e5979699609d858fd2201df675f4d9fefe40cdf54f312ee1d8f6a0e",
+      "sha256": "8cb350e7e33b92483fc2a7ecd2cbf608aadcda6892d9262f6ed7d4ad8b2bac3a"
+    },
+    "UniXNU/drivers/AdrenoMetal/NativeBridgeMetalFrontend.mm": {
+      "repository": "UniXNU/drivers/AdrenoMetal",
+      "path": "NativeBridgeMetalFrontend.mm",
+      "before_sha256": "39cb6dd476349dc98423a4c7b9339f6c8a2492fd2d5817e729ae55be0bd65236",
+      "sha256": "1211dbddc65ac905cc485b24c30b10d80e6dec692036b3185b3d7f93ebdd1452"
+    },
+    "UniXNU/drivers/AdrenoMetal/PrimeShaders.h": {
+      "repository": "UniXNU/drivers/AdrenoMetal",
+      "path": "PrimeShaders.h",
+      "before_sha256": "d1d1cb456e7d87214179de77d4f86e573a553ebeb091761e7ec5590695c6e089",
+      "sha256": "096862a97e596c575e45414d9864bff245731e221a1d535e568d527af0eb1ebc"
+    },
+    "UniXNU/drivers/AdrenoMetal/README.md": {
+      "repository": "UniXNU/drivers/AdrenoMetal",
+      "path": "README.md",
+      "before_sha256": "9772ebb342b94afce6f4509e447f06142ffaca4108b7026d15e8c016d9695920",
+      "sha256": "e5214d502346cc0c206544717eb094886de6f89227efc51c1fbb762dfeb5deaf"
     }
   },
   "candidate_version": "V5.3",

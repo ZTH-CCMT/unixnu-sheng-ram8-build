@@ -1,0 +1,43 @@
+GPU V5.4 管线链路诊断源码交接，2026-11-14
+
+目的与范围
+补齐 V5.3 的渲染管线调查。将预热失败与实际客户端失败区分，并填补命令、runtime、完成和显示记录缺口。本版不是卡顿修复结论，不混入 iSH/WebKit 修改，也不新增电源键或音频日志。
+
+实际代码变更
+1. 管线创建记录来源、调用方 API 输入、函数常量、链接函数、创建尝试及现有重试；缺块、超长文本标为不完整。
+2. pipeline ID → frontend command ID → runtime ID；接收原先 frameRuntime 忽略的 event 45，保存 Vulkan 工作句柄和批次。
+3. 完成记录独立于旧 32 项历史；本地拒绝走独立终止分支，不冒充 GPU 完成。
+4. scanout 保存真实 swap.bytes 和 completion transport 返回码。
+5. 新路径同步发布完整记录、后台写盘；保留早期参数+近期运行记录，显式显示丢失、回卷和写错误。
+6. 读取器按单次命令生命周期关联，避免把复用的 runtime 地址串到后续命令。
+
+Sol 应用步骤
+以 handoff.json 指向的 V5.3 清单为底，保留已有 GPU 内核修复、触控、8 GiB 和实测 audio=4。
+AdrenoMetal 固定 ed8386e6b2966bc5535921d15bf5eeeb63f8ad46；其余 pins 见 handoff.json。
+在该组件 checkout 应用 AdrenoMetal-V5.4.patch，在 UniXNU 应用 UniXNU-docs-V5.4.patch。也可以按 candidate 相对路径复制 handoff.json 列出的文件。
+将变更加入构建覆盖清单，包括三个新头文件；必须进入 resolved tree。不要只修改顶层 checkout 而漏掉构建树。
+复用原构建流程，kernel preparation 后通过 scripts/build-adreno-metal-plugin.py 重编译原生插件。改启动参数不能替代编译。
+增加 metal-chain=1 gpu-trace=1 diag=1，保留 RAM8/audio4 与原有其他设置。菜单标记 GPU V5.4 Chain，普通 Boot，保留 Data。
+没有在本任务启动云编译、推送仓库或重启平板。Windows 主机回归不能替代 Mac 的完整 Apple Objective-C++ 构建。
+
+验证结果
+python -B tools/run_host_checks.py
+实际生产 MetalTraceQueue.h / MetalTraceFile.h 已通过并发、满队列、回卷、元数据溢入、I/O 失败、来源作用域和写出格式测试。
+4 线程总计提交 160,000 条：最终本地这轮完整读取 116,541 条，明确记录队列溢出 43,459 条，计数守恒且无破碎记录。这是刻意无等待的压力测试，不代表平板实际丢失率。
+Python 最终 9 项通过：原生 writer fixture、重试、缺块、未结束尝试、元数据溢入、回卷、地址复用、本地拒绝、无效/截断文件。
+结果见 tests/out/host-checks.log、tests/out/decoder-final.log。
+
+采集及读取
+沿用 BootDiagExport 的 frames.trace 和 gpu.trace.bin。新 frames.trace 的记录仍是 72 字节，但文件外层是 type40/schema2 分区结构，不能直接当旧格式读取。
+python -B tools/decode_metal_chain.py <frames.trace> --out <chain.json> --flat <frames-flat.trace>
+内核 gpu.trace.bin 用固定 device/scripts/decode-gpu-trace.py。保留上游平铺事件用于补充分析。
+
+判断顺序
+先检查 capture 的队列损失、文件写入错误、回卷以及参数完整性。再区分 client 与 prime，找未结束的 native attempt；按真实身份连接管线、命令、runtime/Vulkan 工作以及内核 submit/retire，最后看实际回调与 scanout transport 返回。
+提交到回调包含排队及回调工作，不等于纯 GPU 执行时间。Vulkan句柄/内核fence/最终上屏还需其各自身份字段，不能仅按时间接近声称对应。
+
+限制
+文件最多 11.25 MiB 加头部，元数据保留区满后滚入事件区，无法保证全部开机历史。
+仅 render-server，不是全进程日志，也不记录所有硬件计数器。没有新增 command→最终上屏的独立 fence 身份。设备导出是否完整须看导出结果。
+诊断本身有 CPU、锁与写盘开销，不能把该版帧率直接视作发布版性能。意外终止会失去尚未写出的近期记录。
+Apple 原生编译、设备启动、实机采集均未验证。
