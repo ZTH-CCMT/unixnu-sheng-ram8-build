@@ -4735,7 +4735,7 @@ static void reportUnreadableLibrary(NSString *path) {
  diagnostic.attempted(handle);
  NBFunction *built=(NBFunction *)function;
  if(!handle)if(NBFunction *rebuilt=zeroRestFunction((NBFunction *)function)) {
-  if(diagnostic.id)chainText(diagnostic.id,3,chainJSON(chainFunction(rebuilt)));
+  if(diagnostic.id)chainText(diagnostic.id,3,chainJSON(chainFunction((id<MTLFunction>)rebuilt)));
   diagnostic.startAttempt();handle=nmb_compute_pipeline_new_with_options(gDevice,rebuilt.handle,&creation);diagnostic.attempted(handle);if(handle)built=rebuilt;
  }
  gTimePipeline.add(pipelineBegan);
@@ -4770,7 +4770,7 @@ static void reportUnreadableLibrary(NSString *path) {
  if(!handle) {
   NBFunction *rebuilt=zeroRestFunction((NBFunction *)d.computeFunction);
   if(rebuilt){p.function=rebuilt.handle;
-   if(diagnostic.id)chainText(diagnostic.id,3,chainJSON(chainFunction(rebuilt)));
+   if(diagnostic.id)chainText(diagnostic.id,3,chainJSON(chainFunction((id<MTLFunction>)rebuilt)));
    diagnostic.startAttempt();handle=nmb_compute_pipeline_new_with_descriptor(gDevice,&p,&creation);diagnostic.attempted(handle);}
  }
  gTimePipeline.add(pipelineBegan);
