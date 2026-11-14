@@ -394,7 +394,7 @@
       "repository": "UniXNU/drivers/AdrenoMetal",
       "path": "NativeBridgeMetalFrontend.mm",
       "before_sha256": "39cb6dd476349dc98423a4c7b9339f6c8a2492fd2d5817e729ae55be0bd65236",
-      "sha256": "1211dbddc65ac905cc485b24c30b10d80e6dec692036b3185b3d7f93ebdd1452"
+      "sha256": "96e542bcd7c5fcb4e2daf1c51c09adf00dfdbe203b10b9b0e1b2b636ba2a9661"
     },
     "UniXNU/drivers/AdrenoMetal/PrimeShaders.h": {
       "repository": "UniXNU/drivers/AdrenoMetal",

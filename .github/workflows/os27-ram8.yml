@@ -54,6 +54,8 @@ jobs:
           python3 -B -m unittest discover -s UniXNU/kits/XnuPrelink -p 'test_*.py'
           python3 device/scripts/check-bluetooth-platform.py
           python3 device/scripts/extract-files.py --section Keyboard
+      - name: Check Metal frontend before the expensive native build
+        run: python3 pipeline/ci/check_metal_frontend.py --top "$GITHUB_WORKSPACE"
       - name: Install author build dependencies
         run: |
           brew install dtc llvm lld cmake mtools ninja glslang shaderc spirv-tools bison pkgconf rustup unifdef
@@ -77,6 +79,17 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: python3 pipeline/ci/native_build.py --top "$GITHUB_WORKSPACE"
+      - name: Preserve complete failure logs and print first compiler errors
+        if: failure()
+        run: python3 pipeline/ci/report_build_failure.py "$GITHUB_WORKSPACE"
+      - name: Upload complete build failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpu-v5.4-build-failure-${{ github.run_id }}-${{ github.run_attempt }}
+          path: build-failure-logs/
+          if-no-files-found: warn
+          retention-days: 7
       - name: Report kernel linker and prelink geometry
         if: always()
         env:
