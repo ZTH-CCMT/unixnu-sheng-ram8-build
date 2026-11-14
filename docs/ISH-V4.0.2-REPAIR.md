@@ -33,6 +33,19 @@ The five existing bundle names are WebContentExtension, WebContentEnhancedSecuri
 
 The host model checks references, pointer identity, namespace identity, selected traversal flags, authentication responses and failures. It does not run the complete kernel, real APFS/namecache/readdir/getattrlistbulk, MAC policy or LaunchServices. Whole-XNU ARM64e compilation and the iSH terminal acceptance test remain outstanding.
 
+## Build input downloads
+
+The first Codemagic build stopped while fetching the Apple DriverKit directory
+listing from the GitHub REST API. The build now reads a pinned index for
+DriverKit and TrustCache headers and fetches their bytes from the recorded
+Apple commits. The Adreno firmware fetch also uses the existing locked source
+path directly. Git blob checks and firmware size and SHA-256 checks still apply.
+
+The GitHub workflow runs the offline downloader tests before materializing
+the overlay. A separate local comparison against all 26 real Apple headers
+matched the original downloader output. The three Adreno firmware files also
+matched their existing locks.
+
 ## Deliberate limits
 
 This is a narrow canonical directory junction, not a new mountpoint implementation. It does not synthesize `v_mountedhere` or a directory mountpoint attribute. Native `..` returns its canonical native Library, not an invented alias parent. The actual LaunchServices interpretation of this view must still be checked. The extra NOSUID policy is explicit, and closed-source SystemOS programs have not been exhaustively qualified under it.

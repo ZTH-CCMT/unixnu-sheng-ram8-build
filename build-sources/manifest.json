@@ -237,6 +237,24 @@
       "path": "patches/xnu-12377/series",
       "before_sha256": "15d08ffeafa1d29ece607e4f2913c80cb1f403442b0a0cbf9625f8d60a2d2953",
       "sha256": "bcfb673d5ea3e14513d31b68066f8c2d3a70d7ff46706aca54da9fd913d5eff3"
+    },
+    "UniXNU/scripts/prepare-xnu-source.py": {
+      "repository": "UniXNU",
+      "path": "scripts/prepare-xnu-source.py",
+      "before_sha256": "1ad6cc259a39fdf9b9059e0d748a316f0b2bf64853aef11dff709647706d27af",
+      "sha256": "a12b3e11d312180043eecb139f0c3bd341ee50a2157f210805ad768ee6fcfc6e"
+    },
+    "UniXNU/scripts/fetch-adreno-inputs.py": {
+      "repository": "UniXNU",
+      "path": "scripts/fetch-adreno-inputs.py",
+      "before_sha256": "a854723a3a5530811aa628172b09096def25b6f319609b5f35dc29fe54b2fa15",
+      "sha256": "aa264d5df189a96563bcd80954d9cc1f86082b2ab6631af0634bdbe534105d2d"
+    },
+    "UniXNU/scripts/data/xnu-restored-header-inputs.json": {
+      "repository": "UniXNU",
+      "path": "scripts/data/xnu-restored-header-inputs.json",
+      "before_sha256": null,
+      "sha256": "f989b68c55d57e5bbc51f1e0adf68f3724d9a9f209e1cbcb768a8946719ceb01"
     }
   }
 }
