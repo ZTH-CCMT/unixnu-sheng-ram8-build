@@ -357,15 +357,15 @@
       "repository": "device",
       "path": "patches/xnu-12377/series",
       "before_sha256": "15d08ffeafa1d29ece607e4f2913c80cb1f403442b0a0cbf9625f8d60a2d2953",
-      "sha256": "bcfb673d5ea3e14513d31b68066f8c2d3a70d7ff46706aca54da9fd913d5eff3"
+      "sha256": "609205026a116809ffc445dff93a4b5fa803e24cbde7cb75382ecc71a016aa20"
     },
-    "device/patches/xnu-12377/sheng-cryptex-webkit-v4.0.2.patch": {
+    "device/patches/xnu-12377/sheng-cryptex-webkit-v5.3.2.patch": {
       "repository": "device",
-      "path": "patches/xnu-12377/sheng-cryptex-webkit-v4.0.2.patch",
+      "path": "patches/xnu-12377/sheng-cryptex-webkit-v5.3.2.patch",
       "before_sha256": null,
-      "sha256": "5113c90d2ad3e5d49893a200ba2b0e1f77d516becc85a145529c5bdf18b802f1"
+      "sha256": "9e89ab25f61dfd1a3d6ad51bb711f49e36994156e4d5e3503e77f610c23b2b11"
     }
   },
-  "candidate_version": "V5.3",
+  "candidate_version": "V5.3.2",
   "base_actions_run": 43140807984
 }
