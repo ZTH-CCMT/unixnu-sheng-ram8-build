@@ -27,13 +27,13 @@
       "repository": "UniXNU/drivers/Adreno740",
       "path": "NativeAdrenoPreempt.cpp",
       "before_sha256": "62b5bc2078be1b57eccaaf709ed7d66e215c119b98470bb38ae8bd18644ca58a",
-      "sha256": "f6e415142efcee3987159f3f7bceb4d001c6490d60b0538d443ced92cc379a5c"
+      "sha256": "03a11dd91e03008438ec453f0c6e0e9a0049727d5e0c634f2c5cfd477047db83"
     },
     "UniXNU/drivers/Adreno740/NativeAdrenoPreempt.h": {
       "repository": "UniXNU/drivers/Adreno740",
       "path": "NativeAdrenoPreempt.h",
       "before_sha256": "33b1804ba28d36d5a8aa3c67ec6476f737803e1864c049804bb6fcd3512d91b6",
-      "sha256": "6d08f86b860a6ad81b6a9c0c34a50e56cbb94668b6bcf6f454b9b2d0791660b7"
+      "sha256": "8baa66810072a5c292ed65720ee27f23ed7acaa00f6fa59b07760280ad7deb16"
     },
     "UniXNU/drivers/Adreno740/NativeAdrenoPublish.cpp": {
       "repository": "UniXNU/drivers/Adreno740",
@@ -45,7 +45,7 @@
       "repository": "UniXNU/drivers/Adreno740",
       "path": "NativeAdrenoSubmit.cpp",
       "before_sha256": "6343e5fc8fbf8c1d8d1c053b07744372a452021018283da0db9f74ddf566461e",
-      "sha256": "98de10eb730770ae30a4eab0c3becaea8085beb7c78eee48d128dda57ac73ff2"
+      "sha256": "565732c1613cc1e87558ded0da0a592b1f4e30a8185f1d7f5cb17dc82f61a3a1"
     },
     "UniXNU/drivers/Adreno740/NativeAdrenoSubmit.h": {
       "repository": "UniXNU/drivers/Adreno740",
@@ -63,13 +63,13 @@
       "repository": "UniXNU/drivers/Adreno740",
       "path": "tests/test_preempt.cpp",
       "before_sha256": "e9be5cead892741646432e069bc26c443e584359ca82b403049ea6a859129cdb",
-      "sha256": "df8e5ce0f6fcc8ae83183bd45ed7a8e6fd32b8f4c6bff9827af65500685afd2a"
+      "sha256": "ccda9639e7d069cc57f3e117472bad40cfe56a8e536778da9dce5ec17aaea246"
     },
     "UniXNU/drivers/Adreno740/tests/test_submit.cpp": {
       "repository": "UniXNU/drivers/Adreno740",
       "path": "tests/test_submit.cpp",
       "before_sha256": "ea56b6eb4d9cf9936f472ed5bf622d7e9fe74773f2b11a78beb0ba1d7601a4fa",
-      "sha256": "9a79bbd226cd8c28d5f74d50ae583531db0b0f617a86a17a3e202d42b42cf59f"
+      "sha256": "27d3ee262a10bedd2008e49994c073b3a5bbe240832d10254b6fb67498d3f45a"
     },
     "UniXNU/drivers/ArmCpu/ArmCpu.cpp": {
       "repository": "UniXNU/drivers/ArmCpu",
@@ -237,7 +237,7 @@
       "repository": "device",
       "path": "package/BootLog.c",
       "before_sha256": "5c880128ff6bd54d60dec13cd9b18acb47d2d801ebfa6aac920b308d74f238c2",
-      "sha256": "c62083966199b1581f923833b98ee9f2f30ec84ad11fe139e949ad001b85f57f"
+      "sha256": "642d62a50f9b75b4b5bc7d395027fa838f92837f7f0a6b1e7e86598b200706ac"
     },
     "device/package/LegacyDisplayProbe.cpp": {
       "repository": "device",
@@ -291,21 +291,69 @@
       "repository": "UniXNU/drivers/Adreno740",
       "path": "README.md",
       "before_sha256": "49d084dff45013dc1a50bfd22314e14da8345de8c12f548d2fa55597ac98d6c4",
-      "sha256": "e9b62435dca79e6ed0b9578b490f4118bb577a77a606a6ad6669d177e8396d73"
+      "sha256": "76598a620d885af19f26d0cb2e9f46fd5c6531b3efe4b8bc0a50ebb432a8d0b5"
     },
     "UniXNU/drivers/Adreno740/NativeAdrenoRing.cpp": {
       "repository": "UniXNU/drivers/Adreno740",
       "path": "NativeAdrenoRing.cpp",
       "before_sha256": "436a5f46dc3c6d20dd3d94058c16f83e19bc5c81cbf5c131b90678ebc54a728e",
-      "sha256": "758936f54cec39eda1f5ebe51200c714923f0f922a14b766aa7649e362e8ec00"
+      "sha256": "1ccaef766c9e923c330d4b38eba65c4e29073076608ff5a593b89d770d675212"
     },
     "UniXNU/drivers/Adreno740/NativeAdrenoRing.h": {
       "repository": "UniXNU/drivers/Adreno740",
       "path": "NativeAdrenoRing.h",
       "before_sha256": "37e75406bb33c5b93b6eab298267249c1355b9668dd4ba45d47d6194157b9d4b",
-      "sha256": "3be00c61d5927ec9e20a9363da9865cd03adb467419778e337dcbad21a630545"
+      "sha256": "9ffce7ff9aa443d735e4be26889c4fa460ae9cc0336ca4583c41890ccfadbada"
+    },
+    "UniXNU/drivers/Adreno740/NativeAdrenoSqeSnapshot.h": {
+      "repository": "UniXNU/drivers/Adreno740",
+      "path": "NativeAdrenoSqeSnapshot.h",
+      "before_sha256": null,
+      "sha256": "3c74fe7097656f12ddc029286c27a5a52cc247945720239df1b720d928679f44"
+    },
+    "UniXNU/drivers/Adreno740/tests/run_sqe_mutations.py": {
+      "repository": "UniXNU/drivers/Adreno740",
+      "path": "tests/run_sqe_mutations.py",
+      "before_sha256": null,
+      "sha256": "27b81fce54e7d33cbb43af15934f41daea2ec8d596f5a725e09cc818d198e90c"
+    },
+    "UniXNU/drivers/Adreno740/tests/test_ring.cpp": {
+      "repository": "UniXNU/drivers/Adreno740",
+      "path": "tests/test_ring.cpp",
+      "before_sha256": "9fc453e9b9dca88caa594f4e75397c39bc3380228e11415d93cde09457da1f77",
+      "sha256": "ad435c2c7cfbd02c31c1e495bebef6322ba09e8f3781d01ad4836318127c3fed"
+    },
+    "device/package/GpuPowerProbe.cpp": {
+      "repository": "device",
+      "path": "package/GpuPowerProbe.cpp",
+      "before_sha256": "8885cc1daec1b7c76ae7d98c96e83e7ee882795a2e511e4748eb9f5725efa387",
+      "sha256": "c4a82503b75915bccad79598846d92488caaeab93f44521f356aef9fd336c542"
+    },
+    "device/package/GpuSqeCapture.h": {
+      "repository": "device",
+      "path": "package/GpuSqeCapture.h",
+      "before_sha256": null,
+      "sha256": "0aaa5455e3f992ce53a8d61b1e5cf0bb04834e1e39ca4c6ba74f04ffcdd3f8c4"
+    },
+    "UniXNU/scripts/prepare-xnu-source.py": {
+      "repository": "UniXNU",
+      "path": "scripts/prepare-xnu-source.py",
+      "before_sha256": "1ad6cc259a39fdf9b9059e0d748a316f0b2bf64853aef11dff709647706d27af",
+      "sha256": "ccc67d68eea39d1fdfc5527ba5c07a759282d277ec94e7df37a38789ccb0f431"
+    },
+    "UniXNU/scripts/data/xnu-restored-header-inputs.json": {
+      "repository": "UniXNU",
+      "path": "scripts/data/xnu-restored-header-inputs.json",
+      "before_sha256": null,
+      "sha256": "b9bf8e25bec65d104e510fedc6a4b3650daf7131738ea79babd97989c6bf1ee9"
+    },
+    "UniXNU/scripts/fetch-adreno-inputs.py": {
+      "repository": "UniXNU",
+      "path": "scripts/fetch-adreno-inputs.py",
+      "before_sha256": "a854723a3a5530811aa628172b09096def25b6f319609b5f35dc29fe54b2fa15",
+      "sha256": "aa264d5df189a96563bcd80954d9cc1f86082b2ab6631af0634bdbe534105d2d"
     }
   },
-  "candidate_version": "V5.2",
+  "candidate_version": "V5.3",
   "base_actions_run": 43140807984
 }

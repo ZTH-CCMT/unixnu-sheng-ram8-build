@@ -115,3 +115,27 @@ not emulate A740 execution or demonstrate that duplicate writes caused the
 recorded hardware timeout. Native ARM64e build and device testing are pending.
 Queue count, scheduling policy, timeout, power setup, packets and V4.2 reset
 fallback are unchanged. V5.1 diagnostic capture remains in this candidate.
+
+## V5.3 low-level pre-reset evidence
+
+This diagnostic candidate retains V5.2 behavior and records the first two
+preemption timeouts before progress/stall/reset handling. A typed 359-word
+schema freezes actual hardware-published ring-tail bytes at trigger time,
+record/SMMU pages before and after the switch, restore/status registers,
+ordered BR/BV indexed SQE samples, read statuses and timestamps. Empty-ring
+RPTR==WPTR does not suppress SQE capture. The ring tail ends before hardware
+WPTR and excludes the unpublished software region; it is raw historical ring
+storage, not proof that every retained command executed.
+
+The optional board callback shares the index-port gate with heartbeat reads.
+It disables local interrupts and tries once with a strong CAS, preserves each
+selector, and stops a bank on its first failed DATA read without guessing later
+indices. No allocation, sleeping or GPU scheduler callback occurs under this
+gate. The old 44-word copy API is unchanged. The new copy API performs no MMIO
+and acquires immutable slots published before recovery.
+
+Windows actual-source regressions, five negative controls, board adapter/helper
+checks and BootLog format/decoder checks pass. Complete native ARM64e build and
+hardware capture are still pending. This is not a fix or proof of the first
+hardware timeout. GPU firmware, queue policy, timeout and recovery policy are
+unchanged. Ordered register/page reads do not make an atomic hardware snapshot.

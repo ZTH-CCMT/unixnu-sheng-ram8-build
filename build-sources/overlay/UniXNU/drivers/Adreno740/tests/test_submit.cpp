@@ -42,6 +42,7 @@ struct CpPeer {
     std::vector<uint32_t> regs;
     std::vector<uint32_t> writes;
     unsigned publish=0,acquire=0,barriers=0,fail_publish=0,fail_acquire=0,fail_barrier=0;
+    unsigned sqe_calls=0;bool diagnostic_callbacks=true;
     uint32_t fail_read_reg=~0u,fail_write_reg=~0u;
     CpPeer():regs(0x10000,0){}
 };
@@ -119,8 +120,8 @@ struct DualRingPath : Path {
     NativeAdrenoRing low;
     uint32_t low_words[8192]{};
     uint32_t low_fences[1024]{};
-    uint8_t records[2][64]{};
-    uint8_t smmu_info[2][32]{};
+    alignas(4) uint8_t records[2][64]{};
+    alignas(4) uint8_t smmu_info[2][32]{};
     bool keepalive=false;
     unsigned restart_count=0;
     uint32_t restart_fence=~0u;
@@ -138,6 +139,16 @@ struct DualRingPath : Path {
             static_cast<DualRingPath *>(cookie)->keepalive=value!=0;
             return 0;
         }};
+        config.io.sqe_snapshot=[](void *cookie,NativeAdrenoSqeSnapshot *out)->int {
+            CHECK(cookie==&cp);++cp.sqe_calls;
+            // A failed/unsupported callback can leave no valid data.
+            if(!cp.diagnostic_callbacks)return -55;
+            CHECK(cp.regs[0x08a0]&1); // Hardware reset has not yet cleared STOP.
+            out->words[0][0]=0;out->valid_mask[0][0]=1;
+            out->words[1][0]=0x741;out->valid_mask[1][0]=1;
+            out->read_status[0]=out->read_status[1]=0;
+            return 0;
+        };
         config.pages={{0x300000,0x500000},{0x400000,0x600000},{records[0],records[1]},{smmu_info[0],smmu_info[1]}};
         config.now=cnow;
         config.clock=&cp;
@@ -634,6 +645,7 @@ static void testBoardExecutionResetAndSecondHangKeepFenceHistory()
 
 // These run first: timeout evidence keeps the first two events for the boot lifetime.
 static uint32_t expected_timeout[2][NativeAdrenoSwitchTimeoutWords];
+static uint32_t expected_evidence[2][NativeAdrenoSwitchEvidenceWords];
 static void testInterleavedDiagnosticFences()
 {
     DualRingPath p;p.setup();
@@ -666,6 +678,9 @@ static void testFrozenTimeoutEvidence()
     CHECK(!native_adreno_switch_timeout_copy(0,copy,NativeAdrenoSwitchTimeoutWords));
     CHECK(!std::memcmp(copy,canary,sizeof(copy)));
     CHECK(!native_adreno_switch_timeouts);
+    uint32_t raw[NativeAdrenoSwitchEvidenceWords];for(auto &word:raw)word=0xaabbccdd;
+    CHECK(!native_adreno_switch_evidence_copy(0,raw,NativeAdrenoSwitchEvidenceWords));
+    for(auto word:raw)CHECK(word==0xaabbccdd);
     for(unsigned slot=0;slot<2;++slot) {
         DualRingPath p;p.setup();
         uint32_t blocked=0,completed=0;
@@ -676,6 +691,8 @@ static void testFrozenTimeoutEvidence()
             p.low.writePointer(),p.low.current()?1u:0u,p.low.restorePending()?1u:0u};
         // Hardware samples are distinctive, and do not rely on an all-zero CP peer.
         cp.regs[0x0210]=0x11110000+slot;cp.regs[0x0201]=0x22220000+slot;cp.regs[0x0821]=0x33330000+slot;
+        // Both pointers equal: the diagnostic must still run on idle-ring STOP.
+        cp.regs[0x0806]=cp.regs[0x0807];
         const uint32_t rptr=cp.regs[0x0806],wptr=cp.regs[0x0807];
         const uint32_t progress[6]={0x3a000+slot,1,0x44000+slot,1,0,0};
         cp.regs[0x0928]=progress[0];cp.regs[0x0929]=progress[1];
@@ -684,6 +701,16 @@ static void testFrozenTimeoutEvidence()
         clock_us+=1000001;bool hung=false;
         CHECK(p.submit.hangCheck(&hung)==kIOReturnSuccess && hung);
         CHECK(native_adreno_switch_timeouts==slot+1);
+        CHECK(cp.sqe_calls==1 && p.restart_count==0);
+        CHECK(native_adreno_switch_evidence_copy(slot,raw,NativeAdrenoSwitchEvidenceWords)==NativeAdrenoSwitchEvidenceWords);
+        NativeAdrenoSwitchEvidence evidence{};std::memcpy(&evidence,raw,sizeof evidence);
+        CHECK(evidence.version==1 && evidence.word_count==NativeAdrenoSwitchEvidenceWords && evidence.reason==2);
+        CHECK(evidence.sequence==native_adreno_switch_count && evidence.from_ring==(slot?0u:1u) && evidence.to_ring==(slot?1u:0u));
+        CHECK(evidence.registers[6]==evidence.registers[7] && (evidence.register_valid_mask&0xc0)==0xc0);
+        CHECK(evidence.sqe_status==0 && evidence.sqe.words[0][0]==0 && evidence.sqe.valid_mask[0][0]==1);
+        CHECK(evidence.before.valid_mask==15 && evidence.after.valid_mask==15);
+        CHECK(evidence.published_tail.hw_wptr==wptr && evidence.published_tail.count==64);
+        std::memcpy(expected_evidence[slot],raw,sizeof raw);
         CHECK(native_adreno_switch_timeout_copy(slot,copy,NativeAdrenoSwitchTimeoutWords));
         CHECK(copy[0]==2 && copy[1]==1 && !copy[2] && !copy[3]);
         const uint32_t *e=copy+4;
@@ -708,13 +735,17 @@ static void testFrozenTimeoutEvidence()
         }
         CHECK(native_adreno_switch_timeout_copy(slot,copy,NativeAdrenoSwitchTimeoutWords));
         CHECK(!std::memcmp(copy,expected_timeout[slot],sizeof(copy)));
+        CHECK(native_adreno_switch_evidence_copy(slot,raw,NativeAdrenoSwitchEvidenceWords)==NativeAdrenoSwitchEvidenceWords);
+        CHECK(!std::memcmp(raw,expected_evidence[slot],sizeof raw));
     }
+    std::puts("PASS V5.3 real Submit timeout captures equal-pointer SQE before reset and preserves immutable evidence");
     std::puts("PASS frozen timeout direction, reason, read status, hardware/record/software state survive late completion and reset");
 }
 static void testTimeoutEvidenceReadFailure()
 {
     DualRingPath p;p.setup();p.enqueue(1,7);
     cp.fail_read_reg=0x0928; // The first progress IB word; also read by stallState.
+    cp.diagnostic_callbacks=false;
     clock_us+=1000001;bool hung=false;
     CHECK(p.submit.hangCheck(&hung)==kIOReturnSuccess && hung);
     uint32_t copy[NativeAdrenoSwitchTimeoutWords];
@@ -722,6 +753,12 @@ static void testTimeoutEvidenceReadFailure()
     CHECK(copy[0]==2 && copy[1]==1);
     CHECK(copy[2]==uint32_t(kIOReturnIOError) && copy[3]!=uint32_t(kIOReturnSuccess));
     CHECK(copy[9]==(0x100u|2u<<16));
+    uint32_t raw[NativeAdrenoSwitchEvidenceWords];
+    CHECK(native_adreno_switch_evidence_copy(0,raw,NativeAdrenoSwitchEvidenceWords)==NativeAdrenoSwitchEvidenceWords);
+    NativeAdrenoSwitchEvidence evidence{};std::memcpy(&evidence,raw,sizeof evidence);
+    CHECK(evidence.sqe_status==-55 && !evidence.sqe.valid_mask[0][0] && evidence.sqe.words[0][0]==UINT32_MAX);
+    CHECK(evidence.sqe.selector_read_status[0]==-1 && !p.restart_count);
+    std::puts("PASS failed/busy SQE callback is not valid zero and does not suppress timeout handling");
     std::puts("PASS failed progress/stall reads remain explicitly invalid in the captured event");
 }
 static void checkFrozenTimeoutEvidenceAfterLaterEvents()
@@ -737,6 +774,16 @@ static void checkFrozenTimeoutEvidenceAfterLaterEvents()
     CHECK(!native_adreno_switch_timeout_copy(0,copy,NativeAdrenoSwitchTimeoutWords-1));
     CHECK(!native_adreno_switch_timeout_copy(0,nullptr,NativeAdrenoSwitchTimeoutWords));
     CHECK(!std::memcmp(copy,canary,sizeof(copy)));
+    uint32_t raw[NativeAdrenoSwitchEvidenceWords],before[NativeAdrenoSwitchEvidenceWords];
+    for(unsigned slot=0;slot<2;++slot) {
+        CHECK(native_adreno_switch_evidence_copy(slot,raw,NativeAdrenoSwitchEvidenceWords)==NativeAdrenoSwitchEvidenceWords);
+        CHECK(!std::memcmp(raw,expected_evidence[slot],sizeof raw));
+    }
+    std::memcpy(before,raw,sizeof raw);
+    CHECK(!native_adreno_switch_evidence_copy(2,raw,NativeAdrenoSwitchEvidenceWords));
+    CHECK(!native_adreno_switch_evidence_copy(0,raw,NativeAdrenoSwitchEvidenceWords-1));
+    CHECK(!native_adreno_switch_evidence_copy(0,nullptr,NativeAdrenoSwitchEvidenceWords));
+    CHECK(!std::memcmp(before,raw,sizeof raw));
     std::puts("PASS later timeouts and recovery leave both frozen slots unchanged; rejected reads leave output untouched");
 }
 

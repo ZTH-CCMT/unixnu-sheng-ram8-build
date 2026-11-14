@@ -91,6 +91,7 @@ extern volatile uint32_t native_adreno_kernel_alloc_fail[6] __attribute__((weak_
 extern volatile uint32_t native_adreno_switch_timeout[2][30] __attribute__((weak_import)), native_adreno_switch_timeouts __attribute__((weak_import));
 // Copies a release-published immutable timeout snapshot; no GPU lock or live MMIO reads here.
 extern bool native_adreno_switch_timeout_copy(uint32_t index, uint32_t *out, size_t words) __attribute__((weak_import));
+extern uint32_t native_adreno_switch_evidence_copy(uint32_t index, uint32_t *out, size_t capacity_words) __attribute__((weak_import));
 extern uint32_t ml_outside_memory_pages __attribute__((weak_import)), ml_outside_memory_refused __attribute__((weak_import));
 extern volatile uint64_t native_adreno_pool_scrubbing[16][2] __attribute__((weak_import));
 extern volatile int native_gpu_addon_written __attribute__((weak_import));
@@ -565,6 +566,33 @@ static size_t compose(char *out, size_t cap, uint32_t slot, unsigned now) {
   const int n = snprintf(head, sizeof head, "#slot %u t=%us tag=%s", slot, now, &boot_progress_tag ? boot_progress_tag() : "");
   if (log_diag_on && n > 0 && (size_t)n < sizeof head) snprintf(head + n, sizeof head - (size_t)n, " diag=1 export-at=%us", log_diag_export_at);
   at = put(out, at, cap, head, sizeof head);
+  // BEGIN GPU V5.3 LOW LEVEL EVIDENCE FORMAT
+  // Immutable snapshots are emitted before the verbose sections can fill this 64 KiB slot.
+  // The first word is the schema version; the copy API returns the complete word count, or zero.
+  // Keep raw fixed-width words: the offline schema distinguishes a failed read from a measured zero.
+  if (log_gpu_on && native_adreno_switch_evidence_copy) {
+    for (uint32_t e = 0; e < 2; ++e) {
+      uint32_t v[512] = {0};
+      const uint32_t words = native_adreno_switch_evidence_copy(e, v, 512);
+      if (!words) continue;
+      char row[256];
+      if (words > 512) {
+        snprintf(row, sizeof row, "[gpu switch low %u invalid] words=%u capacity=512", e, words);
+        at = put(out, at, cap, row, sizeof row);
+        continue;
+      }
+      snprintf(row, sizeof row, "[gpu switch low %u] schema=%u words=%u", e, v[0], words);
+      at = put(out, at, cap, row, sizeof row);
+      for (uint32_t first = 0; first < words; first += 8) {
+        int n = snprintf(row, sizeof row, "[gpu switch low %u words %03u]", e, first);
+        for (uint32_t k = first; k < words && k < first + 8 && n > 0 && (size_t)n < sizeof row; ++k)
+          n += snprintf(row + n, sizeof row - (size_t)n, " 0x%08x", v[k]);
+        at = put(out, at, cap, row, sizeof row);
+      }
+    }
+  }
+  // END GPU V5.3 LOW LEVEL EVIDENCE FORMAT
+
   if (&boot_progress_page_text) {
     at = put(out, at, cap, "[page]", 8);
     for (unsigned i = 0; i < 48; ++i) if (boot_progress_page_text[i][0]) at = put(out, at, cap, boot_progress_page_text[i], 120);

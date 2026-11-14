@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import struct
@@ -17,8 +18,9 @@ PROFILE = 'ipados-27.0.1-24A446'
 DUMMY_CHIP = '13579bdf'
 RAM_BYTES = 8 * 1024**3
 DATA_BYTES = 215 * 1024**3
-VERSION = 'V5.2'
-GPU_SOURCE_SHA = 'd7ef01bb43feb66b20a742d6105c3757604851be55413a62b6dd57984d9eaf32'
+VERSION = 'V5.3'
+GPU_SOURCE_SHA = 'ee9ba0f8730a22ab83970160e99115de7b42e7a6c4c456081cf1978fe980b7c7'
+GPU_BOARD_SHA = {'GpuPowerProbe.cpp': 'c4a82503b75915bccad79598846d92488caaeab93f44521f356aef9fd336c542', 'GpuSqeCapture.h': '0aaa5455e3f992ce53a8d61b1e5cf0bb04834e1e39ca4c6ba74f04ffcdd3f8c4', 'BootLog.c': '642d62a50f9b75b4b5bc7d395027fa838f92837f7f0a6b1e7e86598b200706ac'}
 TURNIP_KMD = 'src/freedreno/vulkan/tu_knl_darwin.cc'
 TURNIP_KMD_SHA = '28dbfb342333cbfc70da733ad26102ed64ec502ca002f12c0940a7175627df1c'
 SEED_SHA = 'e1bfa6971ef9fe6a27b53474c509cd518325459484230daf7f679642a04323b3'
@@ -117,22 +119,90 @@ def property_bytes(name, value):
 
 
 
+GPU_EVIDENCE_SYMBOL = '_native_adreno_switch_evidence_copy'
+
+
+def archived_object(archive, obj):
+    members = run('xcrun', 'ar', 't', archive, capture_output=True, text=True).stdout.splitlines()
+    require(members.count(obj.name) == 1, f'Expected one {obj.name} in {archive.name}')
+    archived = run('xcrun', 'ar', 'p', archive, obj.name, capture_output=True).stdout
+    require(archived == obj.read_bytes(), f'Archive member differs from {obj.name}')
+    return {'object_sha256': digest(obj), 'archive_sha256': digest(archive)}
+
+
+def object_symbol(obj, symbol):
+    output = run('xcrun', 'nm', '-m', obj, capture_output=True, text=True).stdout
+    lines = [line.strip() for line in output.splitlines() if re.search(symbol, line)]
+    require(len(lines) == 1, f'Expected one {symbol} in {obj.name}')
+    return lines[0]
+
+
+def gpu_evidence_objects(tree):
+    board = tree / 'kits/sheng'
+    for name, expected in GPU_BOARD_SHA.items():
+        require(digest(board / name) == expected, f'GPU board source differs: {name}')
+
+    adreno = tree / 'build/adreno740'
+    submit = adreno / 'NativeAdrenoSubmit.o'
+    submit_meta = archived_object(adreno / 'libAdreno740.a', submit)
+    definition = object_symbol(submit, rf'\s{GPU_EVIDENCE_SYMBOL}$')
+    require('(__TEXT,__text)' in definition and 'external' in definition
+            and 'weak' not in definition, 'Adreno evidence copy is not a strong text definition')
+
+    legacy = tree / 'build/native-legacy-display'
+    probe = legacy / 'board/GpuPowerProbe.o'
+    probe_meta = archived_object(legacy / 'libNativeLegacyDisplay.late.a', probe)
+    callback = object_symbol(probe, r'\s\S*boardSqeSnapshot\S*$')
+    require('(__TEXT,__text)' in callback, 'GpuPowerProbe lacks the SQE callback definition')
+
+    storage = tree / 'build/sheng-source-storage'
+    bootlog = storage / 'BootLog.o'
+    bootlog_meta = archived_object(storage / 'libShengSourceStorage.a', bootlog)
+    call = object_symbol(bootlog, rf'\s{GPU_EVIDENCE_SYMBOL}$')
+    require('(undefined)' in call, 'BootLog does not reference the Adreno evidence copy')
+    return {'board_source_sha256': GPU_BOARD_SHA,
+            'NativeAdrenoSubmit.o': dict(submit_meta, symbol=definition),
+            'GpuPowerProbe.o': dict(probe_meta, symbol=callback),
+            'BootLog.o': dict(bootlog_meta, symbol=call)}
+
+
 def gpu_diagnostic_symbols(tree, kernel):
     sys.path.insert(0, str(tree / 'kits/XnuPrelink'))
-    from kc_image import Image
+    from kc_image import Image, LC_SYMTAB
 
     raw = kernel.read_bytes()
     fileset = Image(raw)
     image = Image(raw, fileset.entries['com.apple.kernel'][1])
-    symbols = image.symbols()
+    symbol_command = image.command(LC_SYMTAB)
+    require(symbol_command is not None, 'Packaged kernel lacks a symbol table')
+    symoff, count, stroff, _ = struct.unpack_from('<4I', raw, symbol_command[0] + 8)
+    names = ('_native_adreno_reset_epoch', '_native_adreno_switch_timeout_copy',
+             GPU_EVIDENCE_SYMBOL)
+    found = {name.encode(): [] for name in names}
+    for index in range(count):
+        strx, kind, _, desc, address = struct.unpack_from('<IBBHQ', raw, symoff + 16 * index)
+        if kind & 0xe0 or kind & 0x0e != 0x0e:
+            continue
+        start = stroff + strx
+        end = raw.find(b'\0', start)
+        name = raw[start:end]
+        if name in found:
+            found[name].append((address, desc))
     addresses = []
-    for name in ('_native_adreno_reset_epoch', '_native_adreno_switch_timeout_copy'):
-        matches = [address for address, names in symbols.items() if name in names]
+    for name in names:
+        matches = found[name.encode()]
         require(len(matches) == 1, f'Packaged kernel must define {name} exactly once')
-        address, = matches
+        address, desc = matches[0]
         section = image.section(address)
         require(section and (section['segment'], section['name']) == ('__TEXT_EXEC', '__text'),
                 f'{name} is not executable kernel code')
+        if name == GPU_EVIDENCE_SYMBOL:
+            require((desc & 0x0080) == 0, 'Packaged Adreno evidence copy resolved to the weak fallback')
+            instructions = list(struct.unpack('<3I', image.read(address, 12)))
+            if instructions[0] in (0xd503241f, 0xd503245f, 0xd503249f, 0xd50324df):
+                instructions.pop(0)
+            require(instructions[:2] not in ([0x52800000, 0xd65f03c0], [0x2a1f03e0, 0xd65f03c0]),
+                    'Packaged Adreno evidence copy is a return-zero stub')
         image.offset(address, 4)
         addresses.append(hex(address))
     return addresses
@@ -222,8 +292,8 @@ def main():
     require(gpu_trace['source_sha256'] == GPU_SOURCE_SHA
             and gpu_trace['trace_source_id'] == GPU_SOURCE_SHA[:16]
             and gpu_trace['target'] == 'arm64e-apple-ios27.0',
-            'Compiled Adreno source identity differs from the V5.2 candidate')
-    print(f'Adreno V5.2 source ID {gpu_trace["trace_source_id"]}', flush=True)
+            'Compiled Adreno source identity differs from the V5.3 candidate')
+    print(f'Adreno V5.3 source ID {gpu_trace["trace_source_id"]}', flush=True)
 
     stage = top / 'os27-ram8-handoff.partial'
     stage.mkdir()
@@ -240,7 +310,14 @@ def main():
     payload_kernel = stage / 'payload-kernel-check.macho'
     fat_readback(payload, 'Payloads/kernel.macho', payload_kernel)
     require(digest(payload_kernel) == payload_info['payload_kernel_sha256'], 'Packed kernel digest differs')
-    gpu_reset_address, gpu_timeout_address = gpu_diagnostic_symbols(tree, payload_kernel)
+    gpu_objects = gpu_evidence_objects(tree)
+    gpu_reset_address, gpu_timeout_address, gpu_evidence_address = gpu_diagnostic_symbols(tree, payload_kernel)
+    gpu_link_path = stage / 'gpu-sqe-link-evidence.json'
+    gpu_objects.update(status='VERIFIED_STRONG_PACKAGED_GPU_SQE_COPY',
+                       packaged_symbol=gpu_evidence_address,
+                       packaged_kernel_sha256=digest(payload_kernel))
+    gpu_link_path.write_text(json.dumps(gpu_objects, indent=2) + '\n')
+    print(f'GPU SQE evidence copy linked strongly at {gpu_evidence_address}', flush=True)
     print(f'GPU reset generation linked in packaged kernel at {gpu_reset_address}', flush=True)
     payload_kernel.unlink()
     for label, member in (('gpu_addon', 'kernel.macho.gpuaddon'),
@@ -288,6 +365,9 @@ def main():
         'profile': PROFILE, 'synthetic_platform_seed': DUMMY_CHIP,
         'candidate_version': VERSION, 'gpu_reset_epoch_symbol': gpu_reset_address,
         'gpu_switch_timeout_copy_symbol': gpu_timeout_address,
+        'gpu_switch_evidence_copy_symbol': gpu_evidence_address,
+        'gpu_sqe_link_evidence_sha256': digest(gpu_link_path),
+        'gpu_board_source_sha256': GPU_BOARD_SHA,
         'gpu_source_sha256': GPU_SOURCE_SHA,
         'gpu_trace_source_id': gpu_trace['trace_source_id'],
         'turnip_source_id': turnip['source_id'], 'turnip_kmd_sha256': TURNIP_KMD_SHA,

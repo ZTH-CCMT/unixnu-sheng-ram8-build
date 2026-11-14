@@ -112,7 +112,7 @@ IOReturn NativeAdrenoPreempt::programSwitchRegisters()
 
 IOReturn NativeAdrenoPreempt::restart(uint32_t ring)
 {
-    loaded_=ring;next_=ring;armed_=false;event_=nullptr;
+    loaded_=ring;next_=ring;armed_=false;event_=nullptr;evidence_valid_=false;
     if(!releaseKeepalive())return kIOReturnIOError;
     return programSwitchRegisters();
 }
@@ -162,7 +162,78 @@ void NativeAdrenoPreempt::closeEvent(uint32_t outcome)
     if(!io_.read32(io_.cookie,RegCpRbWptr,&v))wptr=v&0xffff;
     row[11]=rptr|wptr<<16;
     snapshot(row,20);
-    event_=nullptr;
+    event_=nullptr;evidence_valid_=false;
+}
+static void evidenceTime(uint32_t out[2],uint64_t value)
+{
+    out[0]=uint32_t(value);out[1]=uint32_t(value>>32);
+}
+static uint32_t diagnosticRead32(const volatile uint8_t *at)
+{
+    /* Production record/SMMU mappings are page aligned; capturePages accepts only
+     * aligned mappings and uses 4-byte offsets. One volatile word load avoids
+     * combining bytes across a GPU write. The whole capture is still non-atomic. */
+    return *reinterpret_cast<const volatile uint32_t *>(at);
+}
+void NativeAdrenoPreempt::capturePages(NativeAdrenoPreemptPages *out) const
+{
+    *out={};
+    for(unsigned r=0;r<2;++r) {
+        for(unsigned i=0;i<16;++i)out->record[r][i]=UINT32_MAX;
+        for(unsigned i=0;i<7;++i)out->smmu[r][i]=UINT32_MAX;
+    }
+    out->barrier_status=io_.barrier(io_.cookie);
+    if(out->barrier_status)return;
+    for(unsigned r=0;r<2;++r) {
+        if(rings_.record_cpu[r] && !(reinterpret_cast<uintptr_t>(rings_.record_cpu[r])&3u)) {
+            for(unsigned i=0;i<16;++i)out->record[r][i]=diagnosticRead32(rings_.record_cpu[r]+4*i);
+            out->valid_mask|=1u<<r;
+        }
+        if(rings_.smmu_cpu[r] && !(reinterpret_cast<uintptr_t>(rings_.smmu_cpu[r])&3u)) {
+            for(unsigned i=0;i<7;++i)out->smmu[r][i]=diagnosticRead32(rings_.smmu_cpu[r]+4*i);
+            out->valid_mask|=4u<<r;
+        }
+    }
+}
+void NativeAdrenoPreempt::beginEvidence(const NativeAdrenoPublishedTail &tail)
+{
+    evidence_={};evidence_.version=NativeAdrenoSwitchEvidenceVersion;
+    evidence_.word_count=NativeAdrenoSwitchEvidenceWords;
+    evidence_.sequence=event_[0];evidence_.from_ring=event_[5]&255u;evidence_.to_ring=(event_[5]>>8)&255u;
+    evidence_.clock_present=now_us_?1:0;
+    evidence_.trigger_us[0]=event_[1];evidence_.trigger_us[1]=event_[2];
+    evidence_.published_tail=tail;
+    for(unsigned r=0;r<2;++r) {
+        evidenceTime(evidence_.record_iova[r],rings_.record[r]);
+        evidenceTime(evidence_.smmu_iova[r],rings_.smmu_info[r]);
+    }
+    capturePages(&evidence_.before);
+    evidence_valid_=true;
+}
+bool NativeAdrenoPreempt::captureTimeoutEvidence(uint32_t reason,NativeAdrenoSwitchEvidence *out)
+{
+    if(!out || !armed_ || !event_ || !evidence_valid_ || evidence_captured_)return false;
+    evidence_captured_=true;evidence_.reason=reason;
+    evidenceTime(evidence_.begin_us,now_us_?now_us_(clock_cookie_):0);
+    static const uint32_t regs[NativeAdrenoEvidenceRegs]={0x08a0,0x08a1,0x08a2,0x08a3,0x08a4,0x08ab,0x0806,0x0807,0x08a0};
+    evidence_.register_valid_mask=0;
+    for(unsigned i=0;i<NativeAdrenoEvidenceRegs;++i) {
+        evidence_.registers[i]=UINT32_MAX;evidence_.register_status[i]=-1;
+    }
+    for(unsigned i=0;i<NativeAdrenoEvidenceRegs-1;++i) {
+        uint32_t value=UINT32_MAX;
+        evidence_.register_status[i]=io_.read32(io_.cookie,regs[i],&value);
+        if(!evidence_.register_status[i]) {evidence_.registers[i]=value;evidence_.register_valid_mask|=1u<<i;}
+    }
+    NativeAdrenoSqeSnapshotInit(&evidence_.sqe);
+    evidence_.sqe_status=io_.sqe_snapshot?io_.sqe_snapshot(io_.cookie,&evidence_.sqe):-1;
+    capturePages(&evidence_.after);
+    uint32_t value=UINT32_MAX;
+    evidence_.register_status[8]=io_.read32(io_.cookie,regs[8],&value);
+    if(!evidence_.register_status[8]) {evidence_.registers[8]=value;evidence_.register_valid_mask|=1u<<8;}
+    evidenceTime(evidence_.end_us,now_us_?now_us_(clock_cookie_):0);
+    *out=evidence_;
+    return true;
 }
 bool NativeAdrenoPreempt::noteTimeout(const uint32_t progress[6],uint32_t *event_out)
 {
@@ -174,7 +245,8 @@ bool NativeAdrenoPreempt::noteTimeout(const uint32_t progress[6],uint32_t *event
     if(event_out)for(unsigned i=0;i<NativeAdrenoSwitchLogWords;++i)event_out[i]=closed[i];
     return true;
 }
-bool NativeAdrenoPreempt::trigger(uint32_t ring,bool uses_gmem)
+bool NativeAdrenoPreempt::trigger(uint32_t ring,bool uses_gmem,
+    void (*capture_tail)(void *,NativeAdrenoPublishedTail *),void *tail_cookie)
 {
     if(!attached_ || armed_ || ring>=NativeAdrenoPreemptRingCount || ring==loaded_)return false;
     /* Hold the GPU awake before programming any restore register. */
@@ -183,6 +255,15 @@ bool NativeAdrenoPreempt::trigger(uint32_t ring,bool uses_gmem)
     if(io_.barrier(io_.cookie)) {releaseKeepalive();return false;}
     const uint64_t info=rings_.smmu_info[ring],record=rings_.record[ring];
     event_=openEvent(ring);
+    evidence_valid_=false;evidence_captured_=false;
+    if(capture_tail) {
+        NativeAdrenoPublishedTail tail{};
+        const uint64_t begin=now_us_?now_us_(clock_cookie_):0;
+        capture_tail(tail_cookie,&tail);
+        evidenceTime(tail.begin_us,begin);
+        evidenceTime(tail.end_us,now_us_?now_us_(clock_cookie_):0);
+        beginEvidence(tail);
+    }
     if(io_.write32(io_.cookie,PreemptSmmuInfo,(uint32_t)info) ||
         io_.write32(io_.cookie,PreemptSmmuInfo+1,(uint32_t)(info>>32)) ||
         io_.write32(io_.cookie,PreemptRestoreAddr,(uint32_t)record) ||
@@ -194,6 +275,7 @@ bool NativeAdrenoPreempt::trigger(uint32_t ring,bool uses_gmem)
     event_[6]=readCntl();
     next_=ring;armed_=true;
     trigger_us_=now_us_?now_us_(clock_cookie_):0;
+    if(evidence_valid_)evidenceTime(evidence_.trigger_us,trigger_us_);
     stats_.triggers=stats_.triggers+1;
     return true;
 }

@@ -68,6 +68,19 @@ extern "C" bool native_adreno_switch_timeout_copy(uint32_t index,uint32_t *out,s
     for(size_t i=0;i<NativeAdrenoSwitchTimeoutWords;++i)out[i]=switch_timeout_detail[index][i];
     return true;
 }
+/* V5.3 separate schema: no expansion or reinterpretation of the old 44 words. */
+static NativeAdrenoSwitchEvidence switch_evidence[NativeAdrenoSwitchEvidenceSlots];
+static uint32_t switch_evidence_ready;
+extern "C" uint32_t native_adreno_switch_evidence_copy(uint32_t index,uint32_t *out,size_t capacity_words)
+{
+    if(!out || capacity_words<NativeAdrenoSwitchEvidenceWords || index>=NativeAdrenoSwitchEvidenceSlots ||
+        index>=__atomic_load_n(&switch_evidence_ready,__ATOMIC_ACQUIRE))return 0;
+    /* Byte copy avoids type-punning between the C schema and a uint32_t array. */
+    const unsigned char *src=reinterpret_cast<const unsigned char *>(&switch_evidence[index]);
+    unsigned char *dst=reinterpret_cast<unsigned char *>(out);
+    for(size_t i=0;i<sizeof(NativeAdrenoSwitchEvidence);++i)dst[i]=src[i];
+    return NativeAdrenoSwitchEvidenceWords;
+}
 /* 16 words of the IB at start, from 12 dwords before the dword the thread has reached (size minus what remains). */
 static void peekIb(const NativeAdrenoVm *vm,uint64_t start,uint32_t size,uint32_t remaining,volatile uint32_t *slot)
 {
@@ -319,7 +332,11 @@ void NativeAdrenoSubmit::driveSwitch(const NativeAdrenoRingClock *clock)
         (void)NativeAdrenoPreempt::writeSmmuInfo(preempt_setup_.pages.smmu_cpu[i],ttbr0,uint32_t(ttbr0>>48),0);
         // The target's current record may become visible as soon as STOP is written.
         exposed_through_[i]=incoming->lastSubmitted();
-        if(preempt_.trigger(i,true)) {aging_grant_=i==1 && high;ring(0)->setCurrent(false);ring(1)->setCurrent(false);return;}
+        const bool capture=__atomic_load_n(&switch_evidence_ready,__ATOMIC_RELAXED)<NativeAdrenoSwitchEvidenceSlots;
+        const auto capture_tail=[](void *cookie,NativeAdrenoPublishedTail *out) {
+            static_cast<NativeAdrenoRing *>(cookie)->capturePublishedTail(out);
+        };
+        if(preempt_.trigger(i,true,capture?+capture_tail:nullptr,ring(loaded))) {aging_grant_=i==1 && high;ring(0)->setCurrent(false);ring(1)->setCurrent(false);return;}
         /* A failed register write can leave target exposure uncertain. The
          * watchdog will recover pending work on either ring. */
         preempt_.noteSkipped();
@@ -978,6 +995,12 @@ bool NativeAdrenoSubmit::madeProgress(unsigned index)
 void NativeAdrenoSubmit::noteSwitchTimeout(uint32_t reason)
 {
     if(preempt_dead_)return;
+    /* Freeze before progress/stall helpers, late completion, recovery or reset.
+     * Idle pointers do not suppress SQE inspection: STOP can hang at an empty ring. */
+    const uint32_t evidence_slot=__atomic_load_n(&switch_evidence_ready,__ATOMIC_RELAXED);
+    if(evidence_slot<NativeAdrenoSwitchEvidenceSlots &&
+        preempt_.captureTimeoutEvidence(reason,&switch_evidence[evidence_slot]))
+        __atomic_store_n(&switch_evidence_ready,evidence_slot+1,__ATOMIC_RELEASE);
     uint32_t progress[6]={};
     const IOReturn progress_status=ring(preempt_.loaded())->progressState(progress);
     const uint32_t n=__atomic_load_n(&native_adreno_switch_timeouts,__ATOMIC_RELAXED);

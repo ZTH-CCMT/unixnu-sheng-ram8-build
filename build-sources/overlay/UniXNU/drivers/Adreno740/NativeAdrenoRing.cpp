@@ -165,6 +165,36 @@ IOReturn NativeAdrenoRing::stallState(uint32_t *out)
         if(io_.read32(io_.cookie,regs[i],&out[i]))return poison();
     return kIOReturnSuccess;
 }
+void NativeAdrenoRing::capturePublishedTail(NativeAdrenoPublishedTail *out) const
+{
+    if(!out)return;
+    *out={};
+    out->ring_words=uint32_t(ring_bytes_/4);out->software_next=next_;
+    out->hw_rptr=out->hw_wptr=out->first=UINT32_MAX;
+    out->read_status[0]=out->read_status[1]=out->barrier_status=-1;
+    for(unsigned i=0;i<NativeAdrenoPublishedTailWords;++i)out->words[i]=UINT32_MAX;
+    if(!attached_ || !ring_ || !io_.read32 || !io_.barrier || !out->ring_words)return;
+    const uint32_t regs[2]={RingRptr,RingWptr};
+    for(unsigned i=0;i<2;++i) {
+        uint32_t value=UINT32_MAX;
+        out->read_status[i]=io_.read32(io_.cookie,regs[i],&value);
+        if(!out->read_status[i]) {
+            (i?out->hw_wptr:out->hw_rptr)=value;out->valid_mask|=1u<<i;
+        }
+    }
+    if(!(out->valid_mask&2u) || out->hw_wptr>=out->ring_words || next_>=out->ring_words)return;
+    out->barrier_status=io_.barrier(io_.cookie);
+    if(out->barrier_status)return;
+    const uint32_t mask=out->ring_words-1;
+    /* Pending commands can wrap almost a whole ring. Do not mistake their
+     * overwritten bytes immediately before WPTR for the older published tail. */
+    const uint32_t unpublished=(next_-out->hw_wptr)&mask;
+    const uint32_t available=out->ring_words-unpublished;
+    out->count=available<NativeAdrenoPublishedTailWords?available:NativeAdrenoPublishedTailWords;
+    out->first=(out->hw_wptr-out->count)&mask;
+    for(uint32_t i=0;i<out->count;++i)out->words[i]=ring_[(out->first+i)&mask];
+    out->valid_mask|=4u;
+}
 IOReturn NativeAdrenoRing::kick()
 {
     if(!attached_ || poisoned_)return kIOReturnNotReady;

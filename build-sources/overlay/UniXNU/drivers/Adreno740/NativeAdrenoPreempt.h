@@ -4,6 +4,7 @@
 #include <IOKit/IOTypes.h>
 #include <stddef.h>
 #include <stdint.h>
+#include "NativeAdrenoSqeSnapshot.h"
 
 /* A6XX..A7XX CP context switch between two rings, as msm's a6xx_preempt.c drives it: the CP keeps one ring loaded and saves
  * and restores the other's state through a preemption record the CPU fills in. Every constant below is from the pinned
@@ -40,6 +41,9 @@ struct NativeAdrenoPreemptIo {
      * as a6xx_gmu.xml writes it (0x1f8c4). */
     void *gmu_cookie;
     int (*gmu_write32)(void *, uint32_t dword_offset, uint32_t value);
+    /* Optional bounded, IRQ-safe indexed SQE read; cookie is the GPU cookie.
+     * Nonzero means failed/partial/busy; per-word validity remains authoritative. */
+    int (*sqe_snapshot)(void *, struct NativeAdrenoSqeSnapshot *);
 };
 
 struct NativeAdrenoPreemptStats {
@@ -73,6 +77,10 @@ class NativeAdrenoPreempt final {
     uint64_t trigger_us_=0;
     NativeAdrenoPreemptStats stats_{};
     volatile uint32_t *event_=nullptr;   /* the log row of the switch in flight */
+    NativeAdrenoSwitchEvidence evidence_{};
+    bool evidence_valid_=false,evidence_captured_=false;
+    void capturePages(NativeAdrenoPreemptPages *) const;
+    void beginEvidence(const NativeAdrenoPublishedTail &);
     IOReturn programSwitchRegisters();
     void snapshot(volatile uint32_t *row,unsigned first) const;
     volatile uint32_t *openEvent(uint32_t to);
@@ -101,7 +109,12 @@ public:
     static uint32_t recordWord(const uint8_t *record,uint32_t byte_offset);
     /* Switch the CP to `ring`, which must not be the loaded one: its SMMU info and record go out first, then the control word
      * with STOP. `uses_gmem` asks for the GMEM save and restore. False where a switch is still in flight or a register refused. */
-    bool trigger(uint32_t ring,bool uses_gmem);
+    bool trigger(uint32_t ring,bool uses_gmem,
+        void (*capture_tail)(void *,NativeAdrenoPublishedTail *)=nullptr,void *tail_cookie=nullptr);
+    /* Read-only diagnostics, called under the submission lock before noteTimeout
+     * and before any reset. At most once for the active trigger; false leaves
+     * out untouched. No scheduling, completion or poison changes. */
+    bool captureTimeoutEvidence(uint32_t reason,NativeAdrenoSwitchEvidence *out);
     /* The interrupt's side: read CP_CONTEXT_SWITCH_CNTL; a cleared STOP bit completes the switch and makes its ring the loaded
      * one, a set one is still pending. False where nothing was in flight. */
     bool complete(bool *read_error=nullptr);
