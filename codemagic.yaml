@@ -22,7 +22,7 @@ definitions:
           -x c -c -o /dev/null -
 
     - &stage_sources
-      name: Check out pinned public sources and verify the V5.3.3 overlay
+      name: Check out pinned public sources and verify the V5.3.4 overlay
       script: |
         set -eu
         top="$CM_BUILD_DIR/.unixnu-build"
@@ -81,12 +81,12 @@ definitions:
         fi
         (
           cd "$top/os27-ram8-handoff"
-          zip -0 -q -r "$CM_BUILD_DIR/os27-ram8-v5.3.3-webkit-handoff.zip" .
+          zip -0 -q -r "$CM_BUILD_DIR/os27-ram8-v5.3.4-webkit-handoff.zip" .
         )
 
 workflows:
-  unixnu-v533-webkit-preflight:
-    name: UniXNU V5.3.3 WebKit source and toolchain preflight
+  unixnu-v534-webkit-preflight:
+    name: UniXNU V5.3.4 WebKit source and toolchain preflight
     instance_type: mac_mini_m2
     max_build_duration: 20
     environment: *macos_environment
@@ -96,8 +96,8 @@ workflows:
     artifacts:
       - .unixnu-build/materialized-sources.json
 
-  unixnu-v533-webkit-handoff:
-    name: UniXNU V5.3.3 WebKit ARM64e boot handoff
+  unixnu-v534-webkit-handoff:
+    name: UniXNU V5.3.4 WebKit ARM64e boot handoff
     instance_type: mac_mini_m2
     max_build_duration: 120
     environment: *macos_environment
@@ -106,4 +106,4 @@ workflows:
       - *stage_sources
       - *build_handoff
     artifacts:
-      - os27-ram8-v5.3.3-webkit-handoff.zip
+      - os27-ram8-v5.3.4-webkit-handoff.zip

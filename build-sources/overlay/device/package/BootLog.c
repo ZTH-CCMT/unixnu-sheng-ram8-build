@@ -112,6 +112,12 @@ extern volatile int native_gpu_addon5_status __attribute__((weak_import));
 extern volatile int native_gpu_addon3_status __attribute__((weak_import));
 extern volatile int native_cryptex_os_stage __attribute__((weak_import));
 extern volatile int native_cryptex_os_status __attribute__((weak_import));
+extern volatile int native_webkit_path_stage __attribute__((weak_import));
+extern volatile int native_webkit_path_status __attribute__((weak_import));
+extern volatile int native_webkit_path_rollback __attribute__((weak_import));
+extern volatile int native_webkit_path_prepare_step __attribute__((weak_import));
+extern volatile int native_webkit_path_uid __attribute__((weak_import));
+extern volatile int native_webkit_path_mode __attribute__((weak_import));
 extern volatile int native_gestalt_cache_status __attribute__((weak_import));
 extern volatile int native_ls_store_status __attribute__((weak_import));
 extern volatile uint64_t native_data_persist_present __attribute__((weak_import));
@@ -695,6 +701,17 @@ static size_t compose(char *out, size_t cap, uint32_t slot, unsigned now) {
     char row[80];
     snprintf(row, sizeof row, "[cryptex os] stage=%d status=%d gestalt-cache=%d ls-store=%d", native_cryptex_os_stage, native_cryptex_os_status,
              native_gestalt_cache_status, &native_ls_store_status ? native_ls_store_status : -9);
+    at = put(out, at, cap, row, sizeof row);
+  }
+  // The old stage checks file visibility; this independent result includes
+  // prepare failures even after the one-time kernel printf has scrolled away.
+  if (&native_webkit_path_stage && &native_webkit_path_status &&
+      &native_webkit_path_rollback && &native_webkit_path_prepare_step &&
+      &native_webkit_path_uid && &native_webkit_path_mode) {
+    char row[160];
+    snprintf(row, sizeof row, "[webkit path] stage=%d status=%d rollback=%d prepare=%d uid=%d mode=%d",
+             native_webkit_path_stage, native_webkit_path_status, native_webkit_path_rollback,
+             native_webkit_path_prepare_step, native_webkit_path_uid, native_webkit_path_mode);
     at = put(out, at, cap, row, sizeof row);
   }
   // The one-time copy of the OS volume's staged system apps into Data (kern_exec.c native_staged_apps_prepare): stage (2 copied, 3 copied

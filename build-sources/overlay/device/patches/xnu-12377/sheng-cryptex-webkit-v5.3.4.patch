@@ -1,10 +1,10 @@
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -8514,6 +8514,254 @@
+@@ -8514,8 +8514,279 @@
  	native_bindfs_boot_mount = 0;
  	return error;
  }
-+/* V5.3.3 opt-in: resolve ExtensionKit through ordinary namei to the native
++/* V5.3.4 opt-in: resolve ExtensionKit through ordinary namei to the native
 + * root vnode namespace. Only this one Library entry is supplied by Data;
 + * MNT_UNION keeps every other Library entry on the existing cryptex bind.
 + * Do not give a bind mount the root's FSID or return foreign vnodes from it. */
@@ -13,9 +13,14 @@
 +volatile int native_webkit_path_stage = 0;
 +volatile int native_webkit_path_status = -1;
 +volatile int native_webkit_path_rollback = 0;
++/* Prepare component: 1=/, 2=/private, 3=Data root, 4=ngpu,
++ * 5=webkit-v533, 6=Library, 7=ExtensionKit link; 0=not preparing. */
++volatile int native_webkit_path_prepare_step = 0;
++volatile int native_webkit_path_uid = -1;
++volatile int native_webkit_path_mode = -1;
 +
 +static int
-+native_webkit_path_directory(proc_t p, user_addr_t scratch, const char *path, int create)
++native_webkit_path_directory(proc_t p, user_addr_t scratch, const char *path, int create, vnode_t expected_root)
 +{
 +	vfs_context_t ctx = vfs_context_current();
 +	vnode_t vp = NULLVP;
@@ -41,34 +46,48 @@
 +	VATTR_WANTED(&va, va_mode);
 +	if (vnode_vtype(vp) != VDIR) {
 +		error = ENOTDIR;
-+	} else if (!(error = vnode_getattr(vp, &va, ctx)) &&
-+	    (!VATTR_IS_SUPPORTED(&va, va_uid) || !VATTR_IS_SUPPORTED(&va, va_mode) ||
-+	    va.va_uid != 0 || (va.va_mode & 0022))) {
-+		error = EPERM;
++	} else if (!(error = vnode_getattr(vp, &va, ctx))) {
++		if (VATTR_IS_SUPPORTED(&va, va_uid)) native_webkit_path_uid = (int)va.va_uid;
++		if (VATTR_IS_SUPPORTED(&va, va_mode)) native_webkit_path_mode = (int)va.va_mode;
++		/* Data is the already-verified APFS root held by our caller. Its seed
++		 * owner is mobile (501), not root. This exception is vnode-specific;
++		 * newly created directories below it must still be root-owned. */
++		if (expected_root != NULLVP && vp != expected_root) {
++			error = EXDEV;
++		} else if (!VATTR_IS_SUPPORTED(&va, va_uid) || !VATTR_IS_SUPPORTED(&va, va_mode) ||
++		    (va.va_uid != 0 && vp != expected_root) || (va.va_mode & 0022)) {
++			error = EPERM;
++		}
 +	}
 +	vnode_put(vp);
 +	return error;
 +}
 +
 +static int
-+native_webkit_path_prepare(proc_t p, user_addr_t scratch)
++native_webkit_path_prepare(proc_t p, user_addr_t scratch, vnode_t data_root)
 +{
-+	/* Check every ancestor, one component at a time, before using it. The
-+	 * final-component NOFOLLOW check therefore cannot hide an earlier link.
-+	 * This runs before user services; no writable parent admits a path race. */
++	/* Inspect ancestors before launchd/user services, including symlinks.
++	 * The verified Data root may have its seed's non-root owner; descendants
++	 * used for this view remain root-owned. The caller holds data_root until
++	 * this entire setup returns, so the exception cannot match a recycled vnode. */
 +	static const char *const parents[] = {"/", "/private", "/private/var", "/private/var/ngpu",
 +	    "/private/var/ngpu/webkit-v533", "/private/var/ngpu/webkit-v533/Library"};
 +	static const char link[] = "/private/var/ngpu/webkit-v533/Library/ExtensionKit";
 +	static const char target[] = "/System/Library/ExtensionKit";
 +	int error = 0;
 +	for (size_t i = 0; i < sizeof(parents) / sizeof(parents[0]); ++i) {
-+		error = native_webkit_path_directory(p, scratch, parents[i], i >= 3);
++		native_webkit_path_prepare_step = (int)i + 1;
++		native_webkit_path_uid = native_webkit_path_mode = -1;
++		error = native_webkit_path_directory(p, scratch, parents[i], i >= 3,
++		    i == 2 ? data_root : NULLVP);
 +		if (error) {
 +			return error;
 +		}
 +	}
 +	vfs_context_t ctx = vfs_context_current();
 +	vnode_t vp = NULLVP;
++	native_webkit_path_prepare_step = 7;
++	native_webkit_path_uid = native_webkit_path_mode = -1;
 +	error = vnode_lookup(link, VNODE_LOOKUP_NOFOLLOW, &vp, ctx);
 +	if (!error) {
 +		struct vnode_attr va;
@@ -76,9 +95,9 @@
 +		VATTR_WANTED(&va, va_uid);
 +		if (vnode_vtype(vp) != VLNK) {
 +			error = EEXIST; /* Never remove an unexpected file or directory. */
-+		} else if (!(error = vnode_getattr(vp, &va, ctx)) &&
-+		    (!VATTR_IS_SUPPORTED(&va, va_uid) || va.va_uid != 0)) {
-+			error = EPERM;
++		} else if (!(error = vnode_getattr(vp, &va, ctx))) {
++			if (VATTR_IS_SUPPORTED(&va, va_uid)) native_webkit_path_uid = (int)va.va_uid;
++			if (!VATTR_IS_SUPPORTED(&va, va_uid) || va.va_uid != 0) error = EPERM;
 +		}
 +		vnode_put(vp);
 +		if (error) {
@@ -148,8 +167,9 @@
 +	return error;
 +}
 +
-+static void
-+native_webkit_canonical_path(proc_t p, user_addr_t scratch)
+ static void
+-native_cryptex_os_view(proc_t p, user_addr_t scratch)
++native_webkit_canonical_path(proc_t p, user_addr_t scratch, vnode_t data_root)
 +{
 +	uint32_t enabled = 0;
 +	if (!PE_parse_boot_argn("webkit-canonical-path", &enabled, sizeof(enabled)) || enabled != 1) {
@@ -168,11 +188,13 @@
 +	vfs_context_t ctx = vfs_context_current();
 +	vnode_t root = NULLVP, sibling = NULLVP, after = NULLVP, covered = NULLVP;
 +	int mounted = 0;
-+	int error = native_webkit_path_prepare(p, scratch);
 +	native_webkit_path_stage = 1;
++	int error = native_webkit_path_prepare(p, scratch, data_root);
 +	if (error) {
 +		goto done;
 +	}
++	native_webkit_path_prepare_step = 0;
++	native_webkit_path_uid = native_webkit_path_mode = -1;
 +	native_webkit_path_stage = 2;
 +	if ((error = vnode_lookup("/", 0, &root, ctx)) ||
 +	    (error = vnode_lookup(frameworks, 0, &sibling, ctx)) ||
@@ -249,17 +271,48 @@
 +		vnode_put(root);
 +	}
 +	native_webkit_path_status = error;
-+	printf("[webkit-path] stage=%d status=%d rollback=%d\n", native_webkit_path_stage, error, native_webkit_path_rollback);
++	printf("[webkit-path] stage=%d status=%d rollback=%d prepare=%d uid=%d mode=%d\n",
++	    native_webkit_path_stage, error, native_webkit_path_rollback,
++	    native_webkit_path_prepare_step, native_webkit_path_uid, native_webkit_path_mode);
 +}
 +
- static void
- native_cryptex_os_view(proc_t p, user_addr_t scratch)
++static void
++native_cryptex_os_view(proc_t p, user_addr_t scratch, vnode_t data_root)
  {
-@@ -8543,6 +8791,7 @@
+ 	static const char *const points[] = {"/private/var/ngpu/preboot/Cryptexes/OS/System/", "/private/var/ngpu/preboot/Cryptexes/OS/usr/"};
+ 	vnode_t probe = NULLVP;
+@@ -8543,6 +8814,7 @@
  		return;
  	}
  	native_cryptex_os_stage = 4;
-+	native_webkit_canonical_path(p, scratch);
++	native_webkit_canonical_path(p, scratch, data_root);
  	error = vnode_lookup("/System/Cryptexes/OS/System/Library/ExtensionKit/Extensions/WebContentExtension.appex/Info.plist", 0, &probe,
  	    vfs_context_current());
  	if (!error) {
+@@ -8685,7 +8957,7 @@
+ 	}
+ }
+ static void
+-native_gpu_addon_prepare(proc_t p, user_addr_t scratch)
++native_gpu_addon_prepare(proc_t p, user_addr_t scratch, vnode_t data_root)
+ {
+ 	uint32_t enabled = 0;
+ 	if (!PE_parse_boot_argn("gpu-addon", &enabled, sizeof(enabled)) || enabled != 1) {
+@@ -8792,7 +9064,7 @@
+ 		}
+ 		printf("[appsync-runtime] library=%d/%d\n", as_lib_stage, as_lib_status);
+ 	}
+-	native_cryptex_os_view(p, scratch);
++	native_cryptex_os_view(p, scratch, data_root);
+ 	native_gestalt_cache_drop(p, scratch);
+ 	native_ls_store_drop(p, scratch);
+ }
+@@ -9184,7 +9456,7 @@
+ 	if (actual != device || (vfs_flags(data_mount) & MNT_RDONLY) ||
+ 	    strcmp(vfs_statfs(data_mount)->f_fstypename, "apfs")) error = EINVAL;
+ 	if (!error) native_owner_data_stage = 4;
+-	if (!error) native_gpu_addon_prepare(p, scratch);
++	if (!error) native_gpu_addon_prepare(p, scratch, data_root);
+ 	if (!error) native_staged_apps_prepare(p, scratch, data_mount);
+ done:
+ 	if (data_root) vnode_put(data_root);

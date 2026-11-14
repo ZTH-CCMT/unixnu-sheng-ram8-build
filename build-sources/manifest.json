@@ -237,7 +237,7 @@
       "repository": "device",
       "path": "package/BootLog.c",
       "before_sha256": "5c880128ff6bd54d60dec13cd9b18acb47d2d801ebfa6aac920b308d74f238c2",
-      "sha256": "642d62a50f9b75b4b5bc7d395027fa838f92837f7f0a6b1e7e86598b200706ac"
+      "sha256": "d3a75f43c83294bd64d18ea37f1bc723fc2848716e7c1f62598209cccc56fae3"
     },
     "device/package/LegacyDisplayProbe.cpp": {
       "repository": "device",
@@ -357,15 +357,15 @@
       "repository": "device",
       "path": "patches/xnu-12377/series",
       "before_sha256": "15d08ffeafa1d29ece607e4f2913c80cb1f403442b0a0cbf9625f8d60a2d2953",
-      "sha256": "524f7ab3960623a0b091edbfac047621417b8131f72783cbe2d5fbf1f5ea420a"
+      "sha256": "894c73aa51fa272a8b60693646854e9541e0ace3938b4e6964373b4699803579"
     },
-    "device/patches/xnu-12377/sheng-cryptex-webkit-v5.3.3.patch": {
+    "device/patches/xnu-12377/sheng-cryptex-webkit-v5.3.4.patch": {
       "repository": "device",
-      "path": "patches/xnu-12377/sheng-cryptex-webkit-v5.3.3.patch",
+      "path": "patches/xnu-12377/sheng-cryptex-webkit-v5.3.4.patch",
       "before_sha256": null,
-      "sha256": "43ec6862b8e638caf6c75ce7c5ac860f1ab98d4a2bea4fde29f9e0b57b278d0d"
+      "sha256": "355d724bb220a0d0cf91f3930b9c6656ef687a5a68ff40ca42285694fe1f1535"
     }
   },
-  "candidate_version": "V5.3.3",
+  "candidate_version": "V5.3.4",
   "base_actions_run": 43140807984
 }
