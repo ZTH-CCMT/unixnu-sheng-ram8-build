@@ -1,0 +1,51 @@
+name: GPU V5.4 native frontend compile check
+on:
+  workflow_dispatch:
+  push:
+    branches: [ram8-gpu-v5.4-compile-check]
+permissions:
+  contents: read
+jobs:
+  frontend:
+    runs-on: macos-26
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: pipeline
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: UniXNU/AdrenoMetal
+          ref: ed8386e6b2966bc5535921d15bf5eeeb63f8ad46
+          path: UniXNU/drivers/AdrenoMetal
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: UniXNU/Adreno740
+          ref: a7c83cf7653f40aabe26f58b32b7e7218ebebd0f
+          path: UniXNU/drivers/Adreno740
+          persist-credentials: false
+      - name: Apply the same Metal overlay used by the failed build
+        run: |
+          python3 - <<'PY'
+          import hashlib,json,pathlib
+          top=pathlib.Path.cwd(); p=top/'pipeline'
+          lock=json.loads((p/'build-sources/manifest.json').read_text())
+          for key,spec in lock['files'].items():
+              if spec['repository'] not in ('UniXNU/drivers/AdrenoMetal','UniXNU/drivers/Adreno740'):continue
+              target=top/key; data=(p/'build-sources/overlay'/key).read_bytes()
+              assert hashlib.sha256(data).hexdigest()==spec['sha256'],key
+              before=hashlib.sha256(target.read_bytes()).hexdigest() if target.is_file() else None
+              assert before==spec['before_sha256'],key
+              target.parent.mkdir(parents=True,exist_ok=True);target.write_bytes(data)
+          PY
+      - name: Compile actual Metal frontend with all diagnostics visible
+        run: python3 pipeline/ci/check_metal_frontend.py --top "$GITHUB_WORKSPACE"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: metal-frontend-check-${{ github.run_id }}-${{ github.run_attempt }}
+          path: metal-frontend-check.log
+          if-no-files-found: warn
+          retention-days: 7
