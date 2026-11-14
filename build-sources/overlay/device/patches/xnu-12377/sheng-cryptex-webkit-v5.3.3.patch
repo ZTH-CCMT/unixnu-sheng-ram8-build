@@ -1,0 +1,265 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -8514,6 +8514,254 @@
+ 	native_bindfs_boot_mount = 0;
+ 	return error;
+ }
++/* V5.3.3 opt-in: resolve ExtensionKit through ordinary namei to the native
++ * root vnode namespace. Only this one Library entry is supplied by Data;
++ * MNT_UNION keeps every other Library entry on the existing cryptex bind.
++ * Do not give a bind mount the root's FSID or return foreign vnodes from it. */
++static const char native_webkit_path_source[] = "/private/var/ngpu/webkit-v533/Library";
++static const char native_webkit_path_point[] = "/private/preboot/Cryptexes/OS/System/Library";
++volatile int native_webkit_path_stage = 0;
++volatile int native_webkit_path_status = -1;
++volatile int native_webkit_path_rollback = 0;
++
++static int
++native_webkit_path_directory(proc_t p, user_addr_t scratch, const char *path, int create)
++{
++	vfs_context_t ctx = vfs_context_current();
++	vnode_t vp = NULLVP;
++	int error = vnode_lookup(path, VNODE_LOOKUP_NOFOLLOW, &vp, ctx);
++	if (error == ENOENT && create) {
++		struct mkdir_args request = {.path = scratch + 0xc00, .mode = 0755};
++		int32_t result = 0;
++		error = copyout(path, request.path, strlen(path) + 1);
++		if (!error) {
++			error = mkdir(p, &request, &result);
++		}
++		if (error && error != EEXIST) {
++			return error;
++		}
++		error = vnode_lookup(path, VNODE_LOOKUP_NOFOLLOW, &vp, ctx);
++	}
++	if (error) {
++		return error;
++	}
++	struct vnode_attr va;
++	VATTR_INIT(&va);
++	VATTR_WANTED(&va, va_uid);
++	VATTR_WANTED(&va, va_mode);
++	if (vnode_vtype(vp) != VDIR) {
++		error = ENOTDIR;
++	} else if (!(error = vnode_getattr(vp, &va, ctx)) &&
++	    (!VATTR_IS_SUPPORTED(&va, va_uid) || !VATTR_IS_SUPPORTED(&va, va_mode) ||
++	    va.va_uid != 0 || (va.va_mode & 0022))) {
++		error = EPERM;
++	}
++	vnode_put(vp);
++	return error;
++}
++
++static int
++native_webkit_path_prepare(proc_t p, user_addr_t scratch)
++{
++	/* Check every ancestor, one component at a time, before using it. The
++	 * final-component NOFOLLOW check therefore cannot hide an earlier link.
++	 * This runs before user services; no writable parent admits a path race. */
++	static const char *const parents[] = {"/", "/private", "/private/var", "/private/var/ngpu",
++	    "/private/var/ngpu/webkit-v533", "/private/var/ngpu/webkit-v533/Library"};
++	static const char link[] = "/private/var/ngpu/webkit-v533/Library/ExtensionKit";
++	static const char target[] = "/System/Library/ExtensionKit";
++	int error = 0;
++	for (size_t i = 0; i < sizeof(parents) / sizeof(parents[0]); ++i) {
++		error = native_webkit_path_directory(p, scratch, parents[i], i >= 3);
++		if (error) {
++			return error;
++		}
++	}
++	vfs_context_t ctx = vfs_context_current();
++	vnode_t vp = NULLVP;
++	error = vnode_lookup(link, VNODE_LOOKUP_NOFOLLOW, &vp, ctx);
++	if (!error) {
++		struct vnode_attr va;
++		VATTR_INIT(&va);
++		VATTR_WANTED(&va, va_uid);
++		if (vnode_vtype(vp) != VLNK) {
++			error = EEXIST; /* Never remove an unexpected file or directory. */
++		} else if (!(error = vnode_getattr(vp, &va, ctx)) &&
++		    (!VATTR_IS_SUPPORTED(&va, va_uid) || va.va_uid != 0)) {
++			error = EPERM;
++		}
++		vnode_put(vp);
++		if (error) {
++			return error;
++		}
++		/* Reuse only our exact link. An unrelated link is not ours to remove. */
++		char value[sizeof(target)];
++		struct readlink_args read = {.path = scratch + 0xc00, .buf = scratch + 0xd00, .count = sizeof(value)};
++		int32_t length = 0;
++		error = copyout(link, read.path, sizeof(link));
++		if (!error) {
++			error = readlink(p, &read, &length);
++		}
++		if (!error && length != (int32_t)(sizeof(target) - 1)) {
++			error = EEXIST;
++		}
++		if (!error) {
++			error = copyin(read.buf, value, sizeof(target) - 1);
++		}
++		if (!error && memcmp(value, target, sizeof(target) - 1)) {
++			error = EEXIST;
++		}
++		return error;
++	} else if (error != ENOENT) {
++		return error;
++	}
++	struct symlink_args request = {.path = scratch + 0xd00, .link = scratch + 0xc00};
++	int32_t result = 0;
++	if ((error = copyout(target, request.path, sizeof(target))) ||
++	    (error = copyout(link, request.link, sizeof(link)))) {
++		return error;
++	}
++	return symlink(p, &request, &result);
++}
++
++static int
++native_webkit_path_identity(const char *path, vnode_t expected, vfs_context_t ctx)
++{
++	vnode_t vp = NULLVP, by_id = NULLVP;
++	struct vnode_attr va, reference;
++	int error = vnode_lookup(path, 0, &vp, ctx);
++	if (error) {
++		return error;
++	}
++	VATTR_INIT(&va);
++	VATTR_INIT(&reference);
++	VATTR_WANTED(&va, va_fileid);
++	VATTR_WANTED(&reference, va_fileid);
++	if (vp != expected || vnode_mount(vp) != vnode_mount(expected)) {
++		error = EXDEV;
++	} else if (!(error = vnode_getattr(expected, &reference, ctx)) &&
++	    !(error = vnode_getattr(vp, &va, ctx))) {
++		if (!VATTR_IS_SUPPORTED(&reference, va_fileid) || !VATTR_IS_SUPPORTED(&va, va_fileid) ||
++		    va.va_fileid != reference.va_fileid) {
++			error = EINVAL;
++		} else {
++			error = VFS_VGET(vnode_mount(expected), reference.va_fileid, &by_id, ctx);
++			if (!error && (by_id != expected || vnode_mount(by_id) != vnode_mount(expected))) {
++				error = EXDEV;
++			}
++		}
++	}
++	if (by_id != NULLVP) {
++		vnode_put(by_id);
++	}
++	vnode_put(vp);
++	return error;
++}
++
++static void
++native_webkit_canonical_path(proc_t p, user_addr_t scratch)
++{
++	uint32_t enabled = 0;
++	if (!PE_parse_boot_argn("webkit-canonical-path", &enabled, sizeof(enabled)) || enabled != 1) {
++		return;
++	}
++	if (native_webkit_path_stage == 5 && native_webkit_path_status == 0) {
++		return; /* Boot setup is idempotent: never stack another shim. */
++	}
++	native_webkit_path_rollback = 0;
++	static const char *const prefixes[] = {"/System/Library/ExtensionKit/Extensions",
++	    "/System/Cryptexes/OS/System/Library/ExtensionKit/Extensions",
++	    "/private/preboot/Cryptexes/OS/System/Library/ExtensionKit/Extensions"};
++	static const char *const bundles[] = {"", "/WebContentExtension.appex", "/NetworkingExtension.appex",
++	    "/GPUExtension.appex", "/WebContentCaptivePortalExtension.appex", "/WebContentEnhancedSecurityExtension.appex"};
++	static const char frameworks[] = "/private/preboot/Cryptexes/OS/System/Library/Frameworks";
++	vfs_context_t ctx = vfs_context_current();
++	vnode_t root = NULLVP, sibling = NULLVP, after = NULLVP, covered = NULLVP;
++	int mounted = 0;
++	int error = native_webkit_path_prepare(p, scratch);
++	native_webkit_path_stage = 1;
++	if (error) {
++		goto done;
++	}
++	native_webkit_path_stage = 2;
++	if ((error = vnode_lookup("/", 0, &root, ctx)) ||
++	    (error = vnode_lookup(frameworks, 0, &sibling, ctx)) ||
++	    (error = vnode_lookup(native_webkit_path_point, 0, &covered, ctx))) {
++		goto done;
++	}
++	if (vnode_isvroot(covered)) {
++		error = EBUSY; /* Do not cover or undo somebody else's Library mount. */
++	}
++	vnode_put(covered);
++	covered = NULLVP;
++	if (error) {
++		goto done;
++	}
++	error = native_cryptex_os_bind(p, scratch, native_webkit_path_source, native_webkit_path_point, MNT_UNION);
++	if (error) {
++		goto done;
++	}
++	mounted = 1;
++	native_webkit_path_stage = 3;
++	for (size_t i = 0; i < sizeof(bundles) / sizeof(bundles[0]) && !error; ++i) {
++		char path[192];
++		vnode_t native = NULLVP;
++		snprintf(path, sizeof(path), "%s%s", prefixes[0], bundles[i]);
++		error = vnode_lookup(path, 0, &native, ctx);
++		if (!error) {
++			/* Same real mount also means the same FSID used for root security
++			 * classification. Do not patch FSID or the underlying mount flags. */
++			if (vnode_mount(native) != vnode_mount(root) || vnode_vtype(native) != VDIR) {
++				error = EXDEV;
++			}
++			for (size_t j = 0; j < sizeof(prefixes) / sizeof(prefixes[0]) && !error; ++j) {
++				snprintf(path, sizeof(path), "%s%s", prefixes[j], bundles[i]);
++				error = native_webkit_path_identity(path, native, ctx);
++			}
++			vnode_put(native);
++		}
++		if (error) {
++			printf("[webkit-path] identity path=%s status=%d\n", path, error);
++		}
++	}
++	if (!error) {
++		native_webkit_path_stage = 4;
++		error = vnode_lookup(frameworks, 0, &after, ctx);
++		if (!error && after != sibling) {
++			error = EXDEV;
++		}
++	}
++	if (after != NULLVP) {
++		vnode_put(after);
++	}
++	if (error && mounted) {
++		/* No new layer vnode remains held here. Undo this mount only;
++		 * the author's existing preboot, System and usr views stay intact. */
++		struct unmount_args undo = {.path = scratch + 0xc00, .flags = 0};
++		int32_t result = 0;
++		int rollback = copyout(native_webkit_path_point, undo.path, sizeof(native_webkit_path_point));
++		if (!rollback) {
++			rollback = unmount(p, &undo, &result);
++		}
++		native_webkit_path_rollback = rollback;
++	}
++	if (!error) {
++		native_webkit_path_stage = 5;
++	}
++ done:
++	if (covered != NULLVP) {
++		vnode_put(covered);
++	}
++	if (sibling != NULLVP) {
++		vnode_put(sibling);
++	}
++	if (root != NULLVP) {
++		vnode_put(root);
++	}
++	native_webkit_path_status = error;
++	printf("[webkit-path] stage=%d status=%d rollback=%d\n", native_webkit_path_stage, error, native_webkit_path_rollback);
++}
++
+ static void
+ native_cryptex_os_view(proc_t p, user_addr_t scratch)
+ {
+@@ -8543,6 +8791,7 @@
+ 		return;
+ 	}
+ 	native_cryptex_os_stage = 4;
++	native_webkit_canonical_path(p, scratch);
+ 	error = vnode_lookup("/System/Cryptexes/OS/System/Library/ExtensionKit/Extensions/WebContentExtension.appex/Info.plist", 0, &probe,
+ 	    vfs_context_current());
+ 	if (!error) {
