@@ -42,6 +42,7 @@ struct CpPeer {
     std::vector<uint32_t> regs;
     std::vector<uint32_t> writes;
     unsigned publish=0,acquire=0,barriers=0,fail_publish=0,fail_acquire=0,fail_barrier=0;
+    uint32_t fail_read_reg=~0u;
     CpPeer():regs(0x10000,0){}
 };
 static CpPeer cp;
@@ -49,7 +50,7 @@ static uint64_t clock_us=0;
 static int cwrite(void *c,uint32_t reg,uint32_t v)
 {CHECK(c==&cp && reg<cp.regs.size());cp.regs[reg]=v;cp.writes.push_back(reg);return 0;}
 static int cread(void *c,uint32_t reg,uint32_t *v)
-{CHECK(c==&cp && v && reg<cp.regs.size());*v=cp.regs[reg];return 0;}
+{CHECK(c==&cp && v && reg<cp.regs.size());if(reg==cp.fail_read_reg)return 1;*v=cp.regs[reg];return 0;}
 static int cbarrier(void *c){CHECK(c==&cp);++cp.barriers;return cp.barriers==cp.fail_barrier;}
 static int cpublish(void *c,const volatile uint32_t *w,size_t bytes)
 {CHECK(c==&cp && w && (bytes==32768 || bytes==4096));++cp.publish;return cp.publish==cp.fail_publish;}
@@ -110,7 +111,9 @@ static int exposed(Path &p,bool write_combined=false)
 }
 void NativeAdrenoNotePhase(unsigned,size_t) {}
 extern "C" {extern volatile uint32_t native_adreno_submit_ibs[4],native_adreno_diag,native_adreno_ib_log[4][4+28],native_adreno_ib_log_count;
-    extern volatile uint64_t native_adreno_submit_us[8];}
+    extern volatile uint64_t native_adreno_submit_us[8];
+    extern volatile uint32_t native_adreno_ring_log[4][116],native_adreno_ring_log_count;
+    extern volatile uint32_t native_adreno_switch_timeouts;}
 
 struct DualRingPath : Path {
     NativeAdrenoRing low;
@@ -628,8 +631,130 @@ static void testBoardExecutionResetAndSecondHangKeepFenceHistory()
     std::puts("PASS execution reset falls back, second real hang recovers, and failed/successful fence history survives");
 }
 
-int main()
+
+// These run first: timeout evidence keeps the first two events for the boot lifetime.
+static uint32_t expected_timeout[2][NativeAdrenoSwitchTimeoutWords];
+static void testInterleavedDiagnosticFences()
 {
+    DualRingPath p;p.setup();
+    uint32_t event_header=0;
+    CHECK(AdrenoPM4Type7(0x46,4,&event_header)==AdrenoPM4Success);
+    for(unsigned i=0;i<4;++i) {
+        const unsigned index=i&1;
+        const uint32_t fence=p.enqueue(index,index?7:8);
+        CHECK(fence==i+1);
+        const volatile uint32_t *ib=native_adreno_ib_log[(native_adreno_ib_log_count-1)&3];
+        const volatile uint32_t *log=native_adreno_ring_log[(native_adreno_ring_log_count-1)&3];
+        CHECK(ib[0]==fence && log[0]==fence);
+        const uint32_t *words=index?p.low_words:ringmem;
+        const uint32_t address=index?0x208004:0x108004;
+        unsigned found=0;
+        for(uint32_t at=log[1],n=0;n<log[3];++n,at=(at+1)&8191) {
+            if(words[at]==event_header && words[(at+2)&8191]==address && !words[(at+3)&8191]) {
+                CHECK(words[(at+4)&8191]==fence);++found;
+            }
+        }
+        CHECK(found==1); // Check the actual CP fence packet, not just the two diagnostic labels.
+    }
+    std::puts("PASS interleaved rings: IB/ring labels equal the actual global fence packet");
+}
+static void testFrozenTimeoutEvidence()
+{
+    uint32_t copy[NativeAdrenoSwitchTimeoutWords],canary[NativeAdrenoSwitchTimeoutWords];
+    for(auto &word:copy)word=0xdeadbeef;
+    std::memcpy(canary,copy,sizeof(copy));
+    CHECK(!native_adreno_switch_timeout_copy(0,copy,NativeAdrenoSwitchTimeoutWords));
+    CHECK(!std::memcmp(copy,canary,sizeof(copy)));
+    CHECK(!native_adreno_switch_timeouts);
+    for(unsigned slot=0;slot<2;++slot) {
+        DualRingPath p;p.setup();
+        uint32_t blocked=0,completed=0;
+        if(!slot)p.beginReverseSwitch(blocked,completed);
+        else blocked=p.enqueue(1,7);
+        CHECK(cp.regs[0x08a0]&1);
+        const uint32_t software[6]={p.ring.writePointer(),p.ring.current()?1u:0u,p.ring.restorePending()?1u:0u,
+            p.low.writePointer(),p.low.current()?1u:0u,p.low.restorePending()?1u:0u};
+        // Hardware samples are distinctive, and do not rely on an all-zero CP peer.
+        cp.regs[0x0210]=0x11110000+slot;cp.regs[0x0201]=0x22220000+slot;cp.regs[0x0821]=0x33330000+slot;
+        const uint32_t rptr=cp.regs[0x0806],wptr=cp.regs[0x0807];
+        const uint32_t progress[6]={0x3a000+slot,1,0x44000+slot,1,0,0};
+        cp.regs[0x0928]=progress[0];cp.regs[0x0929]=progress[1];
+        cp.regs[0x092b]=progress[2];cp.regs[0x092c]=progress[3];
+        cp.regs[0x092a]=cp.regs[0x092d]=0;
+        clock_us+=1000001;bool hung=false;
+        CHECK(p.submit.hangCheck(&hung)==kIOReturnSuccess && hung);
+        CHECK(native_adreno_switch_timeouts==slot+1);
+        CHECK(native_adreno_switch_timeout_copy(slot,copy,NativeAdrenoSwitchTimeoutWords));
+        CHECK(copy[0]==2 && copy[1]==1 && !copy[2] && !copy[3]);
+        const uint32_t *e=copy+4;
+        CHECK(e[5]==((slot?0x100u:1u)|2u<<16));
+        CHECK((e[6]&1) && (e[7]&1));
+        CHECK(e[8]==0x11110000+slot && e[9]==0x22220000+slot && e[10]==0x33330000+slot);
+        CHECK(e[11]==((rptr&0xffff)|wptr<<16));
+        CHECK(!std::memcmp(e+28,progress,sizeof(progress)));
+        CHECK(!std::memcmp(copy+38,software,sizeof(software)));
+        for(unsigned ring=0;ring<2;++ring) {
+            const uint32_t offsets[4]={20,24,8,4};
+            for(unsigned k=0;k<4;++k)
+                CHECK(e[20+4*ring+k]==NativeAdrenoPreempt::recordWord(p.records[ring],offsets[k]));
+        }
+        std::memcpy(expected_timeout[slot],copy,sizeof(copy));
+        NativeAdrenoRecovery result{};
+        if(!slot) {
+            cp.regs[0x08a0]&=~1u;
+            CHECK(p.recover(result)==kIOReturnSuccess && result.completed_late && !p.restart_count);
+        } else {
+            CHECK(p.recoverBoard(result)==kIOReturnSuccess && !result.completed_late && p.restart_count==1);
+        }
+        CHECK(native_adreno_switch_timeout_copy(slot,copy,NativeAdrenoSwitchTimeoutWords));
+        CHECK(!std::memcmp(copy,expected_timeout[slot],sizeof(copy)));
+    }
+    std::puts("PASS frozen timeout direction, reason, read status, hardware/record/software state survive late completion and reset");
+}
+static void testTimeoutEvidenceReadFailure()
+{
+    DualRingPath p;p.setup();p.enqueue(1,7);
+    cp.fail_read_reg=0x0928; // The first progress IB word; also read by stallState.
+    clock_us+=1000001;bool hung=false;
+    CHECK(p.submit.hangCheck(&hung)==kIOReturnSuccess && hung);
+    uint32_t copy[NativeAdrenoSwitchTimeoutWords];
+    CHECK(native_adreno_switch_timeout_copy(0,copy,NativeAdrenoSwitchTimeoutWords));
+    CHECK(copy[0]==2 && copy[1]==1);
+    CHECK(copy[2]==uint32_t(kIOReturnIOError) && copy[3]!=uint32_t(kIOReturnSuccess));
+    CHECK(copy[9]==(0x100u|2u<<16));
+    std::puts("PASS failed progress/stall reads remain explicitly invalid in the captured event");
+}
+static void checkFrozenTimeoutEvidenceAfterLaterEvents()
+{
+    uint32_t copy[NativeAdrenoSwitchTimeoutWords],canary[NativeAdrenoSwitchTimeoutWords];
+    CHECK(native_adreno_switch_timeouts>2);
+    for(unsigned slot=0;slot<2;++slot) {
+        CHECK(native_adreno_switch_timeout_copy(slot,copy,NativeAdrenoSwitchTimeoutWords));
+        CHECK(!std::memcmp(copy,expected_timeout[slot],sizeof(copy)));
+    }
+    std::memcpy(canary,copy,sizeof(copy));
+    CHECK(!native_adreno_switch_timeout_copy(2,copy,NativeAdrenoSwitchTimeoutWords));
+    CHECK(!native_adreno_switch_timeout_copy(0,copy,NativeAdrenoSwitchTimeoutWords-1));
+    CHECK(!native_adreno_switch_timeout_copy(0,nullptr,NativeAdrenoSwitchTimeoutWords));
+    CHECK(!std::memcmp(copy,canary,sizeof(copy)));
+    std::puts("PASS later timeouts and recovery leave both frozen slots unchanged; rejected reads leave output untouched");
+}
+
+int main(int argc,char **argv)
+{
+    if(argc==2 && !std::strcmp(argv[1],"--timeout-read-error")) {
+        testTimeoutEvidenceReadFailure();return 0;
+    }
+    if(argc==2 && !std::strcmp(argv[1],"--timeout-evidence")) {
+        testInterleavedDiagnosticFences();
+        testFrozenTimeoutEvidence();
+        // Wrap the 16-entry live event ring, then cause additional timeouts.
+        for(unsigned i=0;i<20;++i)testSwitchCompletesWithoutInterrupt();
+        testSwitchTimeoutRecovery(true);
+        testSwitchTimeoutRecovery(false);
+        checkFrozenTimeoutEvidenceAfterLaterEvents();
+        return 0;
+    }
     /* One validated indirect-buffer submission with exact ring bytes. */
     {
         Path p;CHECK(exposed(p)==kIOReturnSuccess);

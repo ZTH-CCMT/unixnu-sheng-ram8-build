@@ -17,8 +17,8 @@ PROFILE = 'ipados-27.0.1-24A446'
 DUMMY_CHIP = '13579bdf'
 RAM_BYTES = 8 * 1024**3
 DATA_BYTES = 215 * 1024**3
-VERSION = 'V4.2'
-GPU_SOURCE_SHA = '894ee670d07078b8c05c4530c7b0377e318d10e5671b2174035e3eb8e103d53a'
+VERSION = 'V5.1'
+GPU_SOURCE_SHA = '5f5dae4226b23087fefee602ff1b744e4f1d89c4e92a646ff1718d77ec751943'
 TURNIP_KMD = 'src/freedreno/vulkan/tu_knl_darwin.cc'
 TURNIP_KMD_SHA = '28dbfb342333cbfc70da733ad26102ed64ec502ca002f12c0940a7175627df1c'
 SEED_SHA = 'e1bfa6971ef9fe6a27b53474c509cd518325459484230daf7f679642a04323b3'
@@ -117,22 +117,25 @@ def property_bytes(name, value):
 
 
 
-def gpu_reset_symbol(tree, kernel):
+def gpu_diagnostic_symbols(tree, kernel):
     sys.path.insert(0, str(tree / 'kits/XnuPrelink'))
     from kc_image import Image
 
     raw = kernel.read_bytes()
     fileset = Image(raw)
     image = Image(raw, fileset.entries['com.apple.kernel'][1])
-    name = '_native_adreno_reset_epoch'
-    matches = [address for address, names in image.symbols().items() if name in names]
-    require(len(matches) == 1, f'Packaged kernel must define {name} exactly once')
-    address, = matches
-    section = image.section(address)
-    require(section and (section['segment'], section['name']) == ('__TEXT_EXEC', '__text'),
-            f'{name} is not executable kernel code')
-    image.offset(address, 4)
-    return hex(address)
+    symbols = image.symbols()
+    addresses = []
+    for name in ('_native_adreno_reset_epoch', '_native_adreno_switch_timeout_copy'):
+        matches = [address for address, names in symbols.items() if name in names]
+        require(len(matches) == 1, f'Packaged kernel must define {name} exactly once')
+        address, = matches
+        section = image.section(address)
+        require(section and (section['segment'], section['name']) == ('__TEXT_EXEC', '__text'),
+                f'{name} is not executable kernel code')
+        image.offset(address, 4)
+        addresses.append(hex(address))
+    return addresses
 
 
 def main():
@@ -219,8 +222,8 @@ def main():
     require(gpu_trace['source_sha256'] == GPU_SOURCE_SHA
             and gpu_trace['trace_source_id'] == GPU_SOURCE_SHA[:16]
             and gpu_trace['target'] == 'arm64e-apple-ios27.0',
-            'Compiled Adreno source identity differs from the V4.2 candidate')
-    print(f'Adreno V4.2 source ID {gpu_trace["trace_source_id"]}', flush=True)
+            'Compiled Adreno source identity differs from the V5.1 candidate')
+    print(f'Adreno V5.1 source ID {gpu_trace["trace_source_id"]}', flush=True)
 
     stage = top / 'os27-ram8-handoff.partial'
     stage.mkdir()
@@ -237,7 +240,7 @@ def main():
     payload_kernel = stage / 'payload-kernel-check.macho'
     fat_readback(payload, 'Payloads/kernel.macho', payload_kernel)
     require(digest(payload_kernel) == payload_info['payload_kernel_sha256'], 'Packed kernel digest differs')
-    gpu_reset_address = gpu_reset_symbol(tree, payload_kernel)
+    gpu_reset_address, gpu_timeout_address = gpu_diagnostic_symbols(tree, payload_kernel)
     print(f'GPU reset generation linked in packaged kernel at {gpu_reset_address}', flush=True)
     payload_kernel.unlink()
     for label, member in (('gpu_addon', 'kernel.macho.gpuaddon'),
@@ -284,6 +287,7 @@ def main():
         'status': 'PROVISIONAL_DO_NOT_BOOT_OR_FLASH',
         'profile': PROFILE, 'synthetic_platform_seed': DUMMY_CHIP,
         'candidate_version': VERSION, 'gpu_reset_epoch_symbol': gpu_reset_address,
+        'gpu_switch_timeout_copy_symbol': gpu_timeout_address,
         'gpu_source_sha256': GPU_SOURCE_SHA,
         'gpu_trace_source_id': gpu_trace['trace_source_id'],
         'turnip_source_id': turnip['source_id'], 'turnip_kmd_sha256': TURNIP_KMD_SHA,

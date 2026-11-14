@@ -5,6 +5,15 @@
 #include "NativeAdrenoRing.h"
 #include "NativeAdrenoVm.h"
 
+/* Immutable first two timeout captures, sampled in the submission lock.
+ * [0] reason, [1] event valid, [2..3] progress/stall read IOReturn,
+ * [4..37] NativeAdrenoPreempt's 34-word closed event,
+ * [38..40], [41..43] ring 0/1 software WPTR, current, restorePending.
+ * Hardware fields are sequential samples during one timeout handler.
+ * The copy never locks or reads GPU registers; false leaves out untouched. */
+enum : size_t {NativeAdrenoSwitchTimeoutWords=44};
+extern "C" bool native_adreno_switch_timeout_copy(uint32_t index,uint32_t *out,size_t words);
+
 /* IBs of one submission: a whole frame, so the ring prologue (cache flush, idle wait, thread switch) runs once per frame. */
 enum : size_t {NativeAdrenoSubmitMaxBuffers=128};
 struct NativeAdrenoSubmitBuffer {

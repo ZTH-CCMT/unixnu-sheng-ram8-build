@@ -112,7 +112,9 @@ public:
     /* A switch triggered more than `limit_us` ago and still not complete. */
     bool timedOut(uint32_t limit_us) const;
     /* The switch in flight did not finish: the log row takes the CP's IB state (progress) and the registers, and the switch ends as timed out. */
-    void noteTimeout(const uint32_t progress[6]);
+    /* Copy this event after closing it, before the circular log can reuse it.
+     * False means there was no active event; event_out is left untouched. */
+    bool noteTimeout(const uint32_t progress[6],uint32_t *event_out=nullptr);
     uint32_t readCntl() const;   /* CP_CONTEXT_SWITCH_CNTL as the hardware holds it (all ones when unreadable); STOP set means a switch is not done */
     uint32_t target() const {return next_;}
     /* After a GPU reset: `ring` is the one the CP runs and nothing is in flight. */

@@ -58,3 +58,38 @@ completion and a second genuine hang are covered. These tests check driver
 routing and fence semantics with software peers; they do not emulate the A740.
 No native ARM64e build or hardware qualification has been completed for V4.2.
 The first hardware switch timeout remains a separate unresolved issue.
+
+## V5.1 local timeout evidence candidate
+
+The ring dump and IB dump label each submission with the fence written in its
+command packet. Global fences can skip numbers on an individual ring.
+
+`native_adreno_switch_timeout_copy(index, out, words)` copies one of the first
+two switch-timeout snapshots. `index` is zero-based and `words` must be at least
+44. A false result leaves `out` unchanged. The producer fills a slot while the
+existing submission lock is held, then publishes it with release semantics.
+The consumer uses acquire semantics, without taking the submission lock or
+reading GPU registers. A published slot is not reused during this boot.
+
+Each snapshot holds the timeout reason, event-valid flag, progress/stall read
+statuses, the 34-word closed preemption event, and each ring's software write
+pointer/current/restore-pending state. Event-valid means an active event was
+captured, not that every hardware read succeeded. Failed event-register reads
+retain the existing sentinels. Progress words include IB remaining plus the
+ROQ-availability high half. Hardware fields are sequential samples during one
+timeout handler, not a simultaneous hardware snapshot.
+
+Timeout capture does not finish the in-flight switch. A late STOP-clear can
+still follow the existing completion path. The frozen timeout survives that
+completion, reset, later timeouts and the circular live-event log wrapping.
+The board BootLog change copies both slots through its existing periodic GPU
+log path; it does not make an immediate disk write at timeout. A power loss
+before the next successful log write can still lose this evidence.
+
+Windows host regressions cover interleaved fence packets, both switch
+directions, late completion, board-style reset, subsequent log wrap/timeouts
+and failed register reads. Reinstating the old labels in host-only copies makes
+the new regression fail. These software peers do not emulate A740 execution.
+The native ARM64e build and device capture remain pending. This candidate fixes
+diagnostic correspondence and capture; it does not fix the first hardware
+preemption timeout or prove a desktop performance improvement.

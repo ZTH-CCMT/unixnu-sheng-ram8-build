@@ -89,6 +89,8 @@ extern volatile char native_gpu_row_log[40][52] __attribute__((weak_import));
 extern volatile uint32_t native_gpu_row_count __attribute__((weak_import)), native_gpu_power_stage __attribute__((weak_import));
 extern volatile uint32_t native_adreno_kernel_alloc_fail[6] __attribute__((weak_import));
 extern volatile uint32_t native_adreno_switch_timeout[2][30] __attribute__((weak_import)), native_adreno_switch_timeouts __attribute__((weak_import));
+// Copies a release-published immutable timeout snapshot; no GPU lock or live MMIO reads here.
+extern bool native_adreno_switch_timeout_copy(uint32_t index, uint32_t *out, size_t words) __attribute__((weak_import));
 extern uint32_t ml_outside_memory_pages __attribute__((weak_import)), ml_outside_memory_refused __attribute__((weak_import));
 extern volatile uint64_t native_adreno_pool_scrubbing[16][2] __attribute__((weak_import));
 extern volatile int native_gpu_addon_written __attribute__((weak_import));
@@ -2279,15 +2281,48 @@ static size_t compose(char *out, size_t cap, uint32_t slot, unsigned now) {
     if (boot_log_reset_result[0]) at = put(out, at, cap, boot_log_reset_result, sizeof boot_log_reset_result);
   }
   // Ring switches the CP never finished (the first two): the CP's stall words as in [gpu stall], then the ring's progress words.
-  if (log_gpu_on && &native_adreno_switch_timeout && &native_adreno_switch_timeouts && native_adreno_switch_timeouts) {
-    for (unsigned e = 0; e < 2 && e < native_adreno_switch_timeouts; ++e) {
+  if (log_gpu_on && &native_adreno_switch_timeout && &native_adreno_switch_timeouts) {
+    const uint32_t timeout_count = __atomic_load_n(&native_adreno_switch_timeouts, __ATOMIC_ACQUIRE);
+    for (unsigned e = 0; e < 2 && e < timeout_count; ++e) {
       char row[360];
-      int n = snprintf(row, sizeof row, "[gpu switch timeout] %u of %u:", e + 1, native_adreno_switch_timeouts);
+      int n = snprintf(row, sizeof row, "[gpu switch timeout] %u of %u:", e + 1, timeout_count);
       for (unsigned k = 0; k < 30 && n > 0 && (size_t)n < sizeof row; ++k)
         n += snprintf(row + n, sizeof row - (size_t)n, "%s%x", k == 24 ? " | " : " ", native_adreno_switch_timeout[e][k]);
       at = put(out, at, cap, row, sizeof row);
     }
   }
+  // BEGIN GPU V5.1 FROZEN TIMEOUT FORMAT
+  // ABI: four metadata words, the 34-word NativeAdrenoPreempt event, then three software words per ring.
+  // Fixed-size rows keep every uint32_t intact, including failed-read sentinels and both halves of timestamps/addresses.
+  if (log_gpu_on && native_adreno_switch_timeout_copy) {
+    for (uint32_t e = 0; e < 2; ++e) {
+      uint32_t v[44] = {0};
+      if (!native_adreno_switch_timeout_copy(e, v, 44)) continue;
+      char row[320];
+      snprintf(row, sizeof row, "[gpu switch frozen %u] reason=0x%08x event_valid=0x%08x progress_status=0x%08x stall_status=0x%08x",
+               e, v[0], v[1], v[2], v[3]);
+      at = put(out, at, cap, row, sizeof row);
+      snprintf(row, sizeof row, "[gpu switch frozen %u event] seq=0x%08x trigger_us_lo=0x%08x trigger_us_hi=0x%08x end_us_lo=0x%08x end_us_hi=0x%08x from_to_outcome=0x%08x",
+               e, v[4], v[5], v[6], v[7], v[8], v[9]);
+      at = put(out, at, cap, row, sizeof row);
+      snprintf(row, sizeof row, "[gpu switch frozen %u hw] cntl_trigger=0x%08x cntl_end=0x%08x rbbm_status=0x%08x int0=0x%08x cp_hw_fault=0x%08x rptr_wptr=0x%08x",
+               e, v[10], v[11], v[12], v[13], v[14], v[15]);
+      at = put(out, at, cap, row, sizeof row);
+      snprintf(row, sizeof row, "[gpu switch frozen %u before] ring0 rptr=0x%08x wptr=0x%08x errno=0x%08x info=0x%08x | ring1 rptr=0x%08x wptr=0x%08x errno=0x%08x info=0x%08x",
+               e, v[16], v[17], v[18], v[19], v[20], v[21], v[22], v[23]);
+      at = put(out, at, cap, row, sizeof row);
+      snprintf(row, sizeof row, "[gpu switch frozen %u after] ring0 rptr=0x%08x wptr=0x%08x errno=0x%08x info=0x%08x | ring1 rptr=0x%08x wptr=0x%08x errno=0x%08x info=0x%08x",
+               e, v[24], v[25], v[26], v[27], v[28], v[29], v[30], v[31]);
+      at = put(out, at, cap, row, sizeof row);
+      snprintf(row, sizeof row, "[gpu switch frozen %u progress] ib1_lo=0x%08x ib1_hi=0x%08x ib2_lo=0x%08x ib2_hi=0x%08x ib1_remaining_plus_roq=0x%08x ib2_remaining_plus_roq=0x%08x",
+               e, v[32], v[33], v[34], v[35], v[36], v[37]);
+      at = put(out, at, cap, row, sizeof row);
+      snprintf(row, sizeof row, "[gpu switch frozen %u software] ring0 wptr=0x%08x current=0x%08x restore_pending=0x%08x | ring1 wptr=0x%08x current=0x%08x restore_pending=0x%08x",
+               e, v[38], v[39], v[40], v[41], v[42], v[43]);
+      at = put(out, at, cap, row, sizeof row);
+    }
+  }
+  // END GPU V5.1 FROZEN TIMEOUT FORMAT
   // The GPU bring-up's rows in the order they were set (the shown rows are shared and overwritten), and its stage.
   if (log_gpu_on && &native_gpu_row_log && &native_gpu_row_count && &native_gpu_power_stage) {
     char row[200];

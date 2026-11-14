@@ -164,12 +164,15 @@ void NativeAdrenoPreempt::closeEvent(uint32_t outcome)
     snapshot(row,20);
     event_=nullptr;
 }
-void NativeAdrenoPreempt::noteTimeout(const uint32_t progress[6])
+bool NativeAdrenoPreempt::noteTimeout(const uint32_t progress[6],uint32_t *event_out)
 {
-    if(!armed_ || !event_)return;
+    if(!armed_ || !event_)return false;
+    const volatile uint32_t *const closed=event_;
     if(progress)for(unsigned i=0;i<6;++i)event_[28+i]=progress[i];
     stats_.faulted++;
     closeEvent(2);
+    if(event_out)for(unsigned i=0;i<NativeAdrenoSwitchLogWords;++i)event_out[i]=closed[i];
+    return true;
 }
 bool NativeAdrenoPreempt::trigger(uint32_t ring,bool uses_gmem)
 {

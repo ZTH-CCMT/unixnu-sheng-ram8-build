@@ -57,6 +57,17 @@ extern "C" {volatile uint32_t native_adreno_stall[2+NativeAdrenoRingStallWords];
  * idle, is a job waiting for the switch, not a CP that stopped. */
 extern "C" {volatile uint32_t native_adreno_stall_ring[10];}
 extern "C" {volatile uint32_t native_adreno_switch_timeout[2][30];volatile uint32_t native_adreno_switch_timeouts;}
+/* A slot is written once, then release-published. Later switches, recovery and
+ * the circular event log must not overwrite the failure that triggered reset. */
+static uint32_t switch_timeout_detail[2][NativeAdrenoSwitchTimeoutWords];
+static uint32_t switch_timeout_ready;
+extern "C" bool native_adreno_switch_timeout_copy(uint32_t index,uint32_t *out,size_t words)
+{
+    if(!out || words<NativeAdrenoSwitchTimeoutWords || index>=2 ||
+        index>=__atomic_load_n(&switch_timeout_ready,__ATOMIC_ACQUIRE))return false;
+    for(size_t i=0;i<NativeAdrenoSwitchTimeoutWords;++i)out[i]=switch_timeout_detail[index][i];
+    return true;
+}
 /* 16 words of the IB at start, from 12 dwords before the dword the thread has reached (size minus what remains). */
 static void peekIb(const NativeAdrenoVm *vm,uint64_t start,uint32_t size,uint32_t remaining,volatile uint32_t *slot)
 {
@@ -608,10 +619,16 @@ IOReturn NativeAdrenoSubmit::submit(NativeAdrenoVm *vm,const NativeAdrenoSubmitB
     for(const auto &earlier:jobs_)
         if(earlier.active && earlier.queue==queue) {index=earlier.ring;break;}
     NativeAdrenoRing *const target=ring(index);
+    /* One numbering for both rings: a fence tells its own ring, and a switch's arrival retires the jobs queued behind it. */
+    /* The board's earlier submissions (the CP init and the probes) numbered themselves on the first ring: the next number is above
+     * every ring's newest, and above the last this object handed out. */
+    uint32_t base=fence_issued_;
+    for(unsigned i=0;i<ring_count_;++i)if((int32_t)(ring(i)->lastSubmitted()-base)>0)base=ring(i)->lastSubmitted();
+    const uint32_t number=base+1;
     {
         const uint32_t slot=native_adreno_ib_log_count&3;uint32_t head[28]={};
         if(native_adreno_diag)(void)vm_->headWords(buffers[0].handle,buffers[0].iova,head,28);
-        native_adreno_ib_log[slot][0]=target->lastSubmitted()+1;native_adreno_ib_log[slot][1]=(uint32_t)buffers[0].iova;
+        native_adreno_ib_log[slot][0]=preemption()?number:target->lastSubmitted()+1;native_adreno_ib_log[slot][1]=(uint32_t)buffers[0].iova;
         native_adreno_ib_log[slot][2]=(uint32_t)(buffers[0].iova>>32);native_adreno_ib_log[slot][3]=(uint32_t)buffers[0].bytes;
         for(unsigned i=0;i<28;++i)native_adreno_ib_log[slot][4+i]=head[i];
         native_adreno_ib_log_count=native_adreno_ib_log_count+1;
@@ -623,12 +640,7 @@ IOReturn NativeAdrenoSubmit::submit(NativeAdrenoVm *vm,const NativeAdrenoSubmitB
         for(size_t i=0;i<handle_count;++i) {vm_->retireJobAfterCompletion(handles[i]);++stats_.references_retired;}
         return status;
     }
-    /* One numbering for both rings: a fence tells its own ring, and a switch's arrival retires the jobs queued behind it. */
-    /* The board's earlier submissions (the CP init and the probes) numbered themselves on the first ring: the next number is above
-     * every ring's newest, and above the last this object handed out. */
-    uint32_t base=fence_issued_;
-    for(unsigned i=0;i<ring_count_;++i)if((int32_t)(ring(i)->lastSubmitted()-base)>0)base=ring(i)->lastSubmitted();
-    const uint32_t number=(value=base)+1;
+    value=base;
     status=preemption()?target->submitFramed(words,word_count,number,&value):target->submitFramed(words,word_count,&value);
     if(status) {
         if(!value)fence_issued_=base;
@@ -967,17 +979,28 @@ void NativeAdrenoSubmit::noteSwitchTimeout(uint32_t reason)
 {
     if(preempt_dead_)return;
     uint32_t progress[6]={};
-    (void)ring(preempt_.loaded())->progressState(progress);
-    const uint32_t n=native_adreno_switch_timeouts;
+    const IOReturn progress_status=ring(preempt_.loaded())->progressState(progress);
+    const uint32_t n=__atomic_load_n(&native_adreno_switch_timeouts,__ATOMIC_RELAXED);
     if(n<2) {
         uint32_t words[NativeAdrenoRingStallWords]={};
-        (void)ring(preempt_.loaded())->stallState(words);
+        const IOReturn stall_status=ring(preempt_.loaded())->stallState(words);
         volatile uint32_t *row=native_adreno_switch_timeout[n];
         for(uint32_t i=0;i<NativeAdrenoRingStallWords && i<24;++i)row[i]=words[i];
         for(uint32_t i=0;i<6;++i)row[24+i]=progress[i];
+        uint32_t *const detail=switch_timeout_detail[n];
+        detail[0]=reason;detail[2]=uint32_t(progress_status);detail[3]=uint32_t(stall_status);
+        detail[1]=preempt_.noteTimeout(progress,detail+4)?1u:0u;
+        for(unsigned i=0;i<2;++i) {
+            detail[38+3*i]=ring(i)->writePointer();
+            detail[39+3*i]=ring(i)->current()?1u:0u;
+            detail[40+3*i]=ring(i)->restorePending()?1u:0u;
+        }
+        __atomic_store_n(&switch_timeout_ready,n+1,__ATOMIC_RELEASE);
+    } else {
+        (void)preempt_.noteTimeout(progress);
     }
-    native_adreno_switch_timeouts=n+1;
-    preempt_.noteTimeout(progress);
+    /* Do not wrap and reopen the immutable first-two slots after UINT32_MAX. */
+    __atomic_store_n(&native_adreno_switch_timeouts,n==UINT32_MAX?n:n+1,__ATOMIC_RELEASE);
     markPreemptDead(reason);
 }
 
