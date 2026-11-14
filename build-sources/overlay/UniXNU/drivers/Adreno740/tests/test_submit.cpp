@@ -42,13 +42,13 @@ struct CpPeer {
     std::vector<uint32_t> regs;
     std::vector<uint32_t> writes;
     unsigned publish=0,acquire=0,barriers=0,fail_publish=0,fail_acquire=0,fail_barrier=0;
-    uint32_t fail_read_reg=~0u;
+    uint32_t fail_read_reg=~0u,fail_write_reg=~0u;
     CpPeer():regs(0x10000,0){}
 };
 static CpPeer cp;
 static uint64_t clock_us=0;
 static int cwrite(void *c,uint32_t reg,uint32_t v)
-{CHECK(c==&cp && reg<cp.regs.size());cp.regs[reg]=v;cp.writes.push_back(reg);return 0;}
+{CHECK(c==&cp && reg<cp.regs.size());if(reg==cp.fail_write_reg)return 1;cp.regs[reg]=v;cp.writes.push_back(reg);return 0;}
 static int cread(void *c,uint32_t reg,uint32_t *v)
 {CHECK(c==&cp && v && reg<cp.regs.size());if(reg==cp.fail_read_reg)return 1;*v=cp.regs[reg];return 0;}
 static int cbarrier(void *c){CHECK(c==&cp);++cp.barriers;return cp.barriers==cp.fail_barrier;}
@@ -740,8 +740,118 @@ static void checkFrozenTimeoutEvidenceAfterLaterEvents()
     std::puts("PASS later timeouts and recovery leave both frozen slots unchanged; rejected reads leave output untouched");
 }
 
+
+/* Software CP completion restores the snapshot WPTR itself. Only later host
+ * submissions need a register write. These checks count real driver MMIO calls;
+ * they do not model whether duplicate writes make A740 hardware hang. */
+static unsigned wptrWrites()
+{
+    unsigned n=0;for(uint32_t reg:cp.writes)if(reg==0x0807)++n;return n;
+}
+static void testWptrHandoffWithoutAppend()
+{
+    DualRingPath p;p.setup();
+    const uint32_t job=p.enqueue(1,7);
+    CHECK(cp.regs[0x08a0]&1);
+    const uint32_t saved=NativeAdrenoPreempt::recordWptr(p.records[1]);
+    CHECK(saved==p.low.writePointer());
+    const unsigned before=wptrWrites();
+    cp.regs[0x0807]=saved; // The hardware restore, not a host MMIO write.
+    p.signalSwitch();
+    CHECK(p.low.current() && !p.keepalive);
+    CHECK(wptrWrites()==before);
+    CHECK(!p.low.restorePending());
+    CHECK(p.submit.fencePending(job));
+    p.low_fences[1]=job;
+    CHECK(p.submit.retireCompleted()==kIOReturnSuccess);
+    CHECK(p.submit.observeFence(job,nullptr,0)==kIOReturnSuccess);
+    std::puts("PASS WPTR handoff: no new submission means no duplicate software WPTR write");
+}
+static void testWptrHandoffWithAppend()
+{
+    DualRingPath p;p.setup();
+    const uint32_t first=p.enqueue(1,7);
+    const uint32_t saved=NativeAdrenoPreempt::recordWptr(p.records[1]);
+    const unsigned before=wptrWrites();
+    CHECK(!p.low.restorePending());
+    const uint32_t second=p.enqueue(1,7),third=p.enqueue(1,7);
+    CHECK(third>second && second>first);
+    CHECK(saved==NativeAdrenoPreempt::recordWptr(p.records[1]));
+    CHECK(p.low.restorePending() && p.low.writePointer()!=saved);
+    CHECK(wptrWrites()==before);
+    CHECK(p.low.writePreemptWptr(nullptr)==kIOReturnBadArgument);
+    CHECK(p.low.restorePending()); // A failed snapshot must not consume new work.
+    cp.regs[0x0807]=saved;
+    p.signalSwitch();
+    CHECK(wptrWrites()==before+1);
+    CHECK(cp.regs[0x0807]==p.low.writePointer());
+    CHECK(!p.low.restorePending());
+    CHECK(!p.submit.preemptIrq() && wptrWrites()==before+1);
+    p.low_fences[1]=third;
+    CHECK(p.submit.retireCompleted()==kIOReturnSuccess);
+    CHECK(p.submit.observeFence(first,nullptr,0)==kIOReturnSuccess);
+    CHECK(p.submit.observeFence(second,nullptr,0)==kIOReturnSuccess);
+    CHECK(p.submit.observeFence(third,nullptr,0)==kIOReturnSuccess);
+    std::puts("PASS WPTR handoff: two in-flight appends publish latest WPTR once; null snapshot preserves pending work");
+}
+
+static void testWptrHandoffReverse(bool append)
+{
+    DualRingPath p;p.setup();
+    uint32_t pending=0,done=0;p.beginReverseSwitch(pending,done);
+    const uint32_t saved=NativeAdrenoPreempt::recordWptr(p.records[0]);
+    const unsigned before=wptrWrites();
+    CHECK(!p.ring.restorePending());
+    const uint32_t final=append?p.enqueue(0,8):pending;
+    CHECK(NativeAdrenoPreempt::recordWptr(p.records[0])==saved);
+    CHECK(p.ring.restorePending()==append);
+    cp.regs[0x0807]=saved;
+    p.signalSwitch();
+    CHECK(p.ring.current() && !p.keepalive);
+    CHECK(wptrWrites()==before+(append?1u:0u));
+    CHECK(cp.regs[0x0807]==p.ring.writePointer());
+    CHECK(!p.ring.restorePending());
+    fencemem[1]=final;
+    CHECK(p.submit.retireCompleted()==kIOReturnSuccess);
+    CHECK(p.submit.observeFence(pending,nullptr,0)==kIOReturnSuccess);
+    CHECK(p.submit.observeFence(final,nullptr,0)==kIOReturnSuccess);
+    std::puts(append?"PASS reverse 1->0 WPTR handoff publishes in-flight append once":
+        "PASS reverse 1->0 WPTR handoff does not repeat restored pointer");
+}
+
+static void testWptrHandoffTriggerFailure()
+{
+    DualRingPath p;p.setup();
+    cp.fail_write_reg=0x08a0;
+    const uint32_t failed=p.enqueue(1,7);
+    CHECK(p.submit.deadReason()==1 && !p.keepalive);
+    CHECK(!(cp.regs[0x08a0]&1));
+    CHECK(NativeAdrenoPreempt::recordWptr(p.records[1])==p.low.writePointer());
+    CHECK(!p.low.restorePending());
+    CHECK(p.submit.fencePending(failed) && p.submit.outstanding()==1);
+    bool hung=false;CHECK(p.submit.hangCheck(&hung)==kIOReturnSuccess && hung);
+    cp.fail_write_reg=~0u;
+    NativeAdrenoRecovery result{};
+    CHECK(p.recoverBoard(result)==kIOReturnSuccess);
+    CHECK(p.submit.observeFence(failed,nullptr,0)==kIOReturnAborted);
+    CHECK(p.submit.outstanding()==0 && !p.vm.unusable());
+    const uint32_t resumed=p.enqueue(1,7);
+    CHECK(resumed>failed && p.ring.lastSubmitted()==resumed);
+    fencemem[1]=resumed;
+    CHECK(p.submit.retireCompleted()==kIOReturnSuccess);
+    CHECK(p.submit.observeFence(resumed,nullptr,0)==kIOReturnSuccess);
+    CHECK(p.submit.observeFence(failed,nullptr,0)==kIOReturnAborted);
+    std::puts("PASS failed handoff trigger: pending fence is explicitly aborted by recovery, later work completes");
+}
+
 int main(int argc,char **argv)
 {
+    if(argc==2 && !std::strcmp(argv[1],"--wptr-handoff")) {
+        testWptrHandoffWithoutAppend();
+        testWptrHandoffWithAppend();
+        testWptrHandoffReverse(false);testWptrHandoffReverse(true);
+        testWptrHandoffTriggerFailure();return 0;
+    }
     if(argc==2 && !std::strcmp(argv[1],"--timeout-read-error")) {
         testTimeoutEvidenceReadFailure();return 0;
     }

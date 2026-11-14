@@ -17,8 +17,8 @@ PROFILE = 'ipados-27.0.1-24A446'
 DUMMY_CHIP = '13579bdf'
 RAM_BYTES = 8 * 1024**3
 DATA_BYTES = 215 * 1024**3
-VERSION = 'V5.1'
-GPU_SOURCE_SHA = '5f5dae4226b23087fefee602ff1b744e4f1d89c4e92a646ff1718d77ec751943'
+VERSION = 'V5.2'
+GPU_SOURCE_SHA = 'd7ef01bb43feb66b20a742d6105c3757604851be55413a62b6dd57984d9eaf32'
 TURNIP_KMD = 'src/freedreno/vulkan/tu_knl_darwin.cc'
 TURNIP_KMD_SHA = '28dbfb342333cbfc70da733ad26102ed64ec502ca002f12c0940a7175627df1c'
 SEED_SHA = 'e1bfa6971ef9fe6a27b53474c509cd518325459484230daf7f679642a04323b3'
@@ -222,8 +222,8 @@ def main():
     require(gpu_trace['source_sha256'] == GPU_SOURCE_SHA
             and gpu_trace['trace_source_id'] == GPU_SOURCE_SHA[:16]
             and gpu_trace['target'] == 'arm64e-apple-ios27.0',
-            'Compiled Adreno source identity differs from the V5.1 candidate')
-    print(f'Adreno V5.1 source ID {gpu_trace["trace_source_id"]}', flush=True)
+            'Compiled Adreno source identity differs from the V5.2 candidate')
+    print(f'Adreno V5.2 source ID {gpu_trace["trace_source_id"]}', flush=True)
 
     stage = top / 'os27-ram8-handoff.partial'
     stage.mkdir()

@@ -394,10 +394,14 @@ IOReturn NativeAdrenoRing::writePreemptRecord(uint8_t *record) const
     if(!NativeAdrenoPreempt::writeRecord(record,ring_iova_,fence_iova_,bv_rptr_iova_,control_,next_))return kIOReturnBadArgument;
     return kIOReturnSuccess;
 }
-IOReturn NativeAdrenoRing::writePreemptWptr(uint8_t *record) const
+IOReturn NativeAdrenoRing::writePreemptWptr(uint8_t *record)
 {
-    if(!record)return kIOReturnBadArgument;
-    return NativeAdrenoPreempt::setRecordWptr(record,next_)?kIOReturnSuccess:kIOReturnBadArgument;
+    if(!NativeAdrenoPreempt::setRecordWptr(record,next_))return kIOReturnBadArgument;
+    /* The CP restores this WPTR from the record. The submission lock also
+     * covers this flag: only work appended after this snapshot needs another
+     * WPTR write when the switch completes (a6xx_preempt_trigger). */
+    restore_wptr_=false;
+    return kIOReturnSuccess;
 }
 IOReturn NativeAdrenoRing::restoreWptr()
 {

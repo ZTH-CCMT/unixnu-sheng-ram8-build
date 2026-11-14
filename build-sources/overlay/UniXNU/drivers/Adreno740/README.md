@@ -93,3 +93,25 @@ the new regression fail. These software peers do not emulate A740 execution.
 The native ARM64e build and device capture remain pending. This candidate fixes
 diagnostic correspondence and capture; it does not fix the first hardware
 preemption timeout or prove a desktop performance improvement.
+
+## V5.2 local write-pointer handoff fix
+
+After copying the incoming ring's write pointer to its preemption record,
+`writePreemptWptr()` clears `restore_wptr_` under the existing submission lock.
+The CP restores the saved pointer itself. New submissions during the switch
+set the flag again, so completion publishes only work added after the snapshot.
+A rejected snapshot leaves the flag unchanged. This follows
+[Linux a6xx_preempt_trigger](https://github.com/torvalds/linux/blob/4250923945d05311f41411e8e9d3cffc72a9c523/drivers/gpu/drm/msm/adreno/a6xx_preempt.c#L214-L232).
+
+The actual-driver Windows host regression fails on the previous runtime code
+when completion writes the same pointer again. It passes with this fix for
+both switch directions, no append, multiple in-flight appends, a rejected
+null snapshot, and a trigger-write failure followed by existing recovery.
+Recovery still reports potentially exposed work as aborted; clearing this
+flag does not promise to replay that work.
+
+This corrects a reproduced duplicate-publication defect. The host peer does
+not emulate A740 execution or demonstrate that duplicate writes caused the
+recorded hardware timeout. Native ARM64e build and device testing are pending.
+Queue count, scheduling policy, timeout, power setup, packets and V4.2 reset
+fallback are unchanged. V5.1 diagnostic capture remains in this candidate.
