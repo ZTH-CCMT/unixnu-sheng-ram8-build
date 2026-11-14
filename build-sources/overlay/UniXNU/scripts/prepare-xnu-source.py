@@ -21,7 +21,10 @@ def locked_entries(kind, tag):
     # Contents API quota of each fresh hosted runner. Keep exact Git blob checks.
     source = INPUTS['sources'][kind]
     if source['tag'] != tag:
-        raise ValueError(f'Unpinned Apple header tag: {tag}')
+        selected = source.get('alternate', {}).get(tag)
+        if selected is None:
+            raise ValueError(f'Unpinned Apple header tag: {tag}')
+        source = source | selected
     base = (INPUTS['repository'].replace('https://github.com/',
             'https://raw.githubusercontent.com/') + '/' + source['commit'] + '/'
             + source['directory'] + '/')

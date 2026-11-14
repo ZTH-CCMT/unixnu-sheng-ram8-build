@@ -131,6 +131,33 @@ class HeaderDownloadTests(unittest.TestCase):
             self.execute(corrupt=('driverkit', 'crypto/aes.h'))
         self.assertFalse((self.work / 'candidate/.cache/xnu-work/iokit/DriverKit/crypto/aes.h').exists())
 
+    def test_bootstrap_uses_ipados27_profile_header_tag(self):
+        tag = 'xnu-12377.121.6'
+        source = self.index['sources']['driverkit']
+        selected = source['alternate'][tag]
+        self.assertEqual(selected['commit'], 'ac9718fb1af618d5ce8678d0dc6e8a58f252216f')
+        self.assertEqual(len(selected['files']), 21)
+        self.assertNotEqual(selected['files']['IOTypes.h'],
+                            json.loads(INDEX.read_bytes())['sources']['driverkit']['files']['IOTypes.h'])
+        path = 'iokit/DriverKit/IOTypes.h'
+        content = b'/* fixture for the newer DriverKit IOTypes */\n'
+        other_headers = {
+            'iokit/DriverKit/' + name: self.payloads['driverkit', name]
+            for name in source['files'] if name != 'IOTypes.h'
+        }
+        selected['files']['IOTypes.h'] = blob(content)
+        source['files']['IOTypes.h'] = blob(content)
+        self.payloads['driverkit', 'IOTypes.h'] = content
+        source['commit'] = selected['commit']
+        files, receipt, requests = self.execute(
+            existing=other_headers, tags={'UNIXNU_DRIVERKIT_TAG': tag})
+        self.assertEqual(files[path], content)
+        driverkit = [url for url in requests if '/iokit/DriverKit/' in url]
+        self.assertEqual(driverkit, [
+            'https://raw.githubusercontent.com/apple-oss-distributions/xnu/'
+            + selected['commit'] + '/' + path])
+        self.assertEqual(next(r['source_tag'] for r in receipt if r['name']=='IOTypes.h'), tag)
+
     def test_unpinned_tag_fails_before_download(self):
         with self.assertRaisesRegex(ValueError, 'Unpinned Apple header tag'):
             self.execute(tags={'UNIXNU_DRIVERKIT_TAG': 'xnu-unreviewed'})

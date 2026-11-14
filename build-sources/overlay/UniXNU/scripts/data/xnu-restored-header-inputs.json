@@ -27,6 +27,34 @@
         "macro_help.h": "02fff0602846c259670822c9766424c106ea6a2b",
         "queue_implementation.h": "1d14efdeb7370869d2360a100ff07125c3055119",
         "safe_allocation.h": "1d4759b1ab36d76e7604adce3939ef5b6a56d12f"
+      },
+      "alternate": {
+        "xnu-12377.121.6": {
+          "commit": "ac9718fb1af618d5ce8678d0dc6e8a58f252216f",
+          "files": {
+            "IOKernelReportStructs.h": "71c98a84650a7da3c66618d4306852d3df1c4d60",
+            "IOKitKeys.h": "a304bd533485861dc79a8af0999366fce0238348",
+            "IORPC.h": "7ffc6b73e32ba98616e35c999945d367d2b8751d",
+            "IOReportTypes.h": "dd81759a416ba5cc3b5f6b79f843554765053c22",
+            "IOReturn.h": "e36d37b374d1443c7721ade372a92ccc60d1d129",
+            "IOTypes.h": "9605ab33376ac1b0bc805829a6ddf614d0738c18",
+            "OSBoundedArray.h": "e413229b982880b91350e82520e4aaa6dfd18124",
+            "OSBoundedArrayRef.h": "4467f6b6ff2ff3e50f495bcfce751adb82bd72a4",
+            "OSBoundedPtr.h": "6ea9b1340603fbb5edf7072a276650aed2223f58",
+            "OSBoundedPtrFwd.h": "04c4df48c508f6c9c1a3f53fbb613130ede06b2f",
+            "bounded_array.h": "57e102743d6f6039a27a6ff8310e9ce63d878d0e",
+            "bounded_array_ref.h": "fe060a6d72a9f6930071a701caf162d9bf275fff",
+            "bounded_ptr.h": "4c7de13f1a5bfe6d130413bde4c9c3de444a93ad",
+            "bounded_ptr_fwd.h": "9613279e9841fef46f10398d4d5ac0d2c44a589a",
+            "crypto/aes.h": "9e962a873c50d4bb5d37fb8e333c77985bbe532e",
+            "crypto/md5.h": "4ecd947d7a61464543059eb6265ec4cc548c84f6",
+            "crypto/sha1.h": "706d10f88a499090bbd9fe2b03b4028a6069f7ca",
+            "crypto/sha2.h": "2e93f35d7cc6766f0996014362a7b6c57fa14f19",
+            "macro_help.h": "02fff0602846c259670822c9766424c106ea6a2b",
+            "queue_implementation.h": "e92c2c54c77e1db1ce56502872a38a73bd4c2a8f",
+            "safe_allocation.h": "1d4759b1ab36d76e7604adce3939ef5b6a56d12f"
+          }
+        }
       }
     },
     "trustcache": {

@@ -242,7 +242,7 @@
       "repository": "UniXNU",
       "path": "scripts/prepare-xnu-source.py",
       "before_sha256": "1ad6cc259a39fdf9b9059e0d748a316f0b2bf64853aef11dff709647706d27af",
-      "sha256": "a12b3e11d312180043eecb139f0c3bd341ee50a2157f210805ad768ee6fcfc6e"
+      "sha256": "ccc67d68eea39d1fdfc5527ba5c07a759282d277ec94e7df37a38789ccb0f431"
     },
     "UniXNU/scripts/fetch-adreno-inputs.py": {
       "repository": "UniXNU",
@@ -254,7 +254,7 @@
       "repository": "UniXNU",
       "path": "scripts/data/xnu-restored-header-inputs.json",
       "before_sha256": null,
-      "sha256": "f989b68c55d57e5bbc51f1e0adf68f3724d9a9f209e1cbcb768a8946719ceb01"
+      "sha256": "b9bf8e25bec65d104e510fedc6a4b3650daf7131738ea79babd97989c6bf1ee9"
     }
   }
 }
