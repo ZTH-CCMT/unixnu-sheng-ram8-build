@@ -352,6 +352,18 @@
       "path": "scripts/fetch-adreno-inputs.py",
       "before_sha256": "a854723a3a5530811aa628172b09096def25b6f319609b5f35dc29fe54b2fa15",
       "sha256": "aa264d5df189a96563bcd80954d9cc1f86082b2ab6631af0634bdbe534105d2d"
+    },
+    "device/patches/xnu-12377/series": {
+      "repository": "device",
+      "path": "patches/xnu-12377/series",
+      "before_sha256": "15d08ffeafa1d29ece607e4f2913c80cb1f403442b0a0cbf9625f8d60a2d2953",
+      "sha256": "bcfb673d5ea3e14513d31b68066f8c2d3a70d7ff46706aca54da9fd913d5eff3"
+    },
+    "device/patches/xnu-12377/sheng-cryptex-webkit-v4.0.2.patch": {
+      "repository": "device",
+      "path": "patches/xnu-12377/sheng-cryptex-webkit-v4.0.2.patch",
+      "before_sha256": null,
+      "sha256": "5113c90d2ad3e5d49893a200ba2b0e1f77d516becc85a145529c5bdf18b802f1"
     }
   },
   "candidate_version": "V5.3",
