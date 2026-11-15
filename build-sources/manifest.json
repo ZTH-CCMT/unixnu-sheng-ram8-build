@@ -324,6 +324,12 @@
       "before_sha256": "9fc453e9b9dca88caa594f4e75397c39bc3380228e11415d93cde09457da1f77",
       "sha256": "ad435c2c7cfbd02c31c1e495bebef6322ba09e8f3781d01ad4836318127c3fed"
     },
+    "device/package/AppleARMBacklight.cpp": {
+      "repository": "device",
+      "path": "package/AppleARMBacklight.cpp",
+      "before_sha256": "6036394e5e8fb6fbe9bf8c365834626f97d99c249ae1b87fb6db7fabaa8d1ebb",
+      "sha256": "68187639ca41277d2784e94ebc5395ed425117d4d5aa5650b117d1ef9bcb4140"
+    },
     "device/package/GpuPowerProbe.cpp": {
       "repository": "device",
       "path": "package/GpuPowerProbe.cpp",
