@@ -425,8 +425,14 @@
       "path": "patches/xnu-12377/native-union-lower-directory.patch",
       "before_sha256": "905c52369f6ff5336323dc729f38d238ba735b607de826f433615ec7aba8d927",
       "sha256": "536c0e40308658fb34e98e414f30118c40f714f61e73c0d65f4d1a1086b749f9"
+    },
+    "UniXNU/patches/xnu-12377/native-union-statfs-fsid.patch": {
+      "repository": "UniXNU",
+      "path": "patches/xnu-12377/native-union-statfs-fsid.patch",
+      "before_sha256": "b517214ef32568ad9fa3d0a381c488e028ea8c24c7f562640ac7e66f43048c5b",
+      "sha256": "d5c24aeb7eed69ff500ee5312c5ece27bac0ee88f0c83e3d1883f1937058129b"
     }
   },
-  "candidate_version": "V5.4.2",
+  "candidate_version": "V5.4.3",
   "base_actions_run": 43140807984
 }
