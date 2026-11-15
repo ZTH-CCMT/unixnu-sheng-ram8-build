@@ -14,6 +14,7 @@
 #include "NativeHidTouchPlan.h"
 #include <IOKit/IOWorkLoop.h>
 #include <IOKit/IOTimerEventSource.h>
+#include <kern/clock.h>
 #include <libkern/c++/OSString.h>
 #include <libkern/c++/OSIterator.h>
 #include <pexpert/pexpert.h>
@@ -26,6 +27,7 @@
 #endif
 extern "C" void native_hid_input_observed(unsigned,int);
 extern "C" void native_hid_live_checkpoint(IOService *);
+extern "C" bool native_hid_keys_checkpoint(IOService *,uint32_t) __attribute__((weak_import));
 extern "C" bool native_hid_input_requested(void);
 extern "C" void native_touch_set_sink(void (*)(void *), void *) __attribute__((weak_import));
 // Optional hardware buttons fed by the board button driver: a mask of report 2 bits, sent on every change.
@@ -260,6 +262,8 @@ class NativeHidInput : public IOHIDDevice {
     // (Digitizer/Touch Screen) and the Built-In flag, which a combined keyboard-first descriptor would not provide.
     bool touchOnly=false;
     bool keysOnly=false;
+    bool buttonsTrace=false;
+    uint32_t buttonSequence=0, buttonSnapshot=UINT32_MAX;
     bool eventDriverFound=false;
     IOReturn submitReport(IOMemoryDescriptor *report) {
 #if defined(NATIVE_HID_SOURCE_API) && NATIVE_HID_SOURCE_API
@@ -346,16 +350,25 @@ class NativeHidInput : public IOHIDDevice {
         NativeHidInput *self=static_cast<NativeHidInput *>(context);
         if(self && self->inputLoop)self->inputLoop->runAction(&NativeHidInput::buttonsAction,self,reinterpret_cast<void *>(uintptr_t(mask)));
     }
+    static uint64_t buttonUs() {
+        uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time(),&ns);return ns/1000;
+    }
     static IOReturn buttonsAction(OSObject *owner,void *mask,void *,void *,void *) {
         NativeHidInput *self=OSDynamicCast(NativeHidInput,owner);if(!self)return kIOReturnSuccess;
         self->buttons=static_cast<uint8_t>(uintptr_t(mask)&0xe);
-        if(!self->hasEventDriverCached())return kIOReturnSuccess;
+        const uint32_t sequence=self->buttonsTrace?++self->buttonSequence:0;
+        const uint64_t start=sequence?buttonUs():0;
+        if(!self->hasEventDriverCached()) {
+            if(sequence) IOLog("[hid buttons] seq=%u start_us=%llu mask=%02x no event driver\n",sequence,start,unsigned(self->buttons));
+            return kIOReturnSuccess;
+        }
         unsigned char report[]={2,static_cast<unsigned char>((self->down?1:0)|self->buttons)};
         IOBufferMemoryDescriptor *buffer=IOBufferMemoryDescriptor::withBytes(report,sizeof(report),kIODirectionNone);
         IOReturn result=buffer?self->submitReport(buffer):kIOReturnNoMemory;
         OSSafeReleaseNULL(buffer);
         native_hid_input_observed(4,result);
-        if(self->keysOnly)IOLog("[hid buttons] report2=%02x status=%x\n",unsigned(report[1]),unsigned(result));
+        if(sequence) IOLog("[hid buttons] report2=%02x status=%x seq=%u start_us=%llu done_us=%llu\n",
+                           unsigned(report[1]),unsigned(result),sequence,start,buttonUs());
         return kIOReturnSuccess;
     }
     bool hasEventDriverCached() {
@@ -383,6 +396,8 @@ class NativeHidInput : public IOHIDDevice {
     static void tick(OSObject *owner,IOTimerEventSource *source) {
         NativeHidInput *self=OSDynamicCast(NativeHidInput,owner);if(!self)return;
         if(!self->keysOnly)native_hid_live_checkpoint(self);
+        if(self->buttonsTrace && self->buttonSnapshot!=self->buttonSequence && &native_hid_keys_checkpoint &&
+           native_hid_keys_checkpoint(self,self->buttonSequence))self->buttonSnapshot=self->buttonSequence;
         if(self->touchOnly){source->setTimeoutMS(1000);return;}
         if(!self->down && !hasEventDriver(self,4)) {
             native_hid_input_observed(3,0);
@@ -457,6 +472,8 @@ public:
         if(!setProperty("HIDDefaultBehavior",true))return false;
         unsigned touch=0;
         touchEnabled=!keysOnly && PE_parse_boot_argn("touch-hid",&touch,sizeof(touch)) && touch==1;
+        unsigned buttonTraceArg=0;
+        buttonsTrace=keysOnly && PE_parse_boot_argn("buttons-trace",&buttonTraceArg,sizeof(buttonTraceArg)) && buttonTraceArg==1;
         // DigitizerCollectionDispatch: IOHIDEventDriver (setDigitizerProperties) reads it up the service plane and then sends each
         // report's fingers as one digitizer collection with a child per finger. Without it a touch screen gets one event per finger,
         // and backboardd takes each as the whole touch set, so no two fingers are ever down together for UIKit (no pinch, no

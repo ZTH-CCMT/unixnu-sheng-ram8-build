@@ -3,11 +3,14 @@
 // owned offline input source. No entitlement or original provider is replaced.
 #include <IOKit/IOService.h>
 #include <IOKit/IOLib.h>
+#include <libkern/c++/OSDictionary.h>
 #include <libkern/c++/OSMetaClass.h>
 #include <libkern/c++/OSSymbol.h>
 #include <libkern/c++/OSIterator.h>
 #include <libkern/c++/OSNumber.h>
 #include <libkern/c++/OSKext.h>
+#include <libkern/c++/OSUnserialize.h>
+#include <kern/clock.h>
 #include <kern/thread.h>
 #include <pexpert/pexpert.h>
 #include <mach/kmod.h>
@@ -79,6 +82,37 @@ static IORegistryEntry *findEventDriver(IORegistryEntry *parent,unsigned depth) 
         if((found=findEventDriver(entry,depth-1)))break;
     }
     it->release();return found;
+}
+static int64_t reportCounter(OSDictionary *state,const char *key) {
+    OSNumber *number=state?OSDynamicCast(OSNumber,state->getObject(key)):nullptr;
+    return number?int64_t(number->unsigned64BitValue()):-1;
+}
+extern "C" bool native_hid_keys_checkpoint(IOService *device,uint32_t sequence) {
+    IORegistryEntry *driver=findEventDriver(device,4);
+    if(!driver)return false;
+    IORegistryEntry *interface=driver->getParentEntry(gIOServicePlane);
+    OSObject *property=interface?interface->copyProperty("DebugState"):nullptr;
+    OSDictionary *state=OSDynamicCast(OSDictionary,property);
+    OSObject *decoded=nullptr;
+    if(property && !state) {
+        // DriverKit publishes this property as a lazy serializer. Read it outside the input callback.
+        OSSerialize *xml=OSSerialize::withCapacity(1024);
+        if(xml && property->serialize(xml)) decoded=OSUnserializeXML(xml->text());
+        OSSafeReleaseNULL(xml);
+        state=OSDynamicCast(OSDictionary,decoded);
+    }
+    OSObject *driverState=driver->copyProperty("HIDRMDeviceState");
+    OSString *hidrm=OSDynamicCast(OSString,driverState);
+    uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time(),&ns);
+    IOLog("[hid buttons driverkit] seq=%u at_us=%llu service=%llx interface=%llx builtin=%u/%u opened=%u hidrm=%s calls=%lld runs=%lld\n",
+        sequence,ns/1000,driver->getRegistryEntryID(),interface?interface->getRegistryEntryID():0,
+        unsigned(driver->getProperty("Built-In")==kOSBooleanTrue),
+        unsigned(interface && interface->getProperty("Built-In")==kOSBooleanTrue),
+        unsigned(interface && interface->getProperty("DeviceOpenedByEventSystem")==kOSBooleanTrue),
+        hidrm?hidrm->getCStringNoCopy():"unavailable",
+        reportCounter(state,"ReportAvailableCalls"),reportCounter(state,"ReportAvailableRuns"));
+    OSSafeReleaseNULL(driverState);OSSafeReleaseNULL(decoded);OSSafeReleaseNULL(property);
+    return true;
 }
 static void appendProperty(IORegistryEntry *driver,const char *key,const char *label,size_t &used) {
     OSObject *value=driver->copyProperty(key);

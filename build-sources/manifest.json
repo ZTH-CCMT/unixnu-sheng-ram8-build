@@ -130,13 +130,13 @@
       "repository": "device",
       "path": "board.toml",
       "before_sha256": "88b824800753cc7e79ae9dcd4ea4c92f351228126a3147dfc0ee81de0382e8b2",
-      "sha256": "cb44aa0ffcbeef20124e9764dad90859851324d811fb9aa9d0899e578df92555"
+      "sha256": "48fd3ee09a6e23b69d6e4eb69a0438c9701adbb36c55e988177b7e2a8022c8c0"
     },
     "device/drivers/ShengHidInput/NativeHidInput.cpp": {
       "repository": "device/drivers/ShengHidInput",
       "path": "NativeHidInput.cpp",
       "before_sha256": "c0964bf7faa0332ce8d6334f2b74a271b269eee14112ae89b4453091604a10f6",
-      "sha256": "64228cddf17653c38eac489df1f22521fa1ab66ae9e61cf8716d4b3f4c67694c"
+      "sha256": "2a30c8d46836b05d0359bad19ced7b368e0c7493748551b1b98896e85d352f56"
     },
     "device/drivers/ShengHidInput/NativeHidTouchPlan.h": {
       "repository": "device/drivers/ShengHidInput",
@@ -328,7 +328,7 @@
       "repository": "device",
       "path": "package/HidInputProbe.cpp",
       "before_sha256": "c776e94ef633b3ba2d749ff69c19d12918fe5d21fd0daae9b7ba3ca4d84d7654",
-      "sha256": "0db11e26fdb75491dd79960731e2d76273d265de6e95157189679a382db98b16"
+      "sha256": "7a78bbb73e39b56c3a5ece81c3c1be574f2b588fa5e679b1ad8bd0ee74ea8ec7"
     },
     "device/package/GpuPowerProbe.cpp": {
       "repository": "device",
@@ -431,6 +431,12 @@
       "path": "patches/xnu-12377/native-union-lower-directory.patch",
       "before_sha256": "905c52369f6ff5336323dc729f38d238ba735b607de826f433615ec7aba8d927",
       "sha256": "536c0e40308658fb34e98e414f30118c40f714f61e73c0d65f4d1a1086b749f9"
+    },
+    "device/package/ButtonProbe.cpp": {
+      "repository": "device",
+      "path": "package/ButtonProbe.cpp",
+      "before_sha256": "fe1c39eb478454a0bc8fc169db75f0a94c54d06142ee03315a827e9b7279aa2e",
+      "sha256": "c11ec31e7b615888ec80a83769ef0157738525c198c43af801191488c8c30351"
     }
   },
   "candidate_version": "V5.4.2",
