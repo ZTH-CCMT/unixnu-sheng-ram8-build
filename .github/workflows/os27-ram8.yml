@@ -1,9 +1,9 @@
-name: UniXNU sheng iPadOS 27 RAM 8 GiB GPU V6.1 Frame IPC
+name: UniXNU sheng iPadOS 27 RAM 8 GiB GPU V6.1 Frame Feedback
 
 on:
   workflow_dispatch:
   push:
-    branches: [ram8-v6.1-frame-ipc]
+    branches: [ram8-v6.1-frame-feedback]
 
 permissions:
   contents: read
@@ -86,7 +86,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: gpu-v6.1-frame-ipc-build-failure-${{ github.run_id }}-${{ github.run_attempt }}
+          name: gpu-v6.1-frame-feedback-build-failure-${{ github.run_id }}-${{ github.run_attempt }}
           path: build-failure-logs/
           if-no-files-found: warn
           retention-days: 7
@@ -108,7 +108,7 @@ jobs:
       - name: Upload verified generic boot handoff
         uses: actions/upload-artifact@v4
         with:
-          name: os27-ram8-adreno-v6.1-frame-ipc-handoff-${{ github.run_id }}-${{ github.run_attempt }}
+          name: os27-ram8-adreno-v6.1-frame-feedback-handoff-${{ github.run_id }}-${{ github.run_attempt }}
           path: os27-ram8-handoff/
           include-hidden-files: true
           if-no-files-found: error

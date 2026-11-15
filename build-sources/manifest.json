@@ -82,7 +82,7 @@
       "repository": "UniXNU/drivers/GopFramebuffer",
       "path": "NativeLegacyDisplay.cpp",
       "before_sha256": "465f5ebfe1df7228c66ecebd2b17a9971a7af64882efd132a907b1b0abacb78a",
-      "sha256": "03ead711c29455d56789cce279d3bfdbe8bc81bd32faf1073a0c7d30e9afdb07"
+      "sha256": "1f938378be2dc2a432dd43c23b708fcb405d9b4289af1bca7f0a2411aedc800b"
     },
     "UniXNU/drivers/GopFramebuffer/Test/check-fence-wait.py": {
       "repository": "UniXNU/drivers/GopFramebuffer",
@@ -130,7 +130,7 @@
       "repository": "device",
       "path": "board.toml",
       "before_sha256": "88b824800753cc7e79ae9dcd4ea4c92f351228126a3147dfc0ee81de0382e8b2",
-      "sha256": "e1a00aed4e32b6e29fc49856009471574d7f74c4332105b8d22d3bff82ee5173"
+      "sha256": "14eed4b3e01804d74c7565a49589f92c0f8c70bb9be0d5b5ebccee859b67ac73"
     },
     "device/drivers/ShengHidInput/NativeHidInput.cpp": {
       "repository": "device/drivers/ShengHidInput",
@@ -448,7 +448,7 @@
       "repository": "device",
       "path": "scripts/decode-gpu-trace.py",
       "before_sha256": "970b107fd25dfff9dbd0e9d58f6eecdc71d1985bddacf8b2c7ed16650a04ecc1",
-      "sha256": "b0243bf2acd9ba4e9fde88b54ec085896815ca8d437a1a2704202fff192b9d58"
+      "sha256": "9c864c36d9bb8d07f24472acfca630b1031c84e6b5a1b65ab8b09cdd5e537927"
     },
     "device/patches/xnu-12377/series": {
       "repository": "device",

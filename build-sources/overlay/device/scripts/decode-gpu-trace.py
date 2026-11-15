@@ -17,7 +17,7 @@ FIELDS = {
  3: ('kernel_build', 'source_id'),
  10: ('submit', 'fence queue ring priority role loaded switching context submitted_us buffers'),
  11: ('retire', 'fence queue ring submitted_us gpu_start_ticks gpu_end_ticks stamped replays'),
- 20: ('display', 'request phase pointer surface_object physical slot shown pending queued'),
+ 20: ('display', 'request phase pointer surface_object physical slot shown pending queued completion_thread'),
  21: ('display_surface', 'request physical width height stride format allocation mapped_bytes'),
  22: ('display_fence', 'request reason target submitted retired elapsed_ns ring0 ring1 query_reason repeated_queries'),
  23: ('display_latch', 'request flush elapsed_ns shown pending'),
@@ -236,6 +236,8 @@ def records(blob):
         name, names = FIELDS.get(event, ('unknown', ''))
         row = dict(sequence=seq, us=us, event=event, name=name, pid=pid,
                    fields=dict(zip(names.split(), values)), raw=values)
+        if event == 20 and values[1] in (9, 10):
+            row['name'] = 'display_complete_begin' if values[1] == 9 else 'display_complete_return'
         if event == 63:
             row['text'] = struct.pack('<4Q', *values[2:6]).split(b'\0')[0].decode('utf-8', errors='replace')
         if event == 65:

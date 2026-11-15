@@ -14,6 +14,7 @@
 #include <IOKit/IOTimerEventSource.h>
 #include <IOKit/IODeviceMemory.h>
 #include <kern/clock.h>
+#include <kern/thread.h>
 #include <IOKit/pwr_mgt/IOPM.h>
 #include <IOKit/pwr_mgt/IOPMpowerState.h>
 #include <libkern/c++/OSData.h>
@@ -23,7 +24,6 @@
 #if defined(NATIVE_LEGACY_MACOS) && NATIVE_LEGACY_MACOS
 #include <IOKit/IODeviceTreeSupport.h>
 #include <libkern/OSKextLib.h>
-#include <kern/thread.h>
 #endif
 extern "C" __attribute__((noreturn)) void native_legacy_backend_guard(unsigned,void *,void *);
 extern "C" IOService *native_legacy_display_allocate(void);
@@ -836,8 +836,13 @@ public:
         if(!(retire==1 || cpuPresent==1 || force))return false;
         if(!activateOnlyPendingSwap(request))return false;
         stat(11);note(6,-1,request);
+        const uint64_t id=(&native_gpu_trace_enabled && native_gpu_trace_enabled())?traceId(request):0;
         removeValidated(request);
+        // Use the same thread ID as the Mach trace to identify notifications sent inside this call.
+        const uint64_t tid=id?thread_tid(current_thread()):0;
+        if(id)gpuTraceEvent(GpuTraceDisplay,0,id,9,0,0,0,0,0,0,0,tid);
         IOMobileFramebufferLegacy::completeCurrentSwap();
+        if(id)gpuTraceEvent(GpuTraceDisplay,0,id,10,0,0,0,0,0,0,0,tid);
         native_legacy_retirement_observed(this);
         return true;
     }
