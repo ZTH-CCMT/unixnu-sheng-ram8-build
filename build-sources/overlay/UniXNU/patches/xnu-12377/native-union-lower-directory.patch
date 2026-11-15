@@ -1,0 +1,41 @@
+diff --git a/bsd/vfs/vfs_lookup.c b/bsd/vfs/vfs_lookup.c
+--- a/bsd/vfs/vfs_lookup.c
++++ b/bsd/vfs/vfs_lookup.c
+@@ -1826,6 +1826,8 @@
+  * Given a vnode in a union mount, traverse to the equivalent
+  * vnode in the underlying mount.
+  */
++uint32_t native_union_lookup_reentries;
++
+ int
+ lookup_traverse_union(vnode_t dvp, vnode_t *new_dvp, vfs_context_t ctx)
+ {
+@@ -1885,7 +1887,27 @@
+ 	nd.ni_dvp = dvp->v_mount->mnt_vnodecovered;
+ 	error = namei(&nd);
+ 	if (error == 0) {
+-		*new_dvp = nd.ni_vp;
++		/*
++		 * Only a directory below can hold the name: the base system keeps a symlink where the
++		 * mounted system has a framework directory, and searching that symlink gave ENOTDIR.
++		 */
++		if (nd.ni_vp->v_mount == dvp->v_mount) {
++			/*
++			 * A symlink in the covered tree can lead back into this
++			 * union mount. Repeating the negative lookup there cannot
++			 * find the name. Report that no lower directory was found.
++			 */
++			if (os_atomic_inc_orig(&native_union_lookup_reentries, relaxed) < 8) {
++				printf("[union lookup] rejected reentry: %.160s\n", pp);
++			}
++			vnode_put(nd.ni_vp);
++			error = ENOENT;
++		} else if (nd.ni_vp->v_type != VDIR) {
++			vnode_put(nd.ni_vp);
++			error = ENOENT;
++		} else {
++			*new_dvp = nd.ni_vp;
++		}
+ 	}
+ 	nameidone(&nd);
+ done:
