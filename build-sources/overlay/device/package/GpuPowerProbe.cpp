@@ -399,6 +399,13 @@ int boardSqeSnapshot(void *, NativeAdrenoSqeSnapshot *out) {
 int gmuWrAt(void *, uint32_t dword, uint32_t value) {
     return gColdDevice.io.write32(gColdDevice.io.cookie, ShengGmuCore, size_t(kGmuReg(dword)), value);
 }
+// WPTR uses AHB fence bit 0. Leave bit 1 for the context-switch writes.
+int ringFenceStatus(void *, int clear, uint32_t *status) {
+    if (clear) return gmuWrAt(nullptr, 0x23b14, 1u);
+    return gColdDevice.io.read32(gColdDevice.io.cookie, ShengGmuCore, kGmuReg(0x23b13), status);
+}
+const NativeAdrenoRingIo kShengRingIo{nullptr, ringWrite, ringRead, ringBarrier, nullptr, ringFenceStatus};
+
 // AHB fence bit 1 reports dropped context-switch register writes. The keepalive
 // vote is already held; retry for at most 2 ms while the GPU domain wakes.
 int preemptWrite(void *, uint32_t reg, uint32_t value) {
@@ -1694,12 +1701,11 @@ IOReturn gpuRestart(void *, NativeAdrenoRing *ring, uint32_t completed) {
     gpuWr64(A740_CP_BV_RB_RPTR_ADDR, gGpuBuffers[2].iova + 8);
     gpuWr(A740_CP_SQE_CNTL, 1);
     // The power-up list stays as a7xx_patch_pwrup_reglist wrote it at bring-up (pwrup_reglist_emitted).
-    const NativeAdrenoRingIo rio{nullptr, ringWrite, ringRead, ringBarrier, nullptr, nullptr};
     const NativeAdrenoCpInitConfig config{gGpuBuffers[0].iova, gGpuBuffers[3].iova, 1};
     const NativeAdrenoRingClock clock{nullptr, ringNow, nullptr};
     NativeAdrenoCpInit init;
     uint32_t fence = 0;
-    status = init.run(&rio, ring, &config, &fence, false);
+    status = init.run(&kShengRingIo, ring, &config, &fence, false);
     if (status) return fail(4, status);
     status = ring->idle(&clock, 1000000);
     if (status) return fail(5, status);
@@ -1753,10 +1759,9 @@ void gpuStart() {
     gpuHwInit();
     // 4. Ring 0 (MSM_GPU_RB_CNTL_DEFAULT: 32 KiB, block 32; hw_apriv uses the hardware rptr shadow at memptrs+0).
     c[0] = 4;
-    const NativeAdrenoRingIo rio{nullptr, ringWrite, ringRead, ringBarrier, nullptr, nullptr};
     const NativeAdrenoRingCache cache{nullptr, ringPublish, ringAcquire};
     native_adreno_fence_phys = gGpuBuffers[2].physical;   // the page the CP writes its timestamps to, for the UFS log
-    const IOReturn attached = gRing.attach(&rio, &cache, const_cast<uint8_t *>(gGpuCpu[1]), gGpuBuffers[1].bytes,
+    const IOReturn attached = gRing.attach(&kShengRingIo, &cache, const_cast<uint8_t *>(gGpuCpu[1]), gGpuBuffers[1].bytes,
         gGpuBuffers[1].iova, const_cast<uint8_t *>(gGpuCpu[2]), gGpuBuffers[2].bytes, gGpuBuffers[2].iova);
     if (attached) {snprintf(row, sizeof row, "C4 ring attach %x", unsigned(attached)); setRow(7, row); return;}
     // The CP counter stamps around each job's buffers and the jobs' timeline are diagnostics (diag=1; the board's ring is this one,
@@ -1769,7 +1774,7 @@ void gpuStart() {
     // Boot overrides: 0 one ring, 1 only low/background on ring 1, 2 normal work too.
     {unsigned preempt = 2; PE_parse_boot_argn("gpu-preempt", &preempt, sizeof preempt); gPreemptWanted = preempt == 1 || preempt == 2; gPreemptMode = preempt == 2 ? 2 : 1;}
     if (gPreemptWanted) {
-        const IOReturn second = gRing1.attachSecondary(&rio, &cache, const_cast<uint8_t *>(gGpuCpu[9]), gGpuBuffers[9].bytes,
+        const IOReturn second = gRing1.attachSecondary(&kShengRingIo, &cache, const_cast<uint8_t *>(gGpuCpu[9]), gGpuBuffers[9].bytes,
             gGpuBuffers[9].iova, const_cast<uint8_t *>(gGpuCpu[10]), gGpuBuffers[10].bytes, gGpuBuffers[10].iova);
         if (second) {snprintf(row, sizeof row, "C4 ring1 attach %x", unsigned(second)); setRow(7, row); return;}
         gRing1.setTimeline(gTimelineWanted);   // the second ring's jobs are stamped too: their GPU time says what runs there

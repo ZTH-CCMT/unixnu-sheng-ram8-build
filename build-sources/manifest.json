@@ -328,7 +328,7 @@
       "repository": "device",
       "path": "package/GpuPowerProbe.cpp",
       "before_sha256": "8885cc1daec1b7c76ae7d98c96e83e7ee882795a2e511e4748eb9f5725efa387",
-      "sha256": "c4a82503b75915bccad79598846d92488caaeab93f44521f356aef9fd336c542"
+      "sha256": "83e8652b920711d7c9128e1a4e189db0298d3ed424179ec176ad83ba55aa914c"
     },
     "device/package/GpuSqeCapture.h": {
       "repository": "device",
