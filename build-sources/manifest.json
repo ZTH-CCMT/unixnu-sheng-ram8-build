@@ -407,8 +407,20 @@
       "path": "README.md",
       "before_sha256": "9772ebb342b94afce6f4509e447f06142ffaca4108b7026d15e8c016d9695920",
       "sha256": "e5214d502346cc0c206544717eb094886de6f89227efc51c1fbb762dfeb5deaf"
+    },
+    "UniXNU/scripts/rust-pac-rewrite.py": {
+      "repository": "UniXNU",
+      "path": "scripts/rust-pac-rewrite.py",
+      "before_sha256": "9ad09d8bb4605734b6700da014a6dfe441cc4e831686d4ab5139a7cf567499f3",
+      "sha256": "4511efe592e141770f9fbc429521747d5d3a2a47fc7853ba42e5d9750a6c98a1"
+    },
+    "UniXNU/drivers/AdrenoMetal/bridge/RustPacBoundary.c": {
+      "repository": "UniXNU/drivers/AdrenoMetal",
+      "path": "bridge/RustPacBoundary.c",
+      "before_sha256": "d8d77df2637460754254901a8a93fb8fe55e865b746621d8b7c262d8c46166a4",
+      "sha256": "347b7ba902a912f05987f35475f487eeefd2e5747c84e8998cefb1c6a5917d92"
     }
   },
-  "candidate_version": "V5.3",
+  "candidate_version": "V5.4.1",
   "base_actions_run": 43140807984
 }
