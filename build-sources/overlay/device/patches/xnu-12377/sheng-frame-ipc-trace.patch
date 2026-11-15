@@ -1,0 +1,162 @@
+diff --git a/osfmk/ipc/ipc_mqueue.c b/osfmk/ipc/ipc_mqueue.c
+index 4a4863c..9c50724 100644
+--- a/osfmk/ipc/ipc_mqueue.c
++++ b/osfmk/ipc/ipc_mqueue.c
+@@ -92,6 +92,7 @@
+ #include <ipc/ipc_port.h>
+ #include <ipc/ipc_pset.h>
+ #include <ipc/ipc_space.h>
++#include <ipc/sheng_frame_ipc.h>
+ 
+ #ifdef __LP64__
+ #include <vm/vm_map.h>
+@@ -662,6 +663,7 @@ ipc_mqueue_post(
+ 		goto out_unlock;
+ 	}
+ 
++	sheng_frame_ipc_hook_t frame_hook = __atomic_load_n(&sheng_frame_ipc_hook, __ATOMIC_ACQUIRE);
+ 	for (;;) {
+ 		mach_msg_size_t msize, tsize, asize;
+ 		thread_t receiver;
+@@ -671,6 +673,16 @@ ipc_mqueue_post(
+ 		/* waitq still locked, thread not runnable */
+ 
+ 		if (receiver == THREAD_NULL) {
++			if (frame_hook && mqueue->imq_msgcount != 0) {
++				ipc_space_t space = ip_get_receiver(port);
++				int slot = space ? sheng_frame_ipc_slot(space->is_task) : -1;
++				if (slot >= 0) {
++					struct sheng_frame_ipc_message message = sheng_frame_ipc_message(kmsg);
++					frame_hook(SHENG_FRAME_IPC_ENQUEUE, (uint32_t)slot, 0,
++					    message.cookie, message.sender_pid, message.msgid, MACH_MSG_SUCCESS);
++				}
++			}
++
+ 			/*
+ 			 * no receivers; queue kmsg if space still reserved
+ 			 * Reservations are cancelled when the port goes inactive.
+@@ -753,6 +765,14 @@ ipc_mqueue_post(
+ 			receiver->ith_kmsg = kmsg;
+ 			receiver->ith_seqno = mqueue->imq_seqno++;
+ 
++			if (frame_hook) {
++				int slot = sheng_frame_ipc_slot(get_threadtask(receiver));
++				if (slot >= 0) {
++					struct sheng_frame_ipc_message message = sheng_frame_ipc_message(kmsg);
++					frame_hook(SHENG_FRAME_IPC_WAKE, (uint32_t)slot, thread_tid(receiver),
++					    message.cookie, message.sender_pid, message.msgid, receiver->ith_state);
++				}
++			}
+ 			waitq_resume_identified_thread(waitq, receiver,
+ 			    THREAD_AWAKENED, WAITQ_WAKEUP_DEFAULT);
+ 
+diff --git a/osfmk/ipc/mach_msg.c b/osfmk/ipc/mach_msg.c
+index afaaf38..b6cb83b 100644
+--- a/osfmk/ipc/mach_msg.c
++++ b/osfmk/ipc/mach_msg.c
+@@ -107,6 +107,7 @@
+ #include <ipc/ipc_entry.h>
+ #include <ipc/ipc_importance.h>
+ #include <ipc/ipc_voucher.h>
++#include <ipc/sheng_frame_ipc.h>
+ 
+ #include <machine/machine_routines.h>
+ #include <security/mac_mach_internal.h>
+@@ -132,6 +133,9 @@ mach_msg_receive_results_complete(ipc_object_t object);
+ 
+ const security_token_t KERNEL_SECURITY_TOKEN = KERNEL_SECURITY_TOKEN_VALUE;
+ const audit_token_t KERNEL_AUDIT_TOKEN = KERNEL_AUDIT_TOKEN_VALUE;
++task_t sheng_frame_ipc_tasks[2];
++sheng_frame_ipc_hook_t sheng_frame_ipc_hook;
++
+ 
+ #define mach_copyout_field(kaddr, uaddr, type_t, field) \
+ 	mach_copyout((kaddr), (uaddr) + offsetof(type_t, field), \
+@@ -350,6 +354,13 @@ mach_msg_receive_results(
+ 	/* Save destination port context for the trailer before copyout */
+ 	msgr.msgr_context = ikm_header(kmsg)->msgh_remote_port->ip_context;
+ 
++	sheng_frame_ipc_hook_t frame_hook = __atomic_load_n(&sheng_frame_ipc_hook, __ATOMIC_ACQUIRE);
++	int frame_slot = frame_hook ? sheng_frame_ipc_slot(current_task()) : -1;
++	struct sheng_frame_ipc_message frame_message;
++	if (frame_slot >= 0) {
++		frame_message = sheng_frame_ipc_message(kmsg);
++	}
++
+ 	/*
+ 	 * restore the recv_bufs values that are used by
+ 	 * ipc_kmsg_copyout_guarded_port_descriptor()
+@@ -374,6 +385,11 @@ mach_msg_receive_results(
+ 		msgr.msgr_qos_ovrd = kmsg->ikm_qos_override;
+ 		mr = ipc_kmsg_put_to_user(kmsg, &recv_bufs, &msgr,
+ 		    options, map, mr);
++		if (mr == MACH_MSG_SUCCESS && frame_slot >= 0) {
++			frame_hook(SHENG_FRAME_IPC_RECEIVE, (uint32_t)frame_slot,
++			    thread_tid(self), frame_message.cookie, frame_message.sender_pid,
++			    frame_message.msgid, mr);
++		}
+ 	}
+ 	/* kmsg freed */
+ 
+diff --git a/osfmk/ipc/sheng_frame_ipc.h b/osfmk/ipc/sheng_frame_ipc.h
+new file mode 100644
+index 0000000..58dde39
+--- /dev/null
++++ b/osfmk/ipc/sheng_frame_ipc.h
+@@ -0,0 +1,56 @@
++#ifndef _IPC_SHENG_FRAME_IPC_H_
++#define _IPC_SHENG_FRAME_IPC_H_
++
++#include <ipc/ipc_kmsg.h>
++#include <kern/task.h>
++#include <vm/vm_kern.h>
++
++enum {
++	SHENG_FRAME_IPC_RECEIVE = 1,
++	SHENG_FRAME_IPC_ENQUEUE,
++	SHENG_FRAME_IPC_WAKE,
++};
++
++/*
++ * The publisher retains target task references (0: SpringBoard, 1: backboardd).
++ * ENQUEUE and WAKE callbacks run with the port locked and must not block.
++ */
++typedef void (*sheng_frame_ipc_hook_t)(uint32_t event, uint32_t slot,
++    uint64_t receiver_tid, uint64_t cookie, int32_t sender_pid,
++    int32_t msgid, uint32_t status);
++
++extern task_t sheng_frame_ipc_tasks[2];
++extern sheng_frame_ipc_hook_t sheng_frame_ipc_hook;
++
++struct sheng_frame_ipc_message {
++	uint64_t cookie;
++	int32_t sender_pid;
++	int32_t msgid;
++};
++
++static inline int
++sheng_frame_ipc_slot(task_t task)
++{
++	if (task != TASK_NULL) {
++		for (unsigned slot = 0; slot < 2; slot++) {
++			if (task == __atomic_load_n(&sheng_frame_ipc_tasks[slot], __ATOMIC_ACQUIRE)) {
++				return (int)slot;
++			}
++		}
++	}
++	return -1;
++}
++
++static inline struct sheng_frame_ipc_message
++sheng_frame_ipc_message(ipc_kmsg_t kmsg)
++{
++	vm_offset_t cookie = 0;
++	vm_kernel_addrperm_external((vm_offset_t)kmsg, &cookie);
++	return (struct sheng_frame_ipc_message) {
++		.cookie = cookie,
++		.sender_pid = (int32_t)ipc_kmsg_get_trailer(kmsg)->msgh_audit.val[5],
++		.msgid = ikm_header(kmsg)->msgh_id,
++	};
++}
++
++#endif /* _IPC_SHENG_FRAME_IPC_H_ */

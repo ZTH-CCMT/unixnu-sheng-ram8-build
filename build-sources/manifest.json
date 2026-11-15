@@ -262,7 +262,7 @@
       "repository": "device",
       "path": "package/TouchProbe.cpp",
       "before_sha256": "4c79c17125fbc7f45ca97fda37dc8e67b30c77b51c3c1fc4721660084cde4902",
-      "sha256": "9c593b84875307a32983d464ee1fc795f5d3e684a2a2473f9335ecbe94502b6d"
+      "sha256": "968bdcd70d0fe243d8b5331164e296fbc4745f163ebf9a4deea5bcccdf43b1f0"
     },
     "device/package/TouchReportTimeline.h": {
       "repository": "device",
@@ -425,6 +425,42 @@
       "path": "patches/xnu-12377/native-union-lower-directory.patch",
       "before_sha256": "905c52369f6ff5336323dc729f38d238ba735b607de826f433615ec7aba8d927",
       "sha256": "536c0e40308658fb34e98e414f30118c40f714f61e73c0d65f4d1a1086b749f9"
+    },
+    "device/package/BootLatencyTrace.h": {
+      "repository": "device",
+      "path": "package/BootLatencyTrace.h",
+      "before_sha256": "b1449724fda4a1ad280642274514234474b3354c1f8ea08ac7d243a1de4554c7",
+      "sha256": "9baf73371be47f51ad5dca748708bf652d4129047951e620a9b634ea6e538d96"
+    },
+    "device/package/BootLatencyTrace.c": {
+      "repository": "device",
+      "path": "package/BootLatencyTrace.c",
+      "before_sha256": "305fc493c53196532bd1658845e35b5be8787d4b924dfb8bb183cd2d1424b04e",
+      "sha256": "8223b690d99f3e1e530512f84e0e3ceacb09eb685ba38f248436217ebb2a588d"
+    },
+    "device/package/BootUiTraceProbe.c": {
+      "repository": "device",
+      "path": "package/BootUiTraceProbe.c",
+      "before_sha256": "04f4d9f993a7b4264cd782527043bbbe76935bc4ebb4b14f1529d5ffb9801612",
+      "sha256": "77b230520bc70dcde8fb0f831ac56b75acdff639c0123156f2ceb7eb4ea49507"
+    },
+    "device/scripts/decode-gpu-trace.py": {
+      "repository": "device",
+      "path": "scripts/decode-gpu-trace.py",
+      "before_sha256": "970b107fd25dfff9dbd0e9d58f6eecdc71d1985bddacf8b2c7ed16650a04ecc1",
+      "sha256": "b0243bf2acd9ba4e9fde88b54ec085896815ca8d437a1a2704202fff192b9d58"
+    },
+    "device/patches/xnu-12377/series": {
+      "repository": "device",
+      "path": "patches/xnu-12377/series",
+      "before_sha256": "15d08ffeafa1d29ece607e4f2913c80cb1f403442b0a0cbf9625f8d60a2d2953",
+      "sha256": "28bb2a2e1a423c16d9f164b2a10233a544df77fd6af89c682ce0b0ea4acf2f0f"
+    },
+    "device/patches/xnu-12377/sheng-frame-ipc-trace.patch": {
+      "repository": "device",
+      "path": "patches/xnu-12377/sheng-frame-ipc-trace.patch",
+      "before_sha256": null,
+      "sha256": "9a102f2f36368fd58e3dbe0ea10bb261705c0c98c3774ffb2241c1719bd1a569"
     }
   },
   "candidate_version": "V5.4.2",
