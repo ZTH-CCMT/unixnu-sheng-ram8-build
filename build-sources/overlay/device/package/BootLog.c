@@ -112,6 +112,7 @@ extern volatile int native_gpu_addon5_status __attribute__((weak_import));
 extern volatile int native_gpu_addon3_status __attribute__((weak_import));
 extern volatile int native_cryptex_os_stage __attribute__((weak_import));
 extern volatile int native_cryptex_os_status __attribute__((weak_import));
+extern uint32_t native_union_lookup_reentries __attribute__((weak_import));
 extern volatile int native_gestalt_cache_status __attribute__((weak_import));
 extern volatile int native_ls_store_status __attribute__((weak_import));
 extern volatile uint64_t native_data_persist_present __attribute__((weak_import));
@@ -692,9 +693,11 @@ static size_t compose(char *out, size_t cap, uint32_t slot, unsigned now) {
   // The OS cryptex path (kern_exec.c native_cryptex_os_view; stage 5 = a WebKit extension found through /System/Cryptexes/OS) and the
   // removed MobileGestalt cache (0 removed, 2 none there).
   if (&native_cryptex_os_stage && &native_gestalt_cache_status) {
-    char row[80];
-    snprintf(row, sizeof row, "[cryptex os] stage=%d status=%d gestalt-cache=%d ls-store=%d", native_cryptex_os_stage, native_cryptex_os_status,
-             native_gestalt_cache_status, &native_ls_store_status ? native_ls_store_status : -9);
+    char row[128];
+    snprintf(row, sizeof row, "[cryptex os] stage=%d status=%d gestalt-cache=%d ls-store=%d union-reentries=%u",
+             native_cryptex_os_stage, native_cryptex_os_status, native_gestalt_cache_status,
+             &native_ls_store_status ? native_ls_store_status : -9,
+             &native_union_lookup_reentries ? __atomic_load_n(&native_union_lookup_reentries, __ATOMIC_RELAXED) : 0);
     at = put(out, at, cap, row, sizeof row);
   }
   // The one-time copy of the OS volume's staged system apps into Data (kern_exec.c native_staged_apps_prepare): stage (2 copied, 3 copied

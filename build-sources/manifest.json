@@ -238,7 +238,7 @@
       "repository": "device",
       "path": "package/BootLog.c",
       "before_sha256": "5c880128ff6bd54d60dec13cd9b18acb47d2d801ebfa6aac920b308d74f238c2",
-      "sha256": "642d62a50f9b75b4b5bc7d395027fa838f92837f7f0a6b1e7e86598b200706ac"
+      "sha256": "8befd57a331dea59ca3999597131244cdcf9bfd51b51574c0daed510391546e1"
     },
     "device/package/LegacyDisplayProbe.cpp": {
       "repository": "device",
@@ -419,8 +419,14 @@
       "path": "bridge/RustPacBoundary.c",
       "before_sha256": "d8d77df2637460754254901a8a93fb8fe55e865b746621d8b7c262d8c46166a4",
       "sha256": "347b7ba902a912f05987f35475f487eeefd2e5747c84e8998cefb1c6a5917d92"
+    },
+    "UniXNU/patches/xnu-12377/native-union-lower-directory.patch": {
+      "repository": "UniXNU",
+      "path": "patches/xnu-12377/native-union-lower-directory.patch",
+      "before_sha256": "905c52369f6ff5336323dc729f38d238ba735b607de826f433615ec7aba8d927",
+      "sha256": "536c0e40308658fb34e98e414f30118c40f714f61e73c0d65f4d1a1086b749f9"
     }
   },
-  "candidate_version": "V5.4.1",
+  "candidate_version": "V5.4.2",
   "base_actions_run": 43140807984
 }
