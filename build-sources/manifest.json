@@ -130,13 +130,13 @@
       "repository": "device",
       "path": "board.toml",
       "before_sha256": "88b824800753cc7e79ae9dcd4ea4c92f351228126a3147dfc0ee81de0382e8b2",
-      "sha256": "e1a00aed4e32b6e29fc49856009471574d7f74c4332105b8d22d3bff82ee5173"
+      "sha256": "cb44aa0ffcbeef20124e9764dad90859851324d811fb9aa9d0899e578df92555"
     },
     "device/drivers/ShengHidInput/NativeHidInput.cpp": {
       "repository": "device/drivers/ShengHidInput",
       "path": "NativeHidInput.cpp",
       "before_sha256": "c0964bf7faa0332ce8d6334f2b74a271b269eee14112ae89b4453091604a10f6",
-      "sha256": "447c881b46c9b7829f8d5a040aef0f3b8cf85f7b9499370ea0571db4a38d0179"
+      "sha256": "64228cddf17653c38eac489df1f22521fa1ab66ae9e61cf8716d4b3f4c67694c"
     },
     "device/drivers/ShengHidInput/NativeHidTouchPlan.h": {
       "repository": "device/drivers/ShengHidInput",
@@ -323,6 +323,12 @@
       "path": "tests/test_ring.cpp",
       "before_sha256": "9fc453e9b9dca88caa594f4e75397c39bc3380228e11415d93cde09457da1f77",
       "sha256": "ad435c2c7cfbd02c31c1e495bebef6322ba09e8f3781d01ad4836318127c3fed"
+    },
+    "device/package/HidInputProbe.cpp": {
+      "repository": "device",
+      "path": "package/HidInputProbe.cpp",
+      "before_sha256": "c776e94ef633b3ba2d749ff69c19d12918fe5d21fd0daae9b7ba3ca4d84d7654",
+      "sha256": "0db11e26fdb75491dd79960731e2d76273d265de6e95157189679a382db98b16"
     },
     "device/package/GpuPowerProbe.cpp": {
       "repository": "device",

@@ -10,6 +10,7 @@
 #include "OriginalHidDeviceABI.h"
 #endif
 #include <IOKit/IOBufferMemoryDescriptor.h>
+#include <IOKit/IOLib.h>
 #include "NativeHidTouchPlan.h"
 #include <IOKit/IOWorkLoop.h>
 #include <IOKit/IOTimerEventSource.h>
@@ -258,6 +259,7 @@ class NativeHidInput : public IOHIDDevice {
     // The digitizer is a separate service from the keyboard: backboardd matches digitizers by primary usage page/usage
     // (Digitizer/Touch Screen) and the Built-In flag, which a combined keyboard-first descriptor would not provide.
     bool touchOnly=false;
+    bool keysOnly=false;
     bool eventDriverFound=false;
     IOReturn submitReport(IOMemoryDescriptor *report) {
 #if defined(NATIVE_HID_SOURCE_API) && NATIVE_HID_SOURCE_API
@@ -353,6 +355,7 @@ class NativeHidInput : public IOHIDDevice {
         IOReturn result=buffer?self->submitReport(buffer):kIOReturnNoMemory;
         OSSafeReleaseNULL(buffer);
         native_hid_input_observed(4,result);
+        if(self->keysOnly)IOLog("[hid buttons] report2=%02x status=%x\n",unsigned(report[1]),unsigned(result));
         return kIOReturnSuccess;
     }
     bool hasEventDriverCached() {
@@ -379,7 +382,7 @@ class NativeHidInput : public IOHIDDevice {
     }
     static void tick(OSObject *owner,IOTimerEventSource *source) {
         NativeHidInput *self=OSDynamicCast(NativeHidInput,owner);if(!self)return;
-        native_hid_live_checkpoint(self);
+        if(!self->keysOnly)native_hid_live_checkpoint(self);
         if(self->touchOnly){source->setTimeoutMS(1000);return;}
         if(!self->down && !hasEventDriver(self,4)) {
             native_hid_input_observed(3,0);
@@ -400,6 +403,7 @@ class NativeHidInput : public IOHIDDevice {
     }
 public:
     void setTouchOnly() {touchOnly=true;}
+    void setKeysOnly() {keysOnly=true;}
     IOWorkLoop *getWorkLoop() const override {return inputLoop;}
     OSString *newTransportString() const override {return OSString::withCString(touchOnly?"SPI":"Virtual");}
     OSString *newProductString() const override {return OSString::withCString(touchOnly?"Offline touch digitizer":"Offline HID input probe");}
@@ -452,12 +456,13 @@ public:
         // keyboard. This is a matching property, not a client entitlement.
         if(!setProperty("HIDDefaultBehavior",true))return false;
         unsigned touch=0;
-        touchEnabled=PE_parse_boot_argn("touch-hid",&touch,sizeof(touch)) && touch==1;
+        touchEnabled=!keysOnly && PE_parse_boot_argn("touch-hid",&touch,sizeof(touch)) && touch==1;
         // DigitizerCollectionDispatch: IOHIDEventDriver (setDigitizerProperties) reads it up the service plane and then sends each
         // report's fingers as one digitizer collection with a child per finger. Without it a touch screen gets one event per finger,
         // and backboardd takes each as the whole touch set, so no two fingers are ever down together for UIKit (no pinch, no
         // multi-finger or system gestures).
-        if(touchOnly||touchEnabled){setProperty("Built-In",true);setProperty("DisplayIntegrated",true);setProperty("DigitizerCollectionDispatch",true);}
+        if(keysOnly||touchOnly||touchEnabled)setProperty("Built-In",true);
+        if(touchOnly||touchEnabled){setProperty("DisplayIntegrated",true);setProperty("DigitizerCollectionDispatch",true);}
 #if defined(XNU_TARGET_OS_OSX) && XNU_TARGET_OS_OSX
         // macOS: WindowServer ties a digitizer to the display whose container ID equals the digitizer's kUSBContainerID (a UUID string,
         // read up the service plane as from a USB device); the built-in display publishes that ID in its EDID (NativeLegacyDisplay.cpp).
@@ -487,3 +492,4 @@ public:
 OSDefineMetaClassAndStructors(NativeHidInput,IOHIDDevice)
 extern "C" IOService *native_hid_input_allocate(void) {return new NativeHidInput;}
 extern "C" IOService *native_hid_touch_allocate(void) {NativeHidInput *device=new NativeHidInput;if(device)device->setTouchOnly();return device;}
+extern "C" IOService *native_hid_keys_allocate(void) {NativeHidInput *device=new NativeHidInput;if(device)device->setKeysOnly();return device;}
