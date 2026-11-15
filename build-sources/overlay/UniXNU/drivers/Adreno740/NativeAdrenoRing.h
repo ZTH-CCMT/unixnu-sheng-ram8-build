@@ -122,6 +122,8 @@ public:
     IOReturn executedTable(uint64_t *ttbr0);
     /* The write pointer that waits for a switch (a ring that is not the CP's own appends without moving CP_RB_WPTR). */
     bool restorePending() const {return restore_wptr_;}
+    // GX must be held active by the caller. Diagnostic reads never poison the ring.
+    uint32_t readHardwarePointers(uint32_t &rptr,uint32_t &wptr) const;
     void setCurrent(bool current) {current_=current;}
     bool current() const {return current_;}
     /* Gives the waiting write pointer again; after a switch into this ring, and after a restart. */

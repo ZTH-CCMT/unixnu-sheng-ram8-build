@@ -9,6 +9,10 @@
 #define CHECK(x) do {if(!(x)){std::fprintf(stderr,"line %d: %s\n",__LINE__,#x);std::exit(1);}}while(0)
 #define SMMU_BYTES 0x40000
 #define CB 0x22000
+static bool gpu_trace_enabled;
+extern "C" int native_gpu_trace_enabled() {return gpu_trace_enabled;}
+extern "C" volatile uint64_t native_adreno_wptr_handoff[3][11];
+
 IOReturn NativeAdrenoQueryCpu4K(NativeAdrenoCpuState *out)
 {CHECK(out);*out={};return kIOReturnSuccess;}
 IOReturn NativeAdrenoMaintainOwnedPages(void *mapping,size_t bytes,NativeAdrenoCacheOperation op)
@@ -853,11 +857,23 @@ static void testWptrHandoffReverse(bool append)
     CHECK(NativeAdrenoPreempt::recordWptr(p.records[0])==saved);
     CHECK(p.ring.restorePending()==append);
     cp.regs[0x0807]=saved;
+    const uint64_t priorSample=native_adreno_wptr_handoff[0][0];
+    const uint64_t sampleTime=++clock_us;
+    gpu_trace_enabled=true;
     p.signalSwitch();
+    gpu_trace_enabled=false;
     CHECK(p.ring.current() && !p.keepalive);
     CHECK(wptrWrites()==before+(append?1u:0u));
     CHECK(cp.regs[0x0807]==p.ring.writePointer());
     CHECK(!p.ring.restorePending());
+    if(append) {
+        const uint64_t expected[]={sampleTime,pending,final,saved,p.ring.writePointer(),1,kIOReturnSuccess,
+            cp.regs[0x0806],cp.regs[0x0807],3,0};
+        for(unsigned i=0;i<sizeof(expected)/sizeof(expected[0]);++i)
+            CHECK(native_adreno_wptr_handoff[0][i]==expected[i]);
+    } else {
+        CHECK(native_adreno_wptr_handoff[0][0]==priorSample);
+    }
     fencemem[1]=final;
     CHECK(p.submit.retireCompleted()==kIOReturnSuccess);
     CHECK(p.submit.observeFence(pending,nullptr,0)==kIOReturnSuccess);

@@ -142,6 +142,7 @@ private:
     uint32_t fence_issued_=0;
     // A fence at or below this per-ring boundary may have reached the CP.
     uint32_t exposed_through_[2]{};
+    uint32_t switch_saved_wptr_=0,switch_saved_fence_=0;
     // Failed IDs remain queryable for the lifetime of this submitter.
     uint32_t *failed_fences_=nullptr;
     size_t failed_count_=0,failed_capacity_=0;

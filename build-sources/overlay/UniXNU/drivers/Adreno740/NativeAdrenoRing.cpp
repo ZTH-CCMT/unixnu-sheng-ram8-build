@@ -441,6 +441,15 @@ IOReturn NativeAdrenoRing::restoreWptr()
     restore_wptr_=false;
     return kIOReturnSuccess;
 }
+
+uint32_t NativeAdrenoRing::readHardwarePointers(uint32_t &rptr,uint32_t &wptr) const
+{
+    rptr=wptr=UINT32_MAX;
+    uint32_t valid=0;
+    if(!io_.read32(io_.cookie,RingRptr,&rptr))valid|=1u;
+    if(!io_.read32(io_.cookie,RingWptr,&wptr))valid|=2u;
+    return valid;
+}
 /* CP_RB_BASE, CP_RB_CNTL, CP_RB_RPTR_ADDR, WPTR 0 and CP_SCRATCH(2), then the read pointer the CP reports. */
 IOReturn NativeAdrenoRing::program()
 {

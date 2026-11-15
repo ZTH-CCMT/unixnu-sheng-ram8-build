@@ -34,6 +34,10 @@ Counters: `native_adreno_pool_state` (ranges, KiB total, free and lowest free, g
 
 `native_adreno_stall_ring` holds, with each stall snapshot, the ring of the waited fence, the ring the CP runs, a switch in flight and the unfinished jobs of each ring.
 
+With `gpu-trace=1` and `log-gpu=1`, the boot log shows the last WPTR handoff sample from each ring that received work during a switch. It records the fence and software WPTR before the switch and at completion, whether a restore was pending, the hardware readback with its validity mask, and any exhausted write retries. The stall handler retains the matching handoff if the stalled fence falls within that sample's appended range.
+
+The stall action row records the TLB invalidation and WPTR kick results separately. Both actions still run in the existing recovery order.
+
 `NativeGpuPerfCounters.h` defines the opt-in 19-counter A7XX BR plan used by sheng diagnostics. Capture records selector readback, unstable 64-bit reads, reset masks and preemption epochs. The host check verifies the register plan against pinned Mesa XML.
 
 ## V4.2 local recovery candidate

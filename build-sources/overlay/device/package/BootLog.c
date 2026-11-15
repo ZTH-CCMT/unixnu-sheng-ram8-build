@@ -337,6 +337,8 @@ extern volatile uint32_t native_adreno_job_time[8] __attribute__((weak_import));
 extern volatile uint64_t native_adreno_long_jobs[8][8] __attribute__((weak_import));
 extern volatile uint64_t native_adreno_slow_jobs[16][8] __attribute__((weak_import));
 extern volatile uint32_t native_adreno_stall_kick[26] __attribute__((weak_import));
+extern volatile uint64_t native_adreno_wptr_handoff[3][11] __attribute__((weak_import));
+extern volatile uint64_t native_adreno_stall_actions[4] __attribute__((weak_import));
 extern volatile uint32_t native_adreno_pool_views[5] __attribute__((weak_import));
 extern volatile uint32_t native_gpu_dcvs_reasons[9] __attribute__((weak_import));
 extern volatile uint32_t native_gpu_dcvs_windows[8] __attribute__((weak_import));
@@ -2260,6 +2262,37 @@ static size_t compose(char *out, size_t cap, uint32_t slot, unsigned now) {
     }
   }
   // The first stall stage: the CP's IB position at the first timed-out wait, at the stage and 500 us later, and when the job retired.
+  if (log_gpu_on && &native_adreno_stall_actions) {
+    const volatile uint64_t *sample = native_adreno_stall_actions;
+    const uint64_t fence = __atomic_load_n(sample, __ATOMIC_ACQUIRE);
+    if (fence) {
+      const uint64_t us = __atomic_load_n(sample + 1, __ATOMIC_RELAXED);
+      const uint32_t tlb = __atomic_load_n(sample + 2, __ATOMIC_RELAXED);
+      const uint32_t kick = __atomic_load_n(sample + 3, __ATOMIC_RELAXED);
+      if (fence == __atomic_load_n(sample, __ATOMIC_ACQUIRE)) {
+        char row[160];
+        snprintf(row, sizeof row, "[gpu stall actions] fence=%u at=%lluus tlb=%08x kick=%08x",
+                 (unsigned)fence, (unsigned long long)us, tlb, kick);
+        at = put(out, at, cap, row, sizeof row);
+      }
+    }
+  }
+  if (log_gpu_on && &native_adreno_wptr_handoff) {
+    for (unsigned i = 0; i < 3; ++i) {
+      const volatile uint64_t *sample = native_adreno_wptr_handoff[i];
+      const uint64_t us = __atomic_load_n(sample, __ATOMIC_ACQUIRE);
+      if (!us) continue;
+      uint32_t v[10];
+      for (unsigned field = 0; field < 10; ++field)
+        v[field] = __atomic_load_n(sample + field + 1, __ATOMIC_RELAXED);
+      if (us != __atomic_load_n(sample, __ATOMIC_ACQUIRE)) continue;
+      char row[250];
+      snprintf(row, sizeof row, "[gpu wptr handoff] %s at=%lluus fence=%u..%u sw=%x->%x pending=%u status=%08x hw=%x/%x valid=%x exhausted=%u",
+               i == 2 ? "stall" : i == 1 ? "ring1" : "ring0", (unsigned long long)us,
+               v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9]);
+      at = put(out, at, cap, row, sizeof row);
+    }
+  }
   if (log_gpu_on && &native_adreno_stall_kick && native_adreno_stall_kick[25]) {
     char row[360]; const volatile uint32_t *k = native_adreno_stall_kick;
     snprintf(row, sizeof row, "[gpu kick] n=%u fence=%u pending=%uus moved=%x retired after=%uus | pid=%u ibs=%u ring=%u pri=%d KiB=%u | first ib1 %x:%x rem %u ib2 rem %u | at ib1 %x:%x rem %u ib2 rem %u | +500us ib1 %x:%x rem %u ib2 rem %u",

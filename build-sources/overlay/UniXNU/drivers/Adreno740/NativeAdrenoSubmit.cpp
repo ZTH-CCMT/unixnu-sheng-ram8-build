@@ -5,6 +5,23 @@
 #include "AdrenoPM4.h"
 #include <IOKit/IOLib.h>
 
+extern "C" {
+extern volatile uint32_t native_adreno_wptr_fence[4];
+// Per-ring handoff, plus a copy matched by fence when recovery first acts.
+// Time, saved/latest fence, saved/latest SW WPTR, pending, status, HW RPTR/WPTR, valid mask, GMU write exhaustion.
+volatile uint64_t native_adreno_wptr_handoff[3][11];
+// Fence, time, SMMU invalidation status, ring kick status.
+volatile uint64_t native_adreno_stall_actions[4];
+}
+
+template<size_t Count>
+static void publishWptrSample(volatile uint64_t (&record)[Count],const uint64_t (&values)[Count])
+{
+    __atomic_store_n(&record[0],0,__ATOMIC_RELAXED);
+    for(size_t i=1;i<Count;++i)__atomic_store_n(&record[i],values[i],__ATOMIC_RELAXED);
+    __atomic_store_n(&record[0],values[0],__ATOMIC_RELEASE);
+}
+
 /* CP_INDIRECT_BUFFER is opcode 0x3f with a 3-word payload: 64-bit GPU address
  * and IB_SIZE in dwords (bits 0..19), exactly as the pinned adreno_pm4.xml
  * domain states and Linux msm_gem_submit.c converts the userspace byte size. */
@@ -325,6 +342,8 @@ void NativeAdrenoSubmit::driveSwitch(const NativeAdrenoRingClock *clock)
          * ring out (read pointer, info, errno); only the write pointer the CP resumes at is given again before every switch. */
         NativeAdrenoRing *const incoming=ring(i);
         if(!incoming || !preempt_setup_.pages.record_cpu[i] || !preempt_setup_.pages.smmu_cpu[i])continue;
+        switch_saved_wptr_=incoming->writePointer();
+        switch_saved_fence_=incoming->lastSubmitted();
         (void)incoming->writePreemptWptr(preempt_setup_.pages.record_cpu[i]);
         /* Restore the table at the saved CP position. Queued work may name a later VM. */
         uint64_t ttbr0=0;
@@ -359,7 +378,19 @@ bool NativeAdrenoSubmit::completeSwitch(bool *read_error)
     if(!now) {markPreemptDead(6);return false;}
     now->setCurrent(true);
     exposed_through_[index]=now->lastSubmitted();
-    if(now->restoreWptr()) {markPreemptDead(6);return false;}
+    const bool restorePending=now->restorePending();
+    const uint32_t latestWptr=now->writePointer();
+    const uint32_t exhaustedBefore=native_adreno_wptr_fence[3];
+    const IOReturn restoreStatus=now->restoreWptr();
+    if((restorePending || latestWptr!=switch_saved_wptr_) && &native_gpu_trace_enabled && native_gpu_trace_enabled()) {
+        uint32_t rptr,wptr;
+        const uint32_t valid=now->readHardwarePointers(rptr,wptr);
+        const uint64_t sampled=clock_now_?clock_now_(clock_cookie_):0;
+        const uint64_t values[]={sampled,switch_saved_fence_,now->lastSubmitted(),switch_saved_wptr_,latestWptr,
+            restorePending,uint32_t(restoreStatus),rptr,wptr,valid,native_adreno_wptr_fence[3]-exhaustedBefore};
+        publishWptrSample(native_adreno_wptr_handoff[index],values);
+    }
+    if(restoreStatus) {markPreemptDead(6);return false;}
     preempt_.noteRestoredWptr();
     if(!preempt_.releaseKeepalive()) {markPreemptDead(7);return false;}
     hang_[index]={};
@@ -808,10 +839,19 @@ void NativeAdrenoSubmit::noteStall(uint32_t observed,const NativeAdrenoRingClock
     if(kick_due) {
         native_adreno_unstick[0]=native_adreno_unstick[0]+1;native_adreno_unstick[1]=stall_fence;stall_stage=1;
         const uint32_t r0=stalled->readPointer(),w0=stalled->writePointer()&0xffff;
-        (void)vm_->invalidateTlb();
+        uint64_t handoffSample[11]{};
+        if(preemption() && stalled->current()) {
+            const auto &handoff=native_adreno_wptr_handoff[stalled==ring(1)?1:0];
+            if(handoff[0] && handoff[1]<stall_fence && stall_fence<=handoff[2])
+                for(unsigned i=0;i<11;++i)handoffSample[i]=handoff[i];
+        }
+        publishWptrSample(native_adreno_wptr_handoff[2],handoffSample);
+        const IOReturn invalidateStatus=vm_->invalidateTlb();
         if(preemption() && stalled->current())
             exposed_through_[stalled==ring(1)?1:0]=stalled->lastSubmitted();
-        (void)stalled->kick();
+        const IOReturn kickStatus=stalled->kick();
+        const uint64_t actions[]={stall_fence,now,uint32_t(invalidateStatus),uint32_t(kickStatus)};
+        publishWptrSample(native_adreno_stall_actions,actions);
         stall_kick_us=now;
         log(stall_fence,1,pending,r0&0xffff,w0);
     }

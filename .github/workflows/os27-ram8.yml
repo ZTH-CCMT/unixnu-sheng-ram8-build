@@ -1,9 +1,9 @@
-name: UniXNU sheng iPadOS 27 RAM 8 GiB GPU V5.4.2
+name: UniXNU sheng iPadOS 27 RAM 8 GiB GPU V5.4.2-WPTR
 
 on:
   workflow_dispatch:
   push:
-    branches: [ram8-gpu-v5.4.2-chain]
+    branches: [ram8-gpu-v5.4.2-wptr]
 
 permissions:
   contents: read
@@ -86,7 +86,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: gpu-v5.4.2-build-failure-${{ github.run_id }}-${{ github.run_attempt }}
+          name: gpu-v5.4.2-wptr-build-failure-${{ github.run_id }}-${{ github.run_attempt }}
           path: build-failure-logs/
           if-no-files-found: warn
           retention-days: 7
@@ -108,7 +108,7 @@ jobs:
       - name: Upload verified generic boot handoff
         uses: actions/upload-artifact@v4
         with:
-          name: os27-ram8-adreno-v5.4.2-handoff-${{ github.run_id }}-${{ github.run_attempt }}
+          name: os27-ram8-adreno-v5.4.2-wptr-handoff-${{ github.run_id }}-${{ github.run_attempt }}
           path: os27-ram8-handoff/
           include-hidden-files: true
           if-no-files-found: error
