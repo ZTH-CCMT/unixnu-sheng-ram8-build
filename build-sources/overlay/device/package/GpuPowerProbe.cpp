@@ -1793,7 +1793,7 @@ void gpuStart() {
     __asm__ volatile("dsb sy" ::: "memory");
     const NativeAdrenoCpInitConfig config{gGpuBuffers[0].iova, gGpuBuffers[3].iova, 1};   // base written above, before SQE_CNTL
     uint32_t fence = 0;
-    c[2] = uint32_t(gCpInit.run(&rio, &gRing, &config, &fence));
+    c[2] = uint32_t(gCpInit.run(&kShengRingIo, &gRing, &config, &fence));
     if (c[2]) {cpRow("ref"); return;}
     c[0] = 6;
     cpRow("sent");
