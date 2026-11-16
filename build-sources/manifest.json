@@ -136,7 +136,7 @@
       "repository": "device/drivers/ShengHidInput",
       "path": "NativeHidInput.cpp",
       "before_sha256": "c0964bf7faa0332ce8d6334f2b74a271b269eee14112ae89b4453091604a10f6",
-      "sha256": "2a30c8d46836b05d0359bad19ced7b368e0c7493748551b1b98896e85d352f56"
+      "sha256": "7b33a0a2de0f46cdfa6ede611174fcbb1db8614be343129b37b445599e2cd293"
     },
     "device/drivers/ShengHidInput/NativeHidTouchPlan.h": {
       "repository": "device/drivers/ShengHidInput",

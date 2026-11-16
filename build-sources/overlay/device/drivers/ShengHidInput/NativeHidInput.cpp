@@ -255,8 +255,18 @@ class NativeHidInput : public IOHIDDevice {
     OSDeclareDefaultStructors(NativeHidInput)
     IOWorkLoop *inputLoop=nullptr;
     IOTimerEventSource *timer=nullptr;
+    IOTimerEventSource *buttonRetryTimer=nullptr;
     bool down=false;
-    uint8_t buttons=0;   // report 2 bits held by the hardware buttons
+    uint8_t buttons=0;   // Last hardware button mask submitted in report 2.
+    struct ButtonReport {
+        uint64_t queuedUs;
+        uint32_t sequence;
+        uint8_t mask;
+    };
+    static constexpr unsigned kPendingButtons=8;
+    static constexpr uint64_t kButtonReplayUs=250000;
+    ButtonReport pendingButtons[kPendingButtons]={};
+    unsigned buttonHead=0, buttonCount=0;
     bool touchEnabled=false;
     // The digitizer is a separate service from the keyboard: backboardd matches digitizers by primary usage page/usage
     // (Digitizer/Touch Screen) and the Built-In flag, which a combined keyboard-first descriptor would not provide.
@@ -354,44 +364,103 @@ class NativeHidInput : public IOHIDDevice {
         uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time(),&ns);return ns/1000;
     }
     static IOReturn buttonsAction(OSObject *owner,void *mask,void *,void *,void *) {
-        NativeHidInput *self=OSDynamicCast(NativeHidInput,owner);if(!self)return kIOReturnSuccess;
-        self->buttons=static_cast<uint8_t>(uintptr_t(mask)&0xe);
+        NativeHidInput *self=OSDynamicCast(NativeHidInput,owner);
+        if(!self || !self->buttonRetryTimer)return kIOReturnNotReady;
         const uint32_t sequence=self->buttonsTrace?++self->buttonSequence:0;
-        const uint64_t start=sequence?buttonUs():0;
-        if(!self->hasEventDriverCached()) {
-            if(sequence) IOLog("[hid buttons] seq=%u start_us=%llu mask=%02x no event driver\n",sequence,start,unsigned(self->buttons));
-            return kIOReturnSuccess;
+        const uint8_t current=static_cast<uint8_t>(uintptr_t(mask)&0xe);
+        if(self->buttonCount==kPendingButtons) {
+            if(sequence)IOLog("[hid buttons] seq=%u queue full, resync mask=%02x\n",sequence,unsigned(current));
+            self->buttonCount=0;
         }
-        unsigned char report[]={2,static_cast<unsigned char>((self->down?1:0)|self->buttons)};
-        IOBufferMemoryDescriptor *buffer=IOBufferMemoryDescriptor::withBytes(report,sizeof(report),kIODirectionNone);
-        IOReturn result=buffer?self->submitReport(buffer):kIOReturnNoMemory;
-        OSSafeReleaseNULL(buffer);
-        native_hid_input_observed(4,result);
-        if(sequence) IOLog("[hid buttons] report2=%02x status=%x seq=%u start_us=%llu done_us=%llu\n",
-                           unsigned(report[1]),unsigned(result),sequence,start,buttonUs());
-        return kIOReturnSuccess;
+        self->pendingButtons[(self->buttonHead+self->buttonCount)%kPendingButtons]={buttonUs(),sequence,current};
+        ++self->buttonCount;
+        const IOReturn result=self->flushButtons();
+        if(sequence && result!=kIOReturnSuccess)
+            IOLog("[hid buttons] queued seq=%u mask=%02x status=%x\n",sequence,unsigned(current),unsigned(result));
+        return result;
+    }
+    IOReturn flushButtons() {
+        if(!buttonCount)return kIOReturnSuccess;
+        const uint64_t now=buttonUs();
+        if(buttonCount>1 && now-pendingButtons[buttonHead].queuedUs>=kButtonReplayUs) {
+            // Reconcile to the physical state after a long outage; replaying old taps can toggle the screen.
+            buttonHead=(buttonHead+buttonCount-1)%kPendingButtons;
+            buttonCount=1;
+            if(buttonsTrace)IOLog("[hid buttons] seq=%u stale queue, resync mask=%02x\n",
+                pendingButtons[buttonHead].sequence,unsigned(pendingButtons[buttonHead].mask));
+        }
+
+        // IOHIDInterface opens this device on behalf of its event driver. Recheck on every flush.
+        IOService *receiver=copyEventDriver(this,4,this);
+        IOReturn result=kIOReturnNotReady;
+        if(receiver) {
+            receiver->release();
+            while(buttonCount) {
+                const ButtonReport &pending=pendingButtons[buttonHead];
+                const uint64_t start=pending.sequence?buttonUs():0;
+                unsigned char report[]={2,static_cast<unsigned char>((down?1:0)|pending.mask)};
+                IOBufferMemoryDescriptor *buffer=IOBufferMemoryDescriptor::withBytes(report,sizeof(report),kIODirectionNone);
+                result=buffer?submitReport(buffer):kIOReturnNoMemory;
+                OSSafeReleaseNULL(buffer);
+                native_hid_input_observed(4,result);
+                if(pending.sequence)IOLog("[hid buttons] report2=%02x status=%x seq=%u start_us=%llu done_us=%llu queued_us=%llu\n",
+                    unsigned(report[1]),unsigned(result),pending.sequence,start,buttonUs(),pending.queuedUs);
+                if(result!=kIOReturnSuccess)break;
+                buttons=pending.mask;
+                buttonSnapshot=UINT32_MAX;
+                buttonHead=(buttonHead+1)%kPendingButtons;
+                --buttonCount;
+            }
+        }
+        if(buttonCount)buttonRetryTimer->setTimeoutMS(now-pendingButtons[buttonHead].queuedUs>=kButtonReplayUs?250:20);
+        return result;
+    }
+    static void retryButtons(OSObject *owner,IOTimerEventSource *) {
+        NativeHidInput *self=OSDynamicCast(NativeHidInput,owner);
+        if(self)self->flushButtons();
     }
     bool hasEventDriverCached() {
         if(!eventDriverFound) {
-            IORegistryEntry *driver=eventDriver(this,4);
+            IOService *driver=copyEventDriver(this,4);
             eventDriverFound=driver!=nullptr;
             if(driver && (touchEnabled || touchOnly))edge::install(driver);
+            OSSafeReleaseNULL(driver);
         }
         return eventDriverFound;
     }
-    static bool hasEventDriver(IORegistryEntry *parent,unsigned depth) {return eventDriver(parent,depth)!=nullptr;}
-    // The IOHIDEventDriver below this device, if one has attached.
-    static IORegistryEntry *eventDriver(IORegistryEntry *parent,unsigned depth) {
+    static bool hasEventDriver(IORegistryEntry *parent,unsigned depth) {
+        IOService *driver=copyEventDriver(parent,depth);
+        if(!driver)return false;
+        driver->release();
+        return true;
+    }
+    static IOService *copyEventDriver(IORegistryEntry *parent,unsigned depth,const NativeHidInput *openDevice=nullptr) {
         if(!depth)return nullptr;
         OSIterator *it=parent->getChildIterator(gIOServicePlane);if(!it)return nullptr;
-        IORegistryEntry *found=nullptr;
+        IOService *found=nullptr;
         while(OSObject *child=it->getNextObject()) {
             IORegistryEntry *entry=OSDynamicCast(IORegistryEntry,child);
             if(!entry)continue;
-            found=entry->metaCast("IOHIDEventDriver")?entry:eventDriver(entry,depth-1);
+            IOService *service=OSDynamicCast(IOService,entry);
+            if(service && service->metaCast("IOHIDEventDriver") && !service->isInactive() &&
+               (!openDevice || openDevice->isOpen(service))) {
+                service->retain();
+                found=service;
+                break;
+            }
+            found=copyEventDriver(entry,depth-1,openDevice);
             if(found)break;
         }
         it->release();return found;
+    }
+    static IOReturn stopButtonRetry(OSObject *owner,void *,void *,void *,void *) {
+        NativeHidInput *self=static_cast<NativeHidInput *>(owner);
+        self->buttonRetryTimer->cancelTimeout();
+        self->inputLoop->removeEventSource(self->buttonRetryTimer);
+        OSSafeReleaseNULL(self->buttonRetryTimer);
+        self->buttonCount=0;
+        self->buttons=0;
+        return kIOReturnSuccess;
     }
     static void tick(OSObject *owner,IOTimerEventSource *source) {
         NativeHidInput *self=OSDynamicCast(NativeHidInput,owner);if(!self)return;
@@ -490,17 +559,30 @@ public:
         if(!timer || inputLoop->addEventSource(timer)!=kIOReturnSuccess) {
             OSSafeReleaseNULL(timer);IOHIDDevice::stop(provider);return false;
         }
+        if(!touchOnly && &native_buttons_set_sink) {
+            buttonRetryTimer=IOTimerEventSource::timerEventSource(this,retryButtons);
+            if(!buttonRetryTimer || inputLoop->addEventSource(buttonRetryTimer)!=kIOReturnSuccess) {
+                OSSafeReleaseNULL(buttonRetryTimer);
+                inputLoop->removeEventSource(timer);
+                OSSafeReleaseNULL(timer);
+                IOHIDDevice::stop(provider);
+                return false;
+            }
+        }
         if(touchOnly||touchEnabled) {
             if(&native_touch_set_sink)native_touch_set_sink(&NativeHidInput::touchNotify,this);
         }
-        if(!touchOnly && &native_buttons_set_sink)native_buttons_set_sink(&NativeHidInput::buttonsNotify,this);
+        if(buttonRetryTimer)native_buttons_set_sink(&NativeHidInput::buttonsNotify,this);
         setProperty("OfflineInputProbe",true);
         native_hid_input_observed(2,0);
         timer->setTimeoutMS(1000);return true;
     }
     void stop(IOService *provider) override {
         if((touchOnly||touchEnabled) && &native_touch_set_sink)native_touch_set_sink(nullptr,nullptr);
-        if(!touchOnly && &native_buttons_set_sink)native_buttons_set_sink(nullptr,nullptr);
+        if(buttonRetryTimer) {
+            native_buttons_set_sink(nullptr,nullptr);
+            inputLoop->runAction(&NativeHidInput::stopButtonRetry,this);
+        }
         if(timer){timer->cancelTimeout();inputLoop->removeEventSource(timer);OSSafeReleaseNULL(timer);}
         IOHIDDevice::stop(provider);
     }

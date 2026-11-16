@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the compiled ButtonProbe sampling and wait loop with scripted PMIC reads."""
+"""Run the button sampling loop and HID handoff with scripted inputs."""
 
 import os
 from pathlib import Path
@@ -9,7 +9,9 @@ import subprocess
 import tempfile
 
 
-SOURCE = Path(__file__).resolve().parents[1] / 'build-sources/overlay/device/package/ButtonProbe.cpp'
+DEVICE = Path(__file__).resolve().parents[1] / 'build-sources/overlay/device'
+SOURCE = DEVICE / 'package/ButtonProbe.cpp'
+HID_SOURCE = DEVICE / 'drivers/ShengHidInput/NativeHidInput.cpp'
 
 MOCK = r'''
 #include <cassert>
@@ -169,6 +171,143 @@ def extract_source():
     return MOCK + constants + '\n' + sample + worker + '\n' + CASES
 
 
+HID_MOCK = r'''
+#include <cassert>
+#include <cstdint>
+#include <cstdio>
+#include <vector>
+
+using IOReturn = int;
+constexpr int kIOReturnSuccess = 0, kIOReturnNotReady = -1, kIOReturnNoMemory = -2;
+constexpr int kIODirectionNone = 0, gIOServicePlane = 0;
+struct OSObject { virtual ~OSObject() = default; };
+#define OSDynamicCast(type, object) dynamic_cast<type *>(object)
+#define OSSafeReleaseNULL(object) do { if (object) (object)->release(); (object) = nullptr; } while (false)
+struct OSIterator {
+    const std::vector<OSObject *> &children;
+    unsigned index = 0;
+    OSObject *getNextObject() { return index < children.size() ? children[index++] : nullptr; }
+    void release() { delete this; }
+};
+struct IORegistryEntry : OSObject {
+    std::vector<OSObject *> children;
+    OSIterator *getChildIterator(int) { return new OSIterator{children}; }
+};
+struct IOService : IORegistryEntry {
+    bool eventDriver = false, inactive = false;
+    const void *metaCast(const char *) const { return eventDriver ? this : nullptr; }
+    bool isInactive() const { return inactive; }
+    void retain() {}
+    void release() {}
+};
+struct IOTimerEventSource {
+    unsigned delay = 0;
+    void setTimeoutMS(unsigned ms) { delay = ms; }
+};
+struct IOBufferMemoryDescriptor {
+    unsigned mask;
+    static IOBufferMemoryDescriptor *withBytes(const unsigned char *bytes, unsigned size, int) {
+        assert(size == 2 && bytes[0] == 2);
+        return new IOBufferMemoryDescriptor{bytes[1]};
+    }
+    void release() { delete this; }
+};
+static void native_hid_input_observed(unsigned, int) {}
+static void IOLog(const char *, ...) {}
+static uint64_t nowUs;
+static uint64_t mach_absolute_time() { return nowUs * 1000; }
+static void absolutetime_to_nanoseconds(uint64_t ticks, uint64_t *ns) { *ns = ticks; }
+
+struct NativeHidInput : IOService {
+    IOTimerEventSource retryTimer;
+    IOService *openClient = nullptr;
+    bool buttonsTrace = false;
+    uint32_t buttonSequence = 0, buttonSnapshot = UINT32_MAX;
+    int rejectedMask = -1;
+    std::vector<unsigned> delivered;
+    NativeHidInput() { buttonRetryTimer = &retryTimer; }
+    bool isOpen(const IOService *client) const { return openClient == client; }
+    IOReturn submitReport(IOBufferMemoryDescriptor *report) {
+        assert(openClient && !openClient->inactive);
+        if (int(report->mask) == rejectedMask) return kIOReturnNoMemory;
+        delivered.push_back(report->mask);
+        return kIOReturnSuccess;
+    }
+    IOReturn press(unsigned mask) {
+        return buttonsAction(this, reinterpret_cast<void *>(uintptr_t(mask)), nullptr, nullptr, nullptr);
+    }
+    void retry() { retryButtons(this, buttonRetryTimer); }
+'''
+
+HID_CASES = r'''
+};
+
+int main() {
+    IOService original, replacement;
+    original.eventDriver = replacement.eventDriver = true;
+
+    NativeHidInput late;
+    assert(late.press(2) == kIOReturnNotReady && late.retryTimer.delay == 20);
+    late.children = {&original};
+    nowUs = 120000;
+    assert(late.press(0) == kIOReturnNotReady && late.delivered.empty());
+    late.openClient = &original;
+    late.retry();
+    assert((late.delivered == std::vector<unsigned>{2, 0}));
+    std::puts("PASS HID late open preserves down and up in order");
+
+    late.openClient = nullptr;
+    assert(late.press(4) == kIOReturnNotReady);
+    late.children.push_back(&replacement);
+    late.openClient = &replacement;
+    late.retry();
+    assert(late.press(0) == kIOReturnSuccess);
+    assert((late.delivered == std::vector<unsigned>{2, 0, 4, 0}));
+    std::puts("PASS HID reconnect selects the currently open driver");
+
+    NativeHidInput failed;
+    failed.children = {&original};
+    failed.openClient = &original;
+    failed.rejectedMask = 2;
+    assert(failed.press(2) == kIOReturnNoMemory);
+    failed.rejectedMask = 0;
+    assert(failed.press(0) == kIOReturnNoMemory && failed.buttons == 2);
+    failed.rejectedMask = -1;
+    failed.retry();
+    assert((failed.delivered == std::vector<unsigned>{2, 0} && failed.buttons == 0));
+    std::puts("PASS HID failed submission retries only the undelivered report");
+
+    NativeHidInput expired;
+    assert(expired.press(2) == kIOReturnNotReady);
+    assert(expired.press(0) == kIOReturnNotReady);
+    nowUs += 300000;
+    expired.children = {&original};
+    expired.openClient = &original;
+    expired.retry();
+    assert(expired.delivered == std::vector<unsigned>{0});
+    std::puts("PASS HID stale tap reconciles to the current released state");
+
+    NativeHidInput overflow;
+    for (unsigned i = 0; i <= NativeHidInput::kPendingButtons; ++i)
+        assert(overflow.press(i % 2 ? 0 : 2) == kIOReturnNotReady);
+    overflow.children = {&original};
+    overflow.openClient = &original;
+    overflow.retry();
+    assert(overflow.press(0) == kIOReturnSuccess);
+    assert((overflow.delivered == std::vector<unsigned>{2, 0}));
+    std::puts("PASS HID full queue reconciles to the current held state");
+}
+'''
+
+
+def extract_hid_source():
+    source = HID_SOURCE.read_text(encoding='utf-8')
+    fields = source[source.index('    IOTimerEventSource *buttonRetryTimer'):source.index('    bool touchEnabled')]
+    handoff = source[source.index('    static uint64_t buttonUs()'):source.index('    bool hasEventDriverCached()')]
+    discovery = source[source.index('    static IOService *copyEventDriver('):source.index('    static IOReturn stopButtonRetry(')]
+    return HID_MOCK + fields + handoff + discovery + HID_CASES
+
+
 def compiler_and_environment():
     env = os.environ.copy()
     vs = Path(env.get('ProgramFiles', 'C:/Program Files')) / 'Microsoft Visual Studio/2022'
@@ -194,12 +333,13 @@ def compiler_and_environment():
 def main():
     compiler, env = compiler_and_environment()
     with tempfile.TemporaryDirectory(prefix='sheng-buttons-') as temp:
-        source = Path(temp) / 'button-probe-test.cpp'
-        binary = source.with_suffix('.exe' if os.name == 'nt' else '')
-        source.write_text(extract_source(), encoding='utf-8')
-        subprocess.run([compiler, '-std=c++17', '-Wall', '-Wextra', '-Werror', str(source), '-o', str(binary)],
-                       check=True, env=env)
-        subprocess.run([str(binary)], check=True, env=env)
+        for name, contents in [('button-probe', extract_source()), ('button-handoff', extract_hid_source())]:
+            source = Path(temp) / f'{name}.cpp'
+            binary = source.with_suffix('.exe' if os.name == 'nt' else '')
+            source.write_text(contents, encoding='utf-8')
+            subprocess.run([compiler, '-std=c++17', '-Wall', '-Wextra', '-Werror', str(source), '-o', str(binary)],
+                           check=True, env=env)
+            subprocess.run([str(binary)], check=True, env=env)
 
 
 if __name__ == '__main__':
