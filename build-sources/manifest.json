@@ -130,13 +130,13 @@
       "repository": "device",
       "path": "board.toml",
       "before_sha256": "88b824800753cc7e79ae9dcd4ea4c92f351228126a3147dfc0ee81de0382e8b2",
-      "sha256": "14eed4b3e01804d74c7565a49589f92c0f8c70bb9be0d5b5ebccee859b67ac73"
+      "sha256": "1e3729c73a6b15d582224afdfc87b35750593c9aebb091bb731e1a2c14a18e92"
     },
     "device/drivers/ShengHidInput/NativeHidInput.cpp": {
       "repository": "device/drivers/ShengHidInput",
       "path": "NativeHidInput.cpp",
       "before_sha256": "c0964bf7faa0332ce8d6334f2b74a271b269eee14112ae89b4453091604a10f6",
-      "sha256": "447c881b46c9b7829f8d5a040aef0f3b8cf85f7b9499370ea0571db4a38d0179"
+      "sha256": "3c2bb2427d045d3921fb1d7f2c7aba59310ee00f6fe75bcbdedf27adc37523b9"
     },
     "device/drivers/ShengHidInput/NativeHidTouchPlan.h": {
       "repository": "device/drivers/ShengHidInput",
@@ -484,7 +484,7 @@
       "repository": "device",
       "path": "patches/xnu-12377/series",
       "before_sha256": "15d08ffeafa1d29ece607e4f2913c80cb1f403442b0a0cbf9625f8d60a2d2953",
-      "sha256": "fa6f14b5fedf12dc1db14c8cd3088a806c3a5d0845b4d53f66a6bfe8084e2882"
+      "sha256": "90d8f78cf2ee940477fb8ede2d2ec7b96e2d4cefa2c643a0d38aa212607c59cb"
     },
     "device/patches/xnu-12377/sheng-frame-ipc-trace.patch": {
       "repository": "device",
@@ -503,6 +503,12 @@
       "path": "scripts/decode-gpu-trace.py",
       "before_sha256": "970b107fd25dfff9dbd0e9d58f6eecdc71d1985bddacf8b2c7ed16650a04ecc1",
       "sha256": "bd2b812ef6fcadf966e4379ec4bd8a7971f42b713179827c1871428fc2d745ff"
+    },
+    "device/patches/xnu-12377/sheng-layout-direct-trace.patch": {
+      "repository": "device",
+      "path": "patches/xnu-12377/sheng-layout-direct-trace.patch",
+      "before_sha256": null,
+      "sha256": "3190862efb02eca7d6c024f4011d40ed5df4bb2a400d90f6ec156d0a9f793d6f"
     }
   },
   "candidate_version": "V6.1-BCD",

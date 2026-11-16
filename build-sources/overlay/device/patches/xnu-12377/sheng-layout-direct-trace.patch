@@ -1,0 +1,74 @@
+diff --git a/bsd/kern/kdebug.c b/bsd/kern/kdebug.c
+--- a/bsd/kern/kdebug.c
++++ b/bsd/kern/kdebug.c
+@@ -40,6 +40,7 @@
+ #include <mach/machine.h>
+ #include <mach/vm_map.h>
+ #include <kern/clock.h>
++#include <kern/backtrace.h>
+ 
+ #include <kern/cpu_number.h>
+ #include <kern/task.h>
+@@ -1201,6 +1202,45 @@
+ 	return kdebug_trace64(p, &uap64, retval);
+ }
+ 
++/* Records for the sheng layout and input diagnostic. */
++enum {
++	SHENG_LAYOUT_MARK = 0x31ca01f1,
++	SHENG_LAYOUT_STACK = 0x21f50004,
++	SHENG_LAYOUT_STACK_PAIR = 0x21f50008,
++	SHENG_LAYOUT_TIP_UP = 0x21f5000c,
++	SHENG_LAYOUT_STACK_LIMIT = 24,
++};
++
++static void
++sheng_layout_mark_stack(struct proc *p, const struct kdebug_trace64_args *event)
++{
++	if (event->code != SHENG_LAYOUT_MARK ||
++	    !(kd_control_trace.kdc_flags & KDBG_TYPEFILTER_CHECK) ||
++	    !kdebug_debugid_enabled(SHENG_LAYOUT_STACK) ||
++	    strcmp(p->p_comm, "SpringBoard") != 0) {
++		return;
++	}
++
++	/* Unwind the issuing user thread after kernel_debug_internal returns. */
++	const uint64_t tick = mach_absolute_time();
++	uintptr_t frames[SHENG_LAYOUT_STACK_LIMIT] = { 0 };
++	struct backtrace_user_info info = BTUINFO_INIT;
++	const unsigned int count = backtrace_user(frames, SHENG_LAYOUT_STACK_LIMIT, NULL, &info);
++	const uint64_t state = ((uint64_t)(uint32_t)info.btui_error << 32) | count;
++	KDBG_RELEASE(SHENG_LAYOUT_STACK, tick, event->arg1, event->arg3, state);
++	for (unsigned int i = 0; i < count; i += 2) {
++		KDBG_RELEASE(SHENG_LAYOUT_STACK_PAIR, tick, i, frames[i], frames[i + 1]);
++	}
++}
++
++void sheng_layout_touch_up(uint64_t original_ticks, uint32_t sequence, uint32_t phase, uint32_t ups) __attribute__((used));
++void
++sheng_layout_touch_up(uint64_t original_ticks, uint32_t sequence, uint32_t phase, uint32_t ups)
++{
++	const uint64_t packet = ((uint64_t)phase << 32) | ups;
++	KDBG_RELEASE(SHENG_LAYOUT_TIP_UP, original_ticks, mach_absolute_time(), sequence, packet);
++}
++
+ // Support kdebug_trace(2).  64-bit arguments on K32 will get truncated
+ // to fit in the 32-bit record format.
+ //
+@@ -1208,7 +1248,7 @@
+ // enabled. This is to match the userspace wrapper behavior, which is optimizing
+ // for non-error case performance.
+ int
+-kdebug_trace64(__unused struct proc *p, struct kdebug_trace64_args *uap,
++kdebug_trace64(struct proc *p, struct kdebug_trace64_args *uap,
+     __unused int32_t *retval)
+ {
+ 	if (__probable(kdebug_enable == 0)) {
+@@ -1220,6 +1260,7 @@
+ 	kernel_debug_internal(uap->code, (uintptr_t)uap->arg1, (uintptr_t)uap->arg2,
+ 	    (uintptr_t)uap->arg3, (uintptr_t)uap->arg4,
+ 	    (uintptr_t)thread_tid(current_thread()), 0);
++	sheng_layout_mark_stack(p, uap);
+ 	return 0;
+ }
+ 

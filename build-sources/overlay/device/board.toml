@@ -82,6 +82,9 @@ appsync = true
 FORCE_SOFTWARE_RENDERER = "0"
 CI_ENABLE_METAL_GPU = "0"
 
+[payload.runtime.launchd_job_environment."com.apple.SpringBoard"]
+CA_LAYER_UPDATE_SIGNPOSTS = "1"
+
 ["payload"."install"]
 "title" = "Install and boot"
 "confirm" = "ERASE all iPadOS user data and install again?"

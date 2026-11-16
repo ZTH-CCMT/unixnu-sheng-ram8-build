@@ -24,6 +24,7 @@
 #include <ptrauth.h>
 #endif
 extern "C" void native_hid_input_observed(unsigned,int);
+extern "C" void sheng_layout_touch_up(uint64_t, uint32_t, uint32_t, uint32_t) __attribute__((weak_import));
 extern "C" void native_hid_live_checkpoint(IOService *);
 extern "C" bool native_hid_input_requested(void);
 extern "C" void native_touch_set_sink(void (*)(void *), void *) __attribute__((weak_import));
@@ -325,6 +326,7 @@ class NativeHidInput : public IOHIDDevice {
             native_hid_input_observed(6,result);
             native_touch_hid_reports=native_touch_hid_reports+1;
             if(result!=kIOReturnSuccess)return; // API error can be ambiguous; no successful ACK invented
+            if(packet.ups && sheng_layout_touch_up)sheng_layout_touch_up(originalTicks,before,phase,packet.ups);
             if(!nht_commit(&acknowledged,&plan,phase,1))return;
             // Preserve each successful phase, especially if phase2 fails. The
             // final snapshot sequence advances only after its final packet ACK.
