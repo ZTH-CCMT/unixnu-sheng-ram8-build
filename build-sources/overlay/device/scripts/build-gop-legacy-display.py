@@ -48,6 +48,7 @@ public:
   *reinterpret_cast<uint32_t *>(reinterpret_cast<unsigned char *>(this)+5808)=width;
   *reinterpret_cast<uint32_t *>(reinterpret_cast<unsigned char *>(this)+5812)=height;
  }
+ uintptr_t pendingSwapWaitEvent() const {return reinterpret_cast<uintptr_t>(this)+5480;}
  const OriginalLegacySwapRequest *pendingSwapRequest() const {
   const OriginalLegacySwapRequest *request=nullptr;
   memcpy(&request,reinterpret_cast<const unsigned char *>(this)+5480,sizeof(request));return request;

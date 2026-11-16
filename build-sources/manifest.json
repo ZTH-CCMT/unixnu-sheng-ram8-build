@@ -82,7 +82,7 @@
       "repository": "UniXNU/drivers/GopFramebuffer",
       "path": "NativeLegacyDisplay.cpp",
       "before_sha256": "465f5ebfe1df7228c66ecebd2b17a9971a7af64882efd132a907b1b0abacb78a",
-      "sha256": "4264811c749d2a691871f27e0bd21a4e171b6b9883e639caec13bc6911f9c60c"
+      "sha256": "823e6d29389c214b24c34de14b619f8f16fb0781213622cfab54e015ed5f85f9"
     },
     "UniXNU/drivers/GopFramebuffer/Test/check-fence-wait.py": {
       "repository": "UniXNU/drivers/GopFramebuffer",
@@ -130,7 +130,7 @@
       "repository": "device",
       "path": "board.toml",
       "before_sha256": "88b824800753cc7e79ae9dcd4ea4c92f351228126a3147dfc0ee81de0382e8b2",
-      "sha256": "e1a00aed4e32b6e29fc49856009471574d7f74c4332105b8d22d3bff82ee5173"
+      "sha256": "14eed4b3e01804d74c7565a49589f92c0f8c70bb9be0d5b5ebccee859b67ac73"
     },
     "device/drivers/ShengHidInput/NativeHidInput.cpp": {
       "repository": "device/drivers/ShengHidInput",
@@ -262,7 +262,7 @@
       "repository": "device",
       "path": "package/TouchProbe.cpp",
       "before_sha256": "4c79c17125fbc7f45ca97fda37dc8e67b30c77b51c3c1fc4721660084cde4902",
-      "sha256": "9c593b84875307a32983d464ee1fc795f5d3e684a2a2473f9335ecbe94502b6d"
+      "sha256": "968bdcd70d0fe243d8b5331164e296fbc4745f163ebf9a4deea5bcccdf43b1f0"
     },
     "device/package/TouchReportTimeline.h": {
       "repository": "device",
@@ -274,13 +274,13 @@
       "repository": "device",
       "path": "scripts/build-gop-legacy-display-27.py",
       "before_sha256": "8d2d30b863e53833c55b7d8992e6806df2a2079ecf5893e259a2eb752f0e1fed",
-      "sha256": "df896cafd0c0c56f221c38318cd863a7ad5ca571485a55074bc7a3e63e1c0ca7"
+      "sha256": "fa0e73d6ecc15f1493cee314cbefab9c960bf6ed940d30b4b000ec41b9714c02"
     },
     "device/scripts/build-gop-legacy-display.py": {
       "repository": "device",
       "path": "scripts/build-gop-legacy-display.py",
       "before_sha256": "b90c10d1d1b0d07aaacc176727bb02e2b7e79f35fa42ff00af4048d77d5d7db0",
-      "sha256": "fb9f7531756d065d9487716ec4f24162736b6607486d095adb7c4349e755b958"
+      "sha256": "f14de5d4ca2c01944fcbed1ab0ea3db195e50cfbad4687f861e45cad8667f038"
     },
     "uefi-sheng/Platforms/Xiaomi/shengPkg/Library/MemoryMapLib/MemoryMapLib.c": {
       "repository": "uefi-sheng",
@@ -394,7 +394,7 @@
       "repository": "UniXNU/drivers/AdrenoMetal",
       "path": "NativeBridgeMetalFrontend.mm",
       "before_sha256": "39cb6dd476349dc98423a4c7b9339f6c8a2492fd2d5817e729ae55be0bd65236",
-      "sha256": "376579f70a36a0310797653b77fd3212eea62e2a540810e923617348b31236e0"
+      "sha256": "8fa5382e98c5cc76daff6a565323f63d6ab89e4db36669005044789fb7bb795a"
     },
     "UniXNU/drivers/AdrenoMetal/PrimeShaders.h": {
       "repository": "UniXNU/drivers/AdrenoMetal",
@@ -461,6 +461,48 @@
       "path": "NativeAdrenoVm.h",
       "before_sha256": "78e92782484f940d02338c642825f5215d336793ae2f84b85bb628fb3f9c03f4",
       "sha256": "9ee28678b9a5adec7ad9d87e7adacaa6eedc46844e061b332ee630a3a46ebab8"
+    },
+    "device/package/BootLatencyTrace.c": {
+      "repository": "device",
+      "path": "package/BootLatencyTrace.c",
+      "before_sha256": "305fc493c53196532bd1658845e35b5be8787d4b924dfb8bb183cd2d1424b04e",
+      "sha256": "08675edc21c5213d7e00378926b71d15836b82fb4f5b4c1bd0051fb798ae0c11"
+    },
+    "device/package/BootLatencyTrace.h": {
+      "repository": "device",
+      "path": "package/BootLatencyTrace.h",
+      "before_sha256": "b1449724fda4a1ad280642274514234474b3354c1f8ea08ac7d243a1de4554c7",
+      "sha256": "f2e92fcc9d50f70b761819d36f3b6695349d9e9814ebd3e0f6c332167048e882"
+    },
+    "device/package/BootUiTraceProbe.c": {
+      "repository": "device",
+      "path": "package/BootUiTraceProbe.c",
+      "before_sha256": "04f4d9f993a7b4264cd782527043bbbe76935bc4ebb4b14f1529d5ffb9801612",
+      "sha256": "0a4f36b58e5586094a8a42e50d7711a451ec30202bdf81fd43d1fc32744a4bc5"
+    },
+    "device/patches/xnu-12377/series": {
+      "repository": "device",
+      "path": "patches/xnu-12377/series",
+      "before_sha256": "15d08ffeafa1d29ece607e4f2913c80cb1f403442b0a0cbf9625f8d60a2d2953",
+      "sha256": "fa6f14b5fedf12dc1db14c8cd3088a806c3a5d0845b4d53f66a6bfe8084e2882"
+    },
+    "device/patches/xnu-12377/sheng-frame-ipc-trace.patch": {
+      "repository": "device",
+      "path": "patches/xnu-12377/sheng-frame-ipc-trace.patch",
+      "before_sha256": null,
+      "sha256": "9a102f2f36368fd58e3dbe0ea10bb261705c0c98c3774ffb2241c1719bd1a569"
+    },
+    "device/patches/xnu-12377/sheng-frame-scheduler-trace.patch": {
+      "repository": "device",
+      "path": "patches/xnu-12377/sheng-frame-scheduler-trace.patch",
+      "before_sha256": null,
+      "sha256": "1cba7d5f4f0dd2966a66dec27dd0dea9346af4d3b85b68f5fef6b8e298f656c0"
+    },
+    "device/scripts/decode-gpu-trace.py": {
+      "repository": "device",
+      "path": "scripts/decode-gpu-trace.py",
+      "before_sha256": "970b107fd25dfff9dbd0e9d58f6eecdc71d1985bddacf8b2c7ed16650a04ecc1",
+      "sha256": "bd2b812ef6fcadf966e4379ec4bd8a7971f42b713179827c1871428fc2d745ff"
     }
   },
   "candidate_version": "V6.1-BCD",

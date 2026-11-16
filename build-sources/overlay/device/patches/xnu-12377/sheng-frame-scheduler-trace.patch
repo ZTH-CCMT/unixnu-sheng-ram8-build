@@ -1,0 +1,62 @@
+diff --git a/osfmk/kern/sched_prim.c b/osfmk/kern/sched_prim.c
+--- a/osfmk/kern/sched_prim.c
++++ b/osfmk/kern/sched_prim.c
+@@ -841,9 +841,25 @@
+ 	thread_unlock(thread);
+ }
+ 
++typedef void (*sheng_frame_sched_hook_t)(uint32_t, uint64_t, uint64_t,
++    uint32_t, uint32_t, uint64_t, uint64_t);
++/* Device diagnostics publish one render thread. Hooks run at splsched. */
++extern uint64_t sheng_frame_display_tid;
++extern sheng_frame_sched_hook_t sheng_frame_sched_hook;
++uint64_t sheng_frame_display_tid;
++sheng_frame_sched_hook_t sheng_frame_sched_hook;
++
++static inline sheng_frame_sched_hook_t
++sheng_frame_sched_handler(thread_t thread)
++{
++	uint64_t tid = __atomic_load_n(&sheng_frame_display_tid, __ATOMIC_ACQUIRE);
++	return tid && tid == thread->thread_id ?
++	       __atomic_load_n(&sheng_frame_sched_hook, __ATOMIC_ACQUIRE) : NULL;
++}
++
+ /*
+  *	thread_unblock:
+  *
+  *	Unblock thread on wake up.
+  *
+  *	Returns TRUE if the thread should now be placed on the runqueue.
+@@ -887,7 +903,15 @@
+ 	old_thread_state = thread->state;
+ 	thread->state = (old_thread_state | TH_RUN) &
+ 	    ~(TH_WAIT | TH_UNINT | TH_WAIT_REPORT | TH_WAKING);
++	if (old_thread_state & TH_WAIT) {
++		sheng_frame_sched_hook_t hook = sheng_frame_sched_handler(thread);
++		if (hook) {
++			hook(2, thread->thread_id, 0, (uint32_t)wresult,
++			    (uint32_t)thread->state, cthread->thread_id,
++			    (uint64_t)(uintptr_t)__builtin_return_address(0));
++		}
++	}
+ 
+ 	if ((old_thread_state & TH_RUN) == 0) {
+ 		uint64_t ctime = mach_approximate_time();
+ 
+@@ -3910,7 +3934,16 @@
+ 	self->continuation = continuation;
+ 	self->parameter = parameter;
+ 
++	if (self->state & TH_WAIT) {
++		sheng_frame_sched_hook_t hook = sheng_frame_sched_handler(self);
++		if (hook) {
++			hook(1, self->thread_id, (uint64_t)self->wait_event,
++			    (uint32_t)self->block_hint, (uint32_t)self->state, 0,
++			    (uint64_t)(uintptr_t)__builtin_return_address(0));
++		}
++	}
++
+ 	if (self->state & ~(TH_RUN | TH_IDLE)) {
+ 		KERNEL_DEBUG_CONSTANT_IST(KDEBUG_TRACE,
+ 		    MACHDBG_CODE(DBG_MACH_SCHED, MACH_BLOCK),
+ 		    reason, VM_KERNEL_UNSLIDE(continuation), 0, 0, 0);

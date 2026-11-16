@@ -304,7 +304,7 @@ static thread_local uint64_t tEncodeBatchId;
 static void traceThread(uint32_t role) {
  if(!diagOn() || !gpuTraceOn() || !gFrameTransport)return;
  uint64_t tid=0;pthread_threadid_np(nullptr,&tid);
- static std::atomic<uint64_t> seen[128];const uint64_t key=(tid<<2)|role;
+ static std::atomic<uint64_t> seen[128];const uint64_t key=(tid<<8)|role;
  for(auto &slot:seen) {
   uint64_t value=slot.load();if(value==key)return;
   if(!value && slot.compare_exchange_strong(value,key)) {
@@ -312,6 +312,9 @@ static void traceThread(uint32_t role) {
    pthread_getname_np(pthread_self(),(char *)&rec.value[2],32);(void)gFrameTransport(NativeGpuTraceMethod,&rec,sizeof(rec));return;
   }
  }
+}
+static void traceCommandCreation(uint64_t span,uint64_t tid,uint32_t phase,uint64_t command=0) {
+ TraceRec rec={};rec.type=52;rec.t0=nowUs();rec.t1=span;rec.t2=command;rec.t3=tid;rec.a=phase;tracePush(rec);
 }
 // Types 14/15 persist CPU-side phases beside runtime stages in frames.trace.
 static void frontStage(uint64_t command,uint64_t commit,uint32_t phase,uint64_t bytes=0,uint32_t surfaces=0) {
@@ -3643,9 +3646,23 @@ static void completed(void *context) {
  gQueuePriorities.remove(_priority);auto p=gQueuePriorities.aggregate();nbForwardPriority(p.foreground,p.background);
 }
 - (id<MTLCommandBuffer>)commandBuffer {
+ uint64_t span=0,tid=0;
+ if(traceWanted() && metalChainOn()){
+  static std::atomic<uint64_t> nextSpan{0};
+  span=nextSpan.fetch_add(1,std::memory_order_relaxed)+1;
+  pthread_threadid_np(nullptr,&tid);
+  traceCommandCreation(span,tid,1);
+  // QuartzCore's render workers and display thread share the existing role 1.
+  // Give the display thread its own slot when it actually creates a command.
+  char name[32]={};pthread_getname_np(pthread_self(),name,sizeof name);
+  if(!strcmp(name,"com.apple.coreanimation.display"))traceThread(4);
+ }
  NmbCommandBuffer *handle=nmb_command_buffer_new(_handle);
+ if(span)traceCommandCreation(span,tid,handle?2:4);
  if(!handle){NBLOG(@"native-metal: commandBuffer refused: %@",lastError());return nil;}
- NBCommandBuffer *commandBuffer=[NBCommandBuffer new];commandBuffer.handle=handle;commandBuffer.queue=self;return (id<MTLCommandBuffer>)commandBuffer;
+ NBCommandBuffer *commandBuffer=[NBCommandBuffer new];commandBuffer.handle=handle;commandBuffer.queue=self;
+ if(span)traceCommandCreation(span,tid,3,commandBuffer?commandBuffer->traceNumber:0);
+ return (id<MTLCommandBuffer>)commandBuffer;
 }
 - (id<MTLCommandBuffer>)commandBufferWithUnretainedReferences {return [self commandBuffer];}
 - (void)setSubmissionQueue:(dispatch_queue_t)queue {(void)queue;}   // submission happens on the caller's thread here

@@ -469,7 +469,7 @@ bool publishAt(unsigned count, const nvt_contact *c, uint64_t ticks) {
     native_touch_seq = native_touch_seq + 1;
     __asm__ volatile("dmb ish" ::: "memory");
     native_touch_count = count;
-    native_touch_time_ticks = ticks;
+    __atomic_store_n(&native_touch_time_ticks, ticks, __ATOMIC_RELEASE);
     for (unsigned i = 0; i < count && i < NVT_SLOTS; ++i) {
         native_touch_xs[i] = c[i].x;
         // Panel photograph (v94): X is correct and Y is mirrored, so publish Y from the other edge (axis maximum 20320).

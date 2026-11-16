@@ -144,6 +144,7 @@ public:
  void installBootDimensions(uint32_t width,uint32_t height) {{
   memcpy(reinterpret_cast<unsigned char *>(this)+{D['width']},&width,4);memcpy(reinterpret_cast<unsigned char *>(this)+{D['height']},&height,4);
  }}
+ uintptr_t pendingSwapWaitEvent() const {{return reinterpret_cast<uintptr_t>(this)+{D['head']};}}
  const OriginalLegacySwapRequest *pendingSwapRequest() const {{
   const OriginalLegacySwapRequest *request=nullptr;
   memcpy(&request,reinterpret_cast<const unsigned char *>(this)+{D['head']},sizeof(request));return request;
