@@ -147,7 +147,7 @@ static uint64_t floor_sqrt_u64(uint64_t value) {
 static long point_cost(int x,int y,long px,long py) {
     const long dx=(long)x-px,dy=(long)y-py;return dx*dx+dy*dy;
 }
-static void project_tracks(const struct nvt_touch_core *core,int predict,
+static void project_tracks(const struct nvt_touch_core *core,int predict,uint64_t now_us,
                            struct track_projection *projection) {
     const uint64_t r2=(uint64_t)TRACK_RADIUS*TRACK_RADIUS;
     for(int s=0;s<NVT_SLOTS;++s) {
@@ -160,7 +160,7 @@ static void project_tracks(const struct nvt_touch_core *core,int predict,
             const int steps=predict ? slot->missed+1 : 0;
             sx=(long)slot->dx*steps;sy=(long)slot->dy*steps;
         } else {
-            const uint64_t gap=core->now_us>=slot->last_observed_us ? core->now_us-slot->last_observed_us : UINT64_MAX;
+            const uint64_t gap=now_us>=slot->last_observed_us ? now_us-slot->last_observed_us : UINT64_MAX;
             if(predict && slot->age>=2 && !slot->missed && gap<=NVT_DROPOUT_MAX_US) {
                 // Limited displacement, not velocity*time extrapolation. At a
                 // stop/reversal the measured h0 remains an equally valid gate.
@@ -203,7 +203,7 @@ static void assign_tracks(const struct nvt_touch_core *core, const struct nvt_co
     // all their velocities through the stop can swap neighbours at the centre.
     const int predict = n <= 3;
     struct track_projection projection[NVT_SLOTS];
-    project_tracks(core,predict,projection);
+    project_tracks(core,predict,core->now_us,projection);
     const int m=nfound+n;
     long u[NVT_SLOTS+1]={0},v[COLUMNS+1]={0},minv[COLUMNS+1];
     int p[COLUMNS+1]={0},way[COLUMNS+1]={0};char used[COLUMNS+1];
@@ -543,11 +543,16 @@ static int process_matrix(struct nvt_touch_core *core, const int16_t *matrix, un
                 core->now_us>=slot->last_observed_us && core->now_us-slot->last_observed_us<NVT_DROPOUT_MAX_US;
             if(core->timed_enabled ? timed_hold : legacy_hold)continue;
             if(core->timed_enabled) {
-                if(slot->age>=2)core->retired_ids|=1u<<slot->tracking_id;
+                if(slot->age>=2) {
+                    const unsigned bit=1u<<slot->tracking_id;
+                    core->retired_ids|=bit;
+                    if(!peak_active && reason==NVT_MISS_NONE)
+                        slot->last_covered_negative_us=core->now_us;
+                    else
+                        core->cancelled_ids|=bit;
+                }
                 if(reason==NVT_MISS_FAR || reason==NVT_MISS_TAKEN)++core->far_retired;
             }
-            if(core->timed_enabled && !peak_active && reason==NVT_MISS_NONE)
-                slot->last_covered_negative_us=core->now_us;
             ++core->ends[slot->miss_reason];slot->active=0;continue;
         }
         accept_position(core,slot,s,&found[best]);
@@ -654,9 +659,7 @@ int nvt_touch_process_region(struct nvt_touch_core *core,
         struct nvt_slot *slot=&core->slots[s];
         if(!slot->active || match[s]<0)continue;
         if(now_us<=slot->last_observed_us)continue;
-        const uint64_t gap=now_us-slot->last_observed_us;
-        if((slot->age<2 && now_us-slot->born_us>=NVT_PENDING_MAX_US) ||
-           gap>=NVT_OBSERVATION_MAX_US || (slot->missed && gap>=NVT_DROPOUT_MAX_US))continue;
+        if(slot->age<2 && now_us-slot->born_us>=NVT_PENDING_MAX_US)continue;
         accept_position(core,slot,s,&found[match[s]]);++changed;
     }
     for(int c=0;c<nfound;++c) {
@@ -698,14 +701,13 @@ int nvt_touch_process_partial(struct nvt_touch_core *core,
     struct track_projection projection[NVT_SLOTS];
     int active=0;
     for(int s=0;s<NVT_SLOTS;++s)active+=core->slots[s].active!=0;
-    project_tracks(core,active<=3,projection);
+    project_tracks(core,active<=3,now_us,projection);
     int changed=0;
     for(int j=0;j<count;++j)for(int s=0;s<NVT_SLOTS;++s) {
         struct nvt_slot *slot=&core->slots[s];
         if(!slot->active || slot->age<2 || slot->tracking_id!=measured[j].tracking_id)continue;
         if(now_us<=slot->last_observed_us)break;
         const uint64_t dt=now_us-slot->last_observed_us;
-        if(dt>=NVT_OBSERVATION_MAX_US || (slot->missed && dt>=NVT_DROPOUT_MAX_US))break;
         if(track_cost(slot,&measured[j],1,0,&projection[s],NULL)>(long)TRACK_RADIUS*TRACK_RADIUS)break;
         const uint64_t filter_dt=now_us>slot->last_filter_us ? now_us-slot->last_filter_us : 1;
         const int dx=measured[j].x-slot->x,dy=measured[j].y-slot->y;
@@ -753,6 +755,41 @@ int nvt_touch_covered_negative(struct nvt_touch_core *core,int tracking_id,
     return -1;
 }
 
+int nvt_touch_quiet_stripe(struct nvt_touch_core *core,const int16_t *rows,
+                          int first_row,int row_count,uint64_t previous_us,uint64_t now_us,
+                          struct nvt_contact *out,int max) {
+    if(!core || !core->timed_enabled || !core->have_reference || !rows || !out || max<0 ||
+       first_row<0 || row_count<1 || first_row>NVT_ROWS-row_count ||
+       (core->clock_valid && now_us<core->now_us))return -1;
+    const int last_row=first_row+row_count-1;
+    // All columns must be quiet. A connected signal outside the stripe then
+    // stays on one side of it and cannot yield a centroid within the stripe.
+    for(int i=0;i<row_count*NVT_COLUMNS;++i) {
+        const int delta=(int)rows[i]-core->reference[first_row*NVT_COLUMNS+i];
+        if(delta<=-NVT_NOISE_THRESHOLD || delta>=NVT_NOISE_THRESHOLD)return -1;
+    }
+    const int top=nvt_touch_map_edge_axis(kRowMap[first_row]*NVT_SUPER_RESOLUTION,NVT_SHORT_AXIS_MAX,1);
+    const int bottom=nvt_touch_map_edge_axis(kRowMap[last_row]*NVT_SUPER_RESOLUTION,NVT_SHORT_AXIS_MAX,1);
+    unsigned active=0;
+    for(int s=0;s<NVT_SLOTS;++s)active+=core->slots[s].active!=0;
+    struct track_projection projections[NVT_SLOTS];
+    project_tracks(core,active<=3,now_us,projections);
+    int changed=0;
+    for(int s=0;s<NVT_SLOTS;++s) {
+        const struct nvt_slot *slot=&core->slots[s];
+        if(!slot->active || slot->age<2 || slot->last_observed_us!=previous_us ||
+           now_us<=slot->last_observed_us ||
+           now_us-slot->last_observed_us>NVT_DROPOUT_MAX_US)continue;
+        const struct track_projection *p=&projections[s];
+        const long radius=slot->missed ? REJOIN_RADIUS : TRACK_RADIUS;
+        const long low=(p->y<p->raw_y ? p->y : p->raw_y)-radius;
+        const long high=(p->y>p->raw_y ? p->y : p->raw_y)+radius;
+        if((first_row!=0 && low<top) || (last_row!=NVT_ROWS-1 && high>bottom))continue;
+        if(nvt_touch_covered_negative(core,slot->tracking_id,slot->generation,now_us,out,max)>=0)changed=1;
+    }
+    return changed ? visible_set(core,out,max) : -1;
+}
+
 int nvt_touch_expire(struct nvt_touch_core *core,uint64_t now_us,struct nvt_contact *out,int max) {
     if(!core || !out || max<0)return -1;
     core->timed_enabled=1;
@@ -775,7 +812,8 @@ int nvt_touch_expire(struct nvt_touch_core *core,uint64_t now_us,struct nvt_cont
         if(!rollback && !stale_pending && !stale_visible && !stale_dropout)continue;
         if(pending)++core->pending_expired;
         else {
-            core->retired_ids|=1u<<slot->tracking_id;visible_changed=1;
+            const unsigned bit=1u<<slot->tracking_id;
+            core->retired_ids|=bit;core->cancelled_ids|=bit;visible_changed=1;
             if(stale_dropout)++core->dropout_expired;
             else ++core->observation_cancelled;
         }
@@ -803,9 +841,18 @@ int nvt_touch_process_timed(struct nvt_touch_core *core,const int16_t *matrix,un
                            uint64_t now_us,struct nvt_contact *out,int max) {
     if(!core || !matrix || !out || max<0 || (frame_type!=2 && frame_type!=4))return -1;
     core->previous_retired_ids=core->retired_ids;core->retired_ids=0;
-    // Expire again for direct callers; the production adapter publishes expiry
-    // before frame(). Retired IDs remain unavailable for the current next scan.
-    (void)nvt_touch_expire(core,now_us,out,max);
+    if(core->clock_valid && now_us<core->now_us) {
+        (void)nvt_touch_expire(core,now_us,out,max);
+    } else {
+        core->timed_enabled=core->clock_valid=1;
+        core->now_us=now_us;
+        for(int s=0;s<NVT_SLOTS;++s) {
+            struct nvt_slot *slot=&core->slots[s];
+            if(slot->active && slot->age<2 && now_us-slot->born_us>=NVT_PENDING_MAX_US) {
+                slot->active=0;++core->pending_expired;
+            }
+        }
+    }
     core->previous_matrix_us=now_us;core->matrix_clock_valid=1;
     return process_matrix(core,matrix,frame_type,out,max);
 }

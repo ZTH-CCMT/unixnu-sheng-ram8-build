@@ -105,6 +105,7 @@ struct nvt_touch_core {
     uint64_t now_us, previous_matrix_us;
     unsigned timed_enabled, clock_valid, matrix_clock_valid;
     unsigned retired_ids, previous_retired_ids;
+    unsigned cancelled_ids;         // Retired without an observed lift. The report owner snapshots and clears this mask.
     uint64_t next_generation;
     uint64_t last_region_us;
     unsigned region_clock_valid;
@@ -126,8 +127,8 @@ int nvt_touch_process(struct nvt_touch_core *core, const int16_t *matrix, unsign
 #define NVT_PENDING_MAX_US UINT64_C(25000)
 #define NVT_DROPOUT_MAX_US UINT64_C(25000)
 #define NVT_OBSERVATION_MAX_US UINT64_C(100000)
-// Like the legacy API, but timestamps are monotonic microseconds. Caller should
-// publish an expire() cancellation set before processing a new observation.
+// Like the legacy API, but timestamps are monotonic microseconds. Resolve the
+// current observation before expiring visible contacts that it did not update.
 int nvt_touch_process_timed(struct nvt_touch_core *core, const int16_t *matrix,
                            unsigned frame_type, uint64_t now_us,
                            struct nvt_contact *out, int max);
@@ -137,7 +138,7 @@ int nvt_touch_process_timed(struct nvt_touch_core *core, const int16_t *matrix,
 // Does not update reference, contact state or negative-evidence/lifetime clocks.
 int nvt_touch_extract_region(struct nvt_touch_core *core,const int16_t *rows,
                              int first_row,int row_count,struct nvt_region_candidates *out);
-// Publish expire() first. Only fresh independent regional observations may be
+// Only fresh independent regional observations may be
 // consumed; unmatched IDs are UNKNOWN. Full local blobs may confirm ordinary
 // two-observation DOWN; the global-single-peak fast path is not asserted by a strip.
 int nvt_touch_process_region(struct nvt_touch_core *core,
@@ -161,6 +162,11 @@ int nvt_touch_note_presence(struct nvt_touch_core *core, int tracking_id,
 int nvt_touch_covered_negative(struct nvt_touch_core *core, int tracking_id,
                               uint64_t generation, uint64_t now_us,
                               struct nvt_contact *out, int max);
+// A fresh, quiet mutual stripe can retire a recent contact if it covers the
+// entire Y range in which the existing matcher could continue the same ID.
+int nvt_touch_quiet_stripe(struct nvt_touch_core *core, const int16_t *rows,
+                          int first_row, int row_count, uint64_t previous_us, uint64_t now_us,
+                          struct nvt_contact *out, int max);
 // Remove expired hidden/visible slots without fake matrices or reference updates.
 // -1 = no visible change; >=0 = replacement visible set requiring publication.
 int nvt_touch_expire(struct nvt_touch_core *core, uint64_t now_us,

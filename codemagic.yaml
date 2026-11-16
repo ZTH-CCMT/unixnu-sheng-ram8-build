@@ -22,7 +22,7 @@ definitions:
           -x c -c -o /dev/null -
 
     - &stage_sources
-      name: Check out pinned sources and apply the V6.1 Layout Direct overlay
+      name: Check out pinned sources and apply the V6.3 touch overlay
       script: |
         set -eu
         top="$CM_BUILD_DIR/.unixnu-build"
@@ -78,12 +78,12 @@ definitions:
         fi
         (
           cd "$top/os27-ram8-handoff"
-          zip -0 -q -r "$CM_BUILD_DIR/os27-ram8-adreno-v6.1-layout-direct-handoff.zip" .
+          zip -0 -q -r "$CM_BUILD_DIR/os27-ram8-v6.3-touch-handoff.zip" .
         )
 
 workflows:
-  unixnu-gpu-v61-layout-direct-handoff:
-    name: UniXNU GPU V6.1 Layout Direct ARM64e boot handoff
+  unixnu-v63-touch-release-handoff:
+    name: UniXNU V6.3 Touch ARM64e boot handoff
     instance_type: mac_mini_m2
     max_build_duration: 120
     environment: *macos_environment
@@ -92,5 +92,5 @@ workflows:
       - *stage_sources
       - *build_handoff
     artifacts:
-      - os27-ram8-adreno-v6.1-layout-direct-handoff.zip
+      - os27-ram8-v6.3-touch-handoff.zip
       - .unixnu-build/build-failure-logs/**/*.log

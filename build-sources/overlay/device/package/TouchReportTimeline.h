@@ -12,7 +12,7 @@ extern "C" {
 
 struct TouchReportTimeline {
     enum { Capacity=32 };
-    typedef bool (*Callback)(void *,unsigned,const nvt_contact *,uint64_t);
+    typedef bool (*Callback)(void *,unsigned,const nvt_contact *,uint64_t,uint32_t);
     struct Point {
         nvt_contact contact;
         uint64_t generation,bornUs;
@@ -21,6 +21,7 @@ struct TouchReportTimeline {
     struct Frame {
         uint64_t timeUs,timeTicks;
         unsigned count;
+        uint32_t cancelledIds;
         Point point[NVT_SLOTS];
     };
     Frame frames[Capacity];
@@ -101,6 +102,7 @@ struct TouchReportTimeline {
             }
         }
         Frame &frame=at(used);frame.timeUs=nowUs;frame.timeTicks=nowTicks;frame.count=0;
+        frame.cancelledIds=core.cancelled_ids;
         for(unsigned s=0;s<NVT_SLOTS;++s) {
             const nvt_slot &slot=core.slots[s];
             if(!slot.active || !slot.generation || blockedGeneration[s]==slot.generation)continue;
@@ -117,11 +119,11 @@ struct TouchReportTimeline {
         ++used;++fed;clockValid=1;lastInputUs=nowUs;lastInputTicks=nowTicks;
         return true;
     }
-    bool deliver(Callback callback,void *context,const Point *points,unsigned count,uint64_t ticks) {
+    bool deliver(Callback callback,void *context,const Point *points,unsigned count,uint64_t ticks,uint32_t cancelledIds) {
         if(outputClockValid && ticks<lastOutputTicks) {++clockFaults;return false;}
         nvt_contact contacts[NVT_SLOTS];
         for(unsigned j=0;j<count;++j)contacts[j]=points[j].contact;
-        if(!callback || !callback(context,count,contacts,ticks)) {++submitFailures;return false;}
+        if(!callback || !callback(context,count,contacts,ticks,cancelledIds)) {++submitFailures;return false;}
         emittedCount=count;
         for(unsigned j=0;j<count;++j)emitted[j]=points[j];
         outputClockValid=1;lastOutputTicks=ticks;++submitted;return true;
@@ -147,8 +149,8 @@ struct TouchReportTimeline {
                        emitted[j].generation!=frame.point[k].generation) {retire=true;break;}
                 if(retire)reused=true;else kept[keep++]=emitted[j];
             }
-            if(reused && !deliver(callback,context,kept,keep,frame.timeTicks))break;
-            if(!deliver(callback,context,frame.point,frame.count,frame.timeTicks))break;
+            if(reused && !deliver(callback,context,kept,keep,frame.timeTicks,frame.cancelledIds))break;
+            if(!deliver(callback,context,frame.point,frame.count,frame.timeTicks,frame.cancelledIds))break;
             head=(head+1)%Capacity;--used;++released;
         }
         return released;

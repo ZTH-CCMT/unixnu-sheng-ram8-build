@@ -43,6 +43,7 @@ volatile int native_touch_last_x = -1, native_touch_last_y = -1;
 // Latest finger set for the HID digitizer source (see NativeHidInput); sequence is odd while being written.
 volatile uint32_t native_touch_seq;
 volatile uint32_t native_touch_count;
+volatile uint32_t native_touch_cancelled_ids;
 volatile uint64_t native_touch_time_ticks;
 volatile uint32_t native_touch_ack_seq;
 volatile uint32_t native_touch_astra_stats[8];
@@ -461,7 +462,7 @@ extern "C" void native_touch_set_sink(void (*sink)(void *), void *context) {gTou
 // Set while the scripted input (swipe) holds a contact down: the panel's own empty frames, which it reports about 110 times a second
 // with no finger on it, would lift that contact after every scripted frame (int-283: 1247 one-frame strokes, no swipe ever reached the UI).
 volatile bool gScriptedDown;
-bool publishAt(unsigned count, const nvt_contact *c, uint64_t ticks) {
+bool publishAt(unsigned count, const nvt_contact *c, uint64_t ticks,uint32_t cancelledIds=0) {
     int ids[NVT_SLOTS], xs[NVT_SLOTS], ys[NVT_SLOTS];
     for (unsigned i = 0; i < count && i < NVT_SLOTS; ++i) {
         ids[i] = c[i].tracking_id; xs[i] = c[i].x; ys[i] = c[i].y < 0 ? c[i].y : (20319 - (c[i].y > 20319 ? 20319 : c[i].y));
@@ -469,6 +470,7 @@ bool publishAt(unsigned count, const nvt_contact *c, uint64_t ticks) {
     native_touch_seq = native_touch_seq + 1;
     __asm__ volatile("dmb ish" ::: "memory");
     native_touch_count = count;
+    native_touch_cancelled_ids = cancelledIds;
     __atomic_store_n(&native_touch_time_ticks, ticks, __ATOMIC_RELEASE);
     for (unsigned i = 0; i < count && i < NVT_SLOTS; ++i) {
         native_touch_xs[i] = c[i].x;
@@ -680,7 +682,7 @@ static void recordPaths(const nvt_touch_core &core, touch_trace_row frame) {
                 end.id = origin.id;
                 end.flags |= TouchEnd;
                 end.origin_edges = origin.edges;
-                end.miss_reason = slot.miss_reason;
+                end.miss_reason = (core.cancelled_ids&(1u<<origin.id)) ? UINT8_MAX : slot.miss_reason;
                 pathTrace.ring[pathTrace.total++ % TouchTraceCapacity] = end;
                 origin.id = 0;
             }
@@ -727,14 +729,14 @@ static void aggressiveStats(const nvt_touch_core &core) {
 }
 
 // Only this producer owns the queue; the HID sink submits synchronously.
-static bool sendTimeline(void *,unsigned count,const nvt_contact *contacts,uint64_t ticks) {
-    return publishAt(count,contacts,ticks);
+static bool sendTimeline(void *,unsigned count,const nvt_contact *contacts,uint64_t ticks,uint32_t cancelledIds) {
+    return publishAt(count,contacts,ticks,cancelledIds);
 }
 static bool timelineResetPending;
 static bool captureTimeline(TouchEngine &engine,TouchReportTimeline &timeline,uint64_t ticks) {
     const uint64_t nowUs=touchUs(ticks);
     if(timelineResetPending) {
-        if(!publishAt(0,nullptr,ticks))return false;
+        if(!publishAt(0,nullptr,ticks,UINT32_MAX))return false;
         timeline.reset();nvt_touch_reset(engine.core);
         engine.resetPartial();
         timelineResetPending=false;
@@ -743,7 +745,7 @@ static bool captureTimeline(TouchEngine &engine,TouchReportTimeline &timeline,ui
     if(!timeline.feed(nowUs,ticks,*engine.core)) {
         native_touch_astra_stats[4]=native_touch_astra_stats[4]+1;
         timelineResetPending=true;
-        if(publishAt(0,nullptr,ticks)) {
+        if(publishAt(0,nullptr,ticks,UINT32_MAX)) {
             timeline.reset();nvt_touch_reset(engine.core);
             engine.resetPartial();
             timelineResetPending=false;
@@ -1024,9 +1026,7 @@ static void touchThread(void *, wait_result_t) {
                 lastCounter = counter;
                 s->lastType = type;
                 if (type != 2 && type != 4) break;
-                // Retire truly stale generations before accepting fresh measured positions.
                 const uint64_t nowUs=touchUs(readTime);
-                expireTouchStream(engine,*s->timeline,readTime,counter);
                 native_touch_valid = native_touch_valid + 1;
                 const uint64_t processAt = touchTicks();
                 native_touch_kind_stats[0] = native_touch_kind_stats[0] + 1;

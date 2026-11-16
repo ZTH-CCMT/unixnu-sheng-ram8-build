@@ -15,6 +15,8 @@ struct TouchEngine {
     nvt_touch_core *core;
     nvt_partial_state *partial;
     uint64_t streamUs, mutualUs, previousUs;
+    uint16_t streamCounter=0;
+    bool haveStreamCounter=false;
     unsigned partialFrames, partialPositions, partialRejected, transportCancelled;
     bool isPartial;
     struct CoverageFacts {
@@ -77,20 +79,36 @@ struct TouchEngine {
         if(previousUs && nowUs<previousUs) {
             resetPartial();
             streamUs=mutualUs=0;
+            haveStreamCounter=false;
         }
         previousUs=nowUs;
+    }
+    int finishFrame(uint64_t nowUs,nvt_contact *out,int max,int observed,int before=-1) {
+        const int expired=nvt_touch_expire(core,nowUs,out,max);
+        if(expired>=0)return expired;
+        return observed>=0 || before<0 ? observed : before;
     }
     int frame(const uint8_t *raw,size_t rawLength,uint64_t nowUs,int16_t *matrix,nvt_contact *out,int max) {
         isPartial=false;
         if(!core || !raw || rawLength!=NVT_THP_FRAME_LEN || !matrix || !out || !nvt_frame_header_valid(raw))return Rejected;
         const unsigned type=nvt_frame_type(raw);
         if(type!=2 && type!=4)return Rejected;
-        clock(nowUs);streamUs=nowUs;++sampleToken;
+        core->cancelled_ids=0;
+        // A clock reset ends the old epoch before considering the new one.
+        int before=-1;
+        if(core->clock_valid && nowUs<core->now_us)before=nvt_touch_expire(core,nowUs,out,max);
+        clock(nowUs);
+        const uint64_t previousFrameUs=streamUs;
+        const uint16_t counter=static_cast<uint16_t>(nvt_frame_counter(raw));
+        const bool adjacent=haveStreamCounter && nowUs>previousFrameUs &&
+            static_cast<uint16_t>(counter-streamCounter)==1;
+        streamCounter=counter;haveStreamCounter=true;
+        streamUs=nowUs;++sampleToken;
         if(nvt_frame_is_stylus(raw)) {
             isPartial=true;++partialFrames;
-            if(!partial)return SpecialP;
+            if(!partial)return finishFrame(nowUs,out,max,SpecialP,before);
             const unsigned block=raw[332];
-            if(block<1 || block>4){++partialRejected;return SpecialP;}
+            if(block<1 || block>4){++partialRejected;return finishFrame(nowUs,out,max,SpecialP,before);}
             // Complete supported peaks use the exact ordinary-M candidate path.
             // A clipped peak is excluded here, and may be localized by K below.
             int16_t rows[600];
@@ -114,19 +132,22 @@ struct TouchEngine {
                 const int fitted=nvt_touch_process_partial(core,measured,count,nowUs,out,max);
                 if(fitted>=0){result=fitted;partialPositions+=static_cast<unsigned>(count);}
             }
-            const int negative=coveredNegative(raw,nowUs,out,max);
+            const int negative=coverageProvider ? coveredNegative(raw,nowUs,out,max) :
+                adjacent ? nvt_touch_quiet_stripe(core,rows,static_cast<int>((block-1)*10),10,
+                                                  previousFrameUs,nowUs,out,max) : -1;
             if(negative>=0)result=negative;
             if(result<0)++partialRejected;
-            return result>=0?result:SpecialP;
+            return finishFrame(nowUs,out,max,result>=0?result:SpecialP,before);
         }
         mutualUs=nowUs;
         nvt_frame_matrix(raw,matrix);
         const int result=nvt_touch_process_timed(core,matrix,type,nowUs,out,max);
         if(partial)nvt_partial_seed(partial,core,matrix,nowUs);
-        return result;
+        return finishFrame(nowUs,out,max,result,before);
     }
     int expire(uint64_t nowUs,nvt_contact *out,int max) {
         clock(nowUs);
+        if(core)core->cancelled_ids=0;
         const unsigned long before=core?core->observation_cancelled:0;
         const int result=nvt_touch_expire(core,nowUs,out,max);
         if(core && streamUs && nowUs>=streamUs && nowUs-streamUs>=NVT_OBSERVATION_MAX_US)

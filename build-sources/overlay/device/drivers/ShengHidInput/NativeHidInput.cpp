@@ -33,6 +33,7 @@ extern "C" void native_buttons_set_sink(void (*)(void *, uint32_t), void *) __at
 // Optional touch digitizer fed by the board touch probe (kits/sheng/TouchProbe.cpp): finger set published with a seqlock.
 extern "C" {
 extern volatile uint32_t native_touch_seq, native_touch_count, native_touch_hid_reports;
+extern volatile uint32_t native_touch_cancelled_ids;
 // Original complete-frame receive ticks. Producer updates this inside the same
 // seqlock as coordinates; buffered origin/latest reports retain their own time.
 extern volatile uint64_t native_touch_time_ticks;
@@ -54,12 +55,12 @@ static const unsigned char descriptor[]={
     0x75,0x01,0x95,0x04,0x81,0x02,
     0x75,0x04,0x95,0x01,0x81,0x03,0xc0
 };
-// Report 3: ten-finger Touch Screen collection (Tip Switch, Touch Valid, Contact Identifier, X, Y per finger, then Contact Count).
+// Report 3: ten-finger Touch Screen collection (Tip, Touch Valid, Untouch, ID, X/Y, and Contact Count).
 // Touch Valid (0x47) is the finger confidence: IOHIDEventDriver turns a finger transducer whose value is 0 into a hand (palm), which
 // multi-finger and system edge gestures ignore, so every finger, down or lifting, sends 1.
 // Coordinates are normalised to 0..32767 on both axes by the producer.
 #define FINGER_DESC \
-    0x09,0x22,0xa1,0x02, 0x09,0x42,0x15,0x00,0x25,0x01,0x75,0x01,0x95,0x01,0x81,0x02, 0x09,0x47,0x81,0x02, 0x75,0x06,0x95,0x01,0x81,0x03, \
+    0x09,0x22,0xa1,0x02, 0x09,0x42,0x15,0x00,0x25,0x01,0x75,0x01,0x95,0x01,0x81,0x02, 0x09,0x47,0x81,0x02, 0x09,0x34,0x81,0x02, 0x75,0x05,0x95,0x01,0x81,0x03, \
     0x09,0x51,0x75,0x08,0x95,0x01,0x15,0x00,0x26,0xff,0x00,0x81,0x02, \
     0x05,0x01,0x09,0x30,0x15,0x00,0x26,0xff,0x7f,0x75,0x10,0x95,0x01,0x81,0x02, 0x09,0x31,0x81,0x02, 0x05,0x0d, 0xc0,
 static const unsigned char touchDescriptor[]={
@@ -277,6 +278,7 @@ class NativeHidInput : public IOHIDDevice {
 #endif
     }
     uint32_t lastSeq=0;
+    unsigned cancelSent=0;
     // Fingers sent as down in the previous report; a vanished identifier gets one explicit tip-up report.
     int prevIds[TOUCH_FINGERS]={-1,-1,-1,-1,-1,-1,-1,-1,-1,-1};
     int prevX[TOUCH_FINGERS]={},prevY[TOUCH_FINGERS]={};
@@ -302,12 +304,14 @@ class NativeHidInput : public IOHIDDevice {
         if((before&1) || before==self->lastSeq)return;
         __asm__ volatile("dmb ish":::"memory");
         const uint64_t originalTicks=native_touch_time_ticks;
+        const uint32_t cancelledIds=native_touch_cancelled_ids;
         unsigned count=native_touch_count;if(count>TOUCH_FINGERS)count=TOUCH_FINGERS;
         int ids[TOUCH_FINGERS],xs[TOUCH_FINGERS],ys[TOUCH_FINGERS];
         for(unsigned i=0;i<count;++i){ids[i]=native_touch_ids[i];xs[i]=native_touch_xs[i];ys[i]=native_touch_ys[i];}
         __asm__ volatile("dmb ish":::"memory");
         if(native_touch_seq!=before)return;      // torn snapshot: next notification may retry
         struct nht_state acknowledged={};acknowledged.sequence=self->lastSeq;
+        acknowledged.cancel_sent=self->cancelSent;
         for(unsigned i=0;i<TOUCH_FINGERS;++i)if(self->prevIds[i]>=0) {
             const unsigned j=acknowledged.count++;
             acknowledged.point[j]={self->prevIds[i],self->prevX[i],self->prevY[i]};
@@ -315,7 +319,7 @@ class NativeHidInput : public IOHIDDevice {
         struct nht_point current[TOUCH_FINGERS];
         for(unsigned i=0;i<count;++i)current[i]={ids[i]&0xff,(int)transformCoordinate(xs[i],30480),(int)transformCoordinate(ys[i],20320)};
         struct nht_plan plan;
-        const int packets=nht_build(&acknowledged,current,count,before,&plan);
+        const int packets=nht_build_with_cancel(&acknowledged,current,count,before,cancelledIds,&plan);
         if(packets<0)return;   // impossible duplicate/out-of-range producer state is not acknowledged
         if(!packets) {self->lastSeq=before;native_touch_ack_seq=before;return;} // both acknowledged/current sets empty
         for(unsigned phase=0;phase<(unsigned)packets;++phase) {
@@ -326,7 +330,8 @@ class NativeHidInput : public IOHIDDevice {
             native_hid_input_observed(6,result);
             native_touch_hid_reports=native_touch_hid_reports+1;
             if(result!=kIOReturnSuccess)return; // API error can be ambiguous; no successful ACK invented
-            if(packet.ups && sheng_layout_touch_up)sheng_layout_touch_up(originalTicks,before,phase,packet.ups);
+            if(packet.ups && !acknowledged.cancel_sent && sheng_layout_touch_up)
+                sheng_layout_touch_up(originalTicks,before,phase,packet.ups);
             if(!nht_commit(&acknowledged,&plan,phase,1))return;
             // Preserve each successful phase, especially if phase2 fails. The
             // final snapshot sequence advances only after its final packet ACK.
@@ -335,6 +340,7 @@ class NativeHidInput : public IOHIDDevice {
                 if(j<acknowledged.count){self->prevX[j]=acknowledged.point[j].x;self->prevY[j]=acknowledged.point[j].y;}
             }
             self->lastSeq=acknowledged.sequence;
+            self->cancelSent=acknowledged.cancel_sent;
             native_touch_ack_seq=self->lastSeq;
             if(packet.downs>=2)edge::native_touch_hid_multi[0]=edge::native_touch_hid_multi[0]+1;
             if(packet.downs>edge::native_touch_hid_multi[1])edge::native_touch_hid_multi[1]=packet.downs;

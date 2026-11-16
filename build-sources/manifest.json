@@ -136,13 +136,13 @@
       "repository": "device/drivers/ShengHidInput",
       "path": "NativeHidInput.cpp",
       "before_sha256": "c0964bf7faa0332ce8d6334f2b74a271b269eee14112ae89b4453091604a10f6",
-      "sha256": "3c2bb2427d045d3921fb1d7f2c7aba59310ee00f6fe75bcbdedf27adc37523b9"
+      "sha256": "b80795c9464c4d1671e5be8f7061e01cb17e9985c3589377c3d35bc487644ca7"
     },
     "device/drivers/ShengHidInput/NativeHidTouchPlan.h": {
       "repository": "device/drivers/ShengHidInput",
       "path": "NativeHidTouchPlan.h",
       "before_sha256": null,
-      "sha256": "b11592c16e451d7e37c7e3cb8505503e2737659a3c27648a64ec1016f8b2fd07"
+      "sha256": "70d6e3b67d8ce987be1a0d7b800b0ef77c250040819b812529433469456bdaae"
     },
     "device/drivers/ShengHidInput/README.md": {
       "repository": "device/drivers/ShengHidInput",
@@ -208,13 +208,13 @@
       "repository": "device/drivers/ShengNovatekTouch",
       "path": "NvtTouchCore.c",
       "before_sha256": "9a972542ebcc3e53fc2470f2f4526f16a1f3a144989b1167d22fbbcdf75112b4",
-      "sha256": "a067b9ef18fa9f312732fcfc89890230293f595cb03d09a360b1c1e019f0391b"
+      "sha256": "d4a08e1330e50e4982f00d987a42e94173b15c926ddd031a18079ed34a8c2b63"
     },
     "device/drivers/ShengNovatekTouch/NvtTouchCore.h": {
       "repository": "device/drivers/ShengNovatekTouch",
       "path": "NvtTouchCore.h",
       "before_sha256": "d3bb77c1b7e47a00defce855d1c7b2e55c542eb8068a488722afcbcd3201d08e",
-      "sha256": "81a58af8dd0beb99029130842597a27a57269a1bae0a86b5c249b02dd0b05a1e"
+      "sha256": "9f88a3de50d735969fd30f4a0fb4e42152417db85cfe7e4d9155963b1f984c25"
     },
     "device/drivers/ShengNovatekTouch/README.md": {
       "repository": "device/drivers/ShengNovatekTouch",
@@ -256,19 +256,19 @@
       "repository": "device",
       "path": "package/TouchEngine.h",
       "before_sha256": null,
-      "sha256": "4003ba3fd5cdd8e76b6ebf4263c0e9c86607ad49aa581b57f7278f715495b937"
+      "sha256": "124a7a1bd2e2cbd9f2f581a3201722c82c931bfdb222671e21f9b6c5b7fe2d9f"
     },
     "device/package/TouchProbe.cpp": {
       "repository": "device",
       "path": "package/TouchProbe.cpp",
       "before_sha256": "4c79c17125fbc7f45ca97fda37dc8e67b30c77b51c3c1fc4721660084cde4902",
-      "sha256": "968bdcd70d0fe243d8b5331164e296fbc4745f163ebf9a4deea5bcccdf43b1f0"
+      "sha256": "8a14006e7fd2c50103d2d08c92eb68fed6a76c2865adb4d0ff6ed863593bee38"
     },
     "device/package/TouchReportTimeline.h": {
       "repository": "device",
       "path": "package/TouchReportTimeline.h",
       "before_sha256": null,
-      "sha256": "4a654d48aef1930f270b32c16b75d60c8ac2a82d10f9619863e4f8fde128d95d"
+      "sha256": "ebb4ec44ce19c5c07610d8fdbdb2dd080c605079e261768a8eaec9d68c8b3a21"
     },
     "device/scripts/build-gop-legacy-display-27.py": {
       "repository": "device",
@@ -511,6 +511,6 @@
       "sha256": "3190862efb02eca7d6c024f4011d40ed5df4bb2a400d90f6ec156d0a9f793d6f"
     }
   },
-  "candidate_version": "V6.1-BCD",
+  "candidate_version": "V6.3",
   "base_actions_run": 43140807984
 }
