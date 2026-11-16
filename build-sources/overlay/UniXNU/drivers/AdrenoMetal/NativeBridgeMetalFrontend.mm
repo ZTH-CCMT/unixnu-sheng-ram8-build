@@ -5362,9 +5362,10 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
  using ull=unsigned long long;
  // Turnip's own counters, once the runtime has loaded it.
  static void *turnip;
- static void (*cacheStats)(uint64_t *),(*modeStats)(uint64_t *),(*sideStats)(uint64_t *);
+ static void (*cacheStats)(uint64_t *),(*commandBoStats)(uint64_t *),(*modeStats)(uint64_t *),(*sideStats)(uint64_t *);
  if(!turnip && !gLoaderPath.empty() && (turnip=dlopen(gLoaderPath.c_str(),RTLD_NOW|RTLD_NOLOAD))) {
   cacheStats=(void (*)(uint64_t *))dlsym(turnip,"tu_darwin_bo_cache_stats");
+  commandBoStats=(void (*)(uint64_t *))dlsym(turnip,"tu_darwin_cs_bo_stats");
   modeStats=(void (*)(uint64_t *))dlsym(turnip,"tu_render_mode_stats");
   sideStats=(void (*)(uint64_t *))dlsym(turnip,"tu_gmem_side_stats");
  }
@@ -5380,6 +5381,11 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
    row("MEM pool %llu(%llu) empty %llu ded %llu imp %llu alloc %llu | blk %llu/%llu gp %llu-%llu | tuc %llu/%llu n%llu/%llu",
     (ull)(mc[0]>>20),(ull)(mc[1]>>20),(ull)(mc[2]>>20),(ull)(mc[3]>>20),(ull)(mc[4]>>20),(ull)(mc[5]>>20),(ull)mc[6],(ull)mc[7],
     (ull)mc[8],(ull)mc[9],(ull)(bc[5]>>20),(ull)(bc[6]>>20),(ull)bc[2],(ull)bc[3]);
+  }
+  if(commandBoStats) {
+   uint64_t cs[3]={};
+   commandBoStats(cs);
+   row("CS BO mapped %llu unmapped %llu miss %llu",(ull)cs[0],(ull)cs[1],(ull)cs[2]);
   }
   // The same blocks by size (nmb_device_memory_kinds): how many of at most 16, 32, 40, 48, 56 and 64 MiB and of more, for the
   // pooled blocks in use and those kept empty (MK), the spare image blocks and the dedicated blocks of an image, with their MiB

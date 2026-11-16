@@ -421,6 +421,53 @@ bool NativeAdrenoSubmit::fenceProgress(uint32_t *submitted,uint32_t *retired,uin
     if(rings){rings[0]=done[0];rings[1]=done[1];}
     *submitted=issued;*retired=prefix;return true;
 }
+IOReturn NativeAdrenoSubmit::captureScanoutTargets(const uint64_t *sortedPages,size_t count,uint32_t targets[2])
+{
+    if(!attached_ || poisoned_)return kIOReturnNotReady;
+    if(!preemption() || table_mode_!=2 || !vm_->hasScanoutAddressSpace())return kIOReturnUnsupported;
+    targets[0]=targets[1]=0;
+    struct AddressSpace {const NativeAdrenoVm *vm;bool mayWrite;};
+    AddressSpace inspected[32];
+    size_t inspectedCount=0,budget=16384;
+    bool checkOwned=false;
+    uint32_t completed[2]={};
+    const bool validCompletion[2]={!ring(0)->fenceValue(&completed[0]),!ring(1)->fenceValue(&completed[1])};
+    for(const auto &job:jobs_) {
+        if(!job.active)continue;
+        if(!job.vm || !job.fence || job.ring>=ring_count_)return kIOReturnNotReady;
+        if(validCompletion[job.ring] && int32_t(completed[job.ring]-job.fence)>=0)continue;
+        uint32_t &target=targets[job.ring];
+        if(target && int32_t(job.fence-target)<=0)continue;
+        if(job.write_unmaps==job.vm->writeUnmaps()) {
+            size_t at=0;
+            while(at<inspectedCount && inspected[at].vm!=job.vm)++at;
+            if(at==inspectedCount && inspectedCount<sizeof(inspected)/sizeof(inspected[0])) {
+                if(!inspectedCount)checkOwned=NativeAdrenoMemory::mayOwnScanoutPages(sortedPages,count);
+                if(!job.vm->hasScanoutAddressSpace())return kIOReturnUnsupported;
+                inspected[inspectedCount++]={job.vm,job.vm->mayWriteScanout(sortedPages,count,checkOwned,budget)};
+            }
+            if(at<inspectedCount && !inspected[at].mayWrite)continue;
+        }
+        // A removed mapping can still have writes draining from a command that used it.
+        target=job.fence;
+    }
+    return kIOReturnSuccess;
+}
+
+IOReturn NativeAdrenoSubmit::scanoutProgress(const uint32_t targets[2],uint32_t retired[2])
+{
+    if(!attached_ || poisoned_)return kIOReturnNotReady;
+    bool pending=false;
+    retired[0]=retired[1]=0;
+    for(unsigned i=0;i<2;++i) {
+        if(!targets[i])continue;
+        if(failedFence(targets[i]))return kIOReturnAborted;
+        if(i>=ring_count_ || ring(i)->fenceValue(&retired[i]))return kIOReturnNotReady;
+        pending|=int32_t(retired[i]-targets[i])<0;
+    }
+    return pending?kIOReturnTimeout:kIOReturnSuccess;
+}
+
 bool NativeAdrenoSubmit::fencePending(uint32_t fence)
 {
     if(!attached_ || poisoned_ || !fence)return false;
@@ -706,6 +753,7 @@ IOReturn NativeAdrenoSubmit::submit(NativeAdrenoVm *vm,const NativeAdrenoSubmitB
     }
     for(size_t i=0;i<handle_count;++i)job->handles[i]=handles[i];
     job->count=handle_count;job->fence=value;job->queue=queue;job->active=true;job->vm_next=vm_->nextHandle();job->vm=vm;
+    job->write_unmaps=vm->writeUnmaps();
     job->context=target->context();job->word_count=word_count;job->ring=uint8_t(index);
     job->priority=int8_t(next_priority_);job->role=uint8_t(next_role_);
     job->ib_bytes=(uint32_t)(ib_bytes>UINT32_MAX?UINT32_MAX:ib_bytes);

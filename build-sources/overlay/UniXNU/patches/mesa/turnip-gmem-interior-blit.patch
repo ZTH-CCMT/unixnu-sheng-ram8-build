@@ -1,0 +1,205 @@
+diff --git a/src/freedreno/vulkan/tu_clear_blit.cc b/src/freedreno/vulkan/tu_clear_blit.cc
+--- a/src/freedreno/vulkan/tu_clear_blit.cc
++++ b/src/freedreno/vulkan/tu_clear_blit.cc
+@@ -5619,9 +5619,18 @@
+              enum a6xx_blit_event_type blit_event_type,
+              bool scissor_per_layer,
+              bool align_scissor,
+-             bool separate_stencil)
++             bool separate_stencil,
++             bool interior_only = false)
+ {
+    assert(blit_event_type != BLIT_EVENT_CLEAR);
++   if (interior_only) {
++      const VkExtent2D extent = cmd->state.rp.gmem_blit_interior;
++      tu_cs_emit_regs(cs,
++                      A6XX_RB_RESOLVE_CNTL_1(.x = 0, .y = 0),
++                      A6XX_RB_RESOLVE_CNTL_2(.x = extent.width - 1,
++                                            .y = extent.height - 1));
++   }
++
+    uint32_t clear_mask = 0;
+    tu_note_gmem_side(cmd, iview, blit_event_type == BLIT_EVENT_LOAD ? 4 : 5,
+                      iview->image->layout[0].tile_mode == TILE6_LINEAR, false, 0xff);
+@@ -5682,6 +5691,9 @@
+       event_blit_run<CHIP>(cmd, cs, attachment, &blt_view, separate_stencil, true);
+    }
+ 
++   if (interior_only)
++      tu6_emit_blit_scissor(cmd, cs, 0, true);
++
+    tu_flush_for_access(&cmd->state.cache, TU_ACCESS_BLIT_WRITE_GMEM,
+                        TU_ACCESS_NONE);
+ }
+@@ -5780,6 +5792,46 @@
+           (iview->view.width % info->gmem_align_w || iview->view.height % info->gmem_align_h);
+ }
+ 
++/* The event blit can round past an imported image's edge. For a full-size
++ * single-layer BGRA target, use it only on bins wholly inside the aligned
++ * rectangle. The exact load/store still covers every bin crossing that edge.
++ */
++static bool
++tu_enable_gmem_interior_blit(struct tu_cmd_buffer *cmd,
++                             const struct tu_image_view *iview)
++{
++#ifndef __APPLE__
++   return false;
++#endif
++   const struct tu_physical_device *phys_dev = cmd->device->physical_device;
++   const struct tu_framebuffer *fb = cmd->state.framebuffer;
++   const VkRect2D &area = cmd->state.render_areas[0];
++   if (phys_dev->dev_id.gpu_id != 740 || cmd->state.pass->has_fdm ||
++       cmd->state.pass->num_views > 1 || fb->layers != 1 ||
++       cmd->state.per_layer_render_area ||
++       iview->vk.format != VK_FORMAT_B8G8R8A8_UNORM ||
++       iview->view.is_mutable || iview->image->vk.samples != VK_SAMPLE_COUNT_1_BIT ||
++       area.offset.x != 0 || area.offset.y != 0 ||
++       area.extent.width != fb->width || area.extent.height != fb->height ||
++       iview->view.width != fb->width || iview->view.height != fb->height ||
++       !tu_attachment_unpadded(cmd, iview))
++      return false;
++
++   const auto *info = phys_dev->info;
++   const VkExtent2D interior = {
++      fb->width - fb->width % info->gmem_align_w,
++      fb->height - fb->height % info->gmem_align_h,
++   };
++   const auto &tile = cmd->state.tiling->tile0;
++   if (!tile.width || !tile.height || tile.width > interior.width ||
++       tile.height > interior.height || tile.width % info->gmem_align_w ||
++       tile.height % info->gmem_align_h)
++      return false;
++
++   cmd->state.rp.gmem_blit_interior = interior;
++   return true;
++}
++
+ template <chip CHIP>
+ static void
+ load_3d_blit(struct tu_cmd_buffer *cmd,
+@@ -5938,28 +5990,44 @@
+    if (cond_exec)
+       tu_begin_load_store_cond_exec(cmd, cs, true);
+ 
+-   if (TU_DEBUG(3D_LOAD) ||
+-       cmd->state.pass->has_fdm ||
+-       tu_attachment_unpadded(cmd, iview) ||
+-       /* Replicating unresolve seems to not work and the blob never uses it.
+-        */
+-       (a != gmem_a)) {
+-      if (load_common || load_stencil)
+-         tu_disable_draw_states(cmd, cs);
++   const bool split_load = CHIP == A7XX && a == gmem_a && !force_load &&
++      load_common && !load_stencil && !TU_DEBUG(3D_LOAD) &&
++      tu_enable_gmem_interior_blit(cmd, iview);
++   /* Replicating unresolve needs a draw. */
++   const bool use_draw = TU_DEBUG(3D_LOAD) || cmd->state.pass->has_fdm ||
++      tu_attachment_unpadded(cmd, iview) || a != gmem_a;
++
++   if (use_draw) {
++      tu_disable_draw_states(cmd, cs);
++      if (split_load)
++         tu_cond_exec_start(cs, CP_COND_REG_EXEC_0_MODE(PRED_TEST) |
++                            CP_COND_REG_EXEC_0_PRED_BIT(TU_PREDICATE_NO_FAST_STORE));
+ 
+       if (load_common)
+          load_3d_blit<CHIP>(cmd, cs, iview, attachment, false);
+ 
+       if (load_stencil)
+          load_3d_blit<CHIP>(cmd, cs, iview, attachment, true);
+-   } else {
++
++      if (split_load)
++         tu_cond_exec_end(cs);
++   }
++
++   if (!use_draw || split_load) {
++      if (split_load)
++         tu_cond_exec_start(cs, CP_COND_REG_EXEC_0_MODE(PRED_TEST) |
++                            CP_COND_REG_EXEC_0_PRED_BIT(TU_PREDICATE_FAST_STORE));
++
+       if (load_common)
+          tu_emit_blit<CHIP>(cmd, cs, resolve_group, iview, attachment, NULL,
+-                            BLIT_EVENT_LOAD, per_layer_render_area, true, false);
++                            BLIT_EVENT_LOAD, per_layer_render_area, true, false, split_load);
+ 
+       if (load_stencil)
+          tu_emit_blit<CHIP>(cmd, cs, resolve_group, iview, attachment, NULL,
+                             BLIT_EVENT_LOAD, per_layer_render_area, true, true);
++
++      if (split_load)
++         tu_cond_exec_end(cs);
+    }
+ 
+    if (cond_exec)
+@@ -6422,12 +6490,16 @@
+    bool store_common = dst->store && !resolve_d32s8_s8;
+    bool store_separate_stencil = dst->store_stencil || resolve_d32s8_s8;
+ 
+-   bool use_fast_path = !unaligned && !mismatched_mutability &&
++   const bool split_store = CHIP == A7XX && unaligned && !resolve &&
++      store_common && !store_separate_stencil && !TU_DEBUG(UNALIGNED_STORE) &&
++      tu_enable_gmem_interior_blit(cmd, dst_iview);
++   bool use_fast_path = (!unaligned || split_store) && !mismatched_mutability &&
+                         !resolve_d24s8_s8 &&
+                         (a == gmem_a || blit_can_resolve(dst->format)) &&
+                         (!cmd->state.pass->has_fdm || CHIP >= A7XX);
+ 
+-   bool fast_path_conditional = use_fast_path && cmd->state.pass->has_fdm;
++   bool fast_path_conditional =
++      use_fast_path && (cmd->state.pass->has_fdm || split_store);
+ 
+    trace_start_gmem_store(&cmd->rp_trace, cs, cmd, dst->format, use_fast_path, unaligned);
+ 
+@@ -6448,7 +6520,7 @@
+ 
+       if (store_common)
+          tu_emit_blit<CHIP>(cmd, cs, resolve_group, dst_iview, src, clear_value,
+-                            BLIT_EVENT_STORE, per_layer_render_area, true, false);
++                            BLIT_EVENT_STORE, per_layer_render_area, true, false, split_store);
+       if (store_separate_stencil)
+          tu_emit_blit<CHIP>(cmd, cs, resolve_group, dst_iview, src, clear_value,
+                             BLIT_EVENT_STORE, per_layer_render_area, true, true);
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
+--- a/src/freedreno/vulkan/tu_cmd_buffer.cc
++++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
+@@ -1683,6 +1683,16 @@
+       tu6_emit_window_scissor<CHIP>(cs, x1, y1, x2 - 1, y2 - 1);
+    }
+    tu6_emit_window_offset<CHIP>(cs, x1, y1);
++
++   const VkExtent2D interior = cmd->state.rp.gmem_blit_interior;
++   if (CHIP == A7XX && interior.width) {
++      const bool fast = MIN2(x2, fb->width) <= interior.width &&
++                        MIN2(y2, fb->height) <= interior.height;
++      tu7_set_pred_mask(cs, (1u << TU_PREDICATE_FAST_STORE) |
++                           (1u << TU_PREDICATE_NO_FAST_STORE),
++                           1u << (fast ? TU_PREDICATE_FAST_STORE :
++                                         TU_PREDICATE_NO_FAST_STORE));
++   }
+ 
+    unsigned slot = ffs(tile->slot_mask) - 1;
+ 
+@@ -6431,6 +6441,8 @@
+    dst->sysmem_single_prim_mode |= src->sysmem_single_prim_mode;
+    dst->draw_cs_writes_to_cond_pred |= src->draw_cs_writes_to_cond_pred;
+    dst->shared_viewport |= src->shared_viewport;
++   if (src->gmem_blit_interior.width)
++      dst->gmem_blit_interior = src->gmem_blit_interior;
+ 
+    dst->drawcall_bandwidth_per_sample_sum +=
+       src->drawcall_bandwidth_per_sample_sum;
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.h b/src/freedreno/vulkan/tu_cmd_buffer.h
+--- a/src/freedreno/vulkan/tu_cmd_buffer.h
++++ b/src/freedreno/vulkan/tu_cmd_buffer.h
+@@ -325,6 +325,9 @@
+ 
+    /* Track whether conditional predicate for COND_REG_EXEC is changed in draw_cs */
+    bool draw_cs_writes_to_cond_pred;
++
++   /* Aligned interior of a full-size imported GMEM attachment, or zero. */
++   VkExtent2D gmem_blit_interior;
+ 
+    uint32_t drawcall_count;
+ 

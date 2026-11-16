@@ -93,6 +93,7 @@ private:
         bool active=false;
         bool abort_on_reset=false;
         uint64_t vm_next=0;   /* NativeAdrenoVm::nextHandle() at submission: a mapping with a handle from it on came later */
+        uint64_t write_unmaps=0;
         NativeAdrenoVm *vm=nullptr;   /* the GPU address space (process page table) the job's buffers belong to */
         uint32_t context=0;           /* the ring context it ran in (NativeAdrenoRing::useContext) */
         uint64_t submit_us=0;         /* the clock when the write pointer moved (0: no clock), and the GPU level then (native_gpu_dcvs) */
@@ -229,6 +230,8 @@ public:
      * the scanout's prefix. False for everything else (a retired or unknown fence, a poisoned object), where wait() has the answer.
      * No side effect: the check of a waiter before it sleeps and of the completion pass that wakes it. */
     bool fencePending(uint32_t fence);
+    IOReturn captureScanoutTargets(const uint64_t *sortedPages,size_t count,uint32_t targets[2]);
+    IOReturn scanoutProgress(const uint32_t targets[2],uint32_t retired[2]);
     /* The switch counters, the ring the CP runs, whether a switch is in flight and the control register as the hardware holds it. */
     /* A word of ring `index`'s preemption record as the CPU sees it now (the CP saves the read pointer, info and errno there). */
     uint32_t recordWord(unsigned index,uint32_t byte_offset) const

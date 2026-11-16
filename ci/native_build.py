@@ -18,11 +18,11 @@ PROFILE = 'ipados-27.0.1-24A446'
 DUMMY_CHIP = '13579bdf'
 RAM_BYTES = 8 * 1024**3
 DATA_BYTES = 215 * 1024**3
-VERSION = 'V5.4.2-WPTR-GMU'
-GPU_SOURCE_SHA = '5b4b2291339a83a00bcbe122f397a95ccffc69d6e10982ce48b0525c050e67de'
+VERSION = 'V6.1-BCD'
+GPU_SOURCE_SHA = 'f0844784f63017995861fb9554986ad613bcd43092e3b5b4dd1e85d804c29040'
 GPU_BOARD_SHA = {'GpuPowerProbe.cpp': 'fd964d7b7f771daa22c41b4c7cbcfd82d80489ef5b2383f2b896a876a8c9d97b', 'GpuSqeCapture.h': '0aaa5455e3f992ce53a8d61b1e5cf0bb04834e1e39ca4c6ba74f04ffcdd3f8c4', 'BootLog.c': 'fd1f3e05ebfdf331f3dcbe5cfe8f68d19eeef394a74dbf0f50ed179362859dad'}
 TURNIP_KMD = 'src/freedreno/vulkan/tu_knl_darwin.cc'
-TURNIP_KMD_SHA = '28dbfb342333cbfc70da733ad26102ed64ec502ca002f12c0940a7175627df1c'
+TURNIP_KMD_SHA = 'ef48eb2ee59b19c362592b5e3eea6c5453f00dde227b14b0ccfc03123cdb2ec6'
 SEED_SHA = 'e1bfa6971ef9fe6a27b53474c509cd518325459484230daf7f679642a04323b3'
 XNU_DEFAULT_CFLAGS = (
     '-Wno-reserved-identifier -Wno-pre-c11-compat -Wno-missing-designated-field-initializers '
@@ -120,6 +120,7 @@ def property_bytes(name, value):
 
 
 GPU_EVIDENCE_SYMBOL = '_native_adreno_switch_evidence_copy'
+SCANOUT_WAIT_SYMBOL = '_native_adreno_scanout_wait'
 
 
 def archived_object(archive, obj):
@@ -177,7 +178,7 @@ def gpu_diagnostic_symbols(tree, kernel):
     require(symbol_command is not None, 'Packaged kernel lacks a symbol table')
     symoff, count, stroff, _ = struct.unpack_from('<4I', raw, symbol_command[0] + 8)
     names = ('_native_adreno_reset_epoch', '_native_adreno_switch_timeout_copy',
-             GPU_EVIDENCE_SYMBOL)
+             GPU_EVIDENCE_SYMBOL, SCANOUT_WAIT_SYMBOL)
     found = {name.encode(): [] for name in names}
     for index in range(count):
         strx, kind, _, desc, address = struct.unpack_from('<IBBHQ', raw, symoff + 16 * index)
@@ -196,6 +197,8 @@ def gpu_diagnostic_symbols(tree, kernel):
         section = image.section(address)
         require(section and (section['segment'], section['name']) == ('__TEXT_EXEC', '__text'),
                 f'{name} is not executable kernel code')
+        if name == SCANOUT_WAIT_SYMBOL:
+            require((desc & 0x0080) == 0, 'Packaged surface fence wait must link strongly')
         if name == GPU_EVIDENCE_SYMBOL:
             require((desc & 0x0080) == 0, 'Packaged Adreno evidence copy resolved to the weak fallback')
             instructions = list(struct.unpack('<3I', image.read(address, 12)))
@@ -292,8 +295,8 @@ def main():
     require(gpu_trace['source_sha256'] == GPU_SOURCE_SHA
             and gpu_trace['trace_source_id'] == GPU_SOURCE_SHA[:16]
             and gpu_trace['target'] == 'arm64e-apple-ios27.0',
-            'Compiled Adreno source identity differs from the V5.3 candidate')
-    print(f'Adreno V5.3 source ID {gpu_trace["trace_source_id"]}', flush=True)
+            'Compiled Adreno source identity differs from the declared candidate')
+    print(f'Adreno {VERSION} source ID {gpu_trace["trace_source_id"]}', flush=True)
 
     stage = top / 'os27-ram8-handoff.partial'
     stage.mkdir()
@@ -311,7 +314,7 @@ def main():
     fat_readback(payload, 'Payloads/kernel.macho', payload_kernel)
     require(digest(payload_kernel) == payload_info['payload_kernel_sha256'], 'Packed kernel digest differs')
     gpu_objects = gpu_evidence_objects(tree)
-    gpu_reset_address, gpu_timeout_address, gpu_evidence_address = gpu_diagnostic_symbols(tree, payload_kernel)
+    gpu_reset_address, gpu_timeout_address, gpu_evidence_address, gpu_scanout_address = gpu_diagnostic_symbols(tree, payload_kernel)
     gpu_link_path = stage / 'gpu-sqe-link-evidence.json'
     gpu_objects.update(status='VERIFIED_STRONG_PACKAGED_GPU_SQE_COPY',
                        packaged_symbol=gpu_evidence_address,
@@ -319,6 +322,7 @@ def main():
     gpu_link_path.write_text(json.dumps(gpu_objects, indent=2) + '\n')
     print(f'GPU SQE evidence copy linked strongly at {gpu_evidence_address}', flush=True)
     print(f'GPU reset generation linked in packaged kernel at {gpu_reset_address}', flush=True)
+    print(f'GPU surface fence wait linked in packaged kernel at {gpu_scanout_address}', flush=True)
     payload_kernel.unlink()
     for label, member in (('gpu_addon', 'kernel.macho.gpuaddon'),
                           ('trust_cache', 'kernel.macho.trustcache')):
@@ -366,6 +370,7 @@ def main():
         'candidate_version': VERSION, 'gpu_reset_epoch_symbol': gpu_reset_address,
         'gpu_switch_timeout_copy_symbol': gpu_timeout_address,
         'gpu_switch_evidence_copy_symbol': gpu_evidence_address,
+        'gpu_scanout_wait_symbol': gpu_scanout_address,
         'gpu_sqe_link_evidence_sha256': digest(gpu_link_path),
         'gpu_board_source_sha256': GPU_BOARD_SHA,
         'gpu_source_sha256': GPU_SOURCE_SHA,

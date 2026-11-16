@@ -181,6 +181,25 @@ diff --git a/src/freedreno/vulkan/tu_device.h b/src/freedreno/vulkan/tu_device.h
  
     struct tu_queue *queues[TU_MAX_QUEUE_FAMILIES];
     int queue_count[TU_MAX_QUEUE_FAMILIES];
+diff --git a/src/freedreno/vulkan/tu_cs.cc b/src/freedreno/vulkan/tu_cs.cc
+--- a/src/freedreno/vulkan/tu_cs.cc
++++ b/src/freedreno/vulkan/tu_cs.cc
+@@ -167,9 +167,10 @@ tu_cs_add_bo(struct tu_cs *cs, uint32_t size)
++   enum tu_bo_alloc_flags flags = (enum tu_bo_alloc_flags)(
++      COND(!cs->writeable, TU_BO_ALLOC_GPU_READ_ONLY) | TU_BO_ALLOC_ALLOW_DUMP);
++#ifdef TU_HAS_DARWIN
++   flags = (enum tu_bo_alloc_flags)(flags | TU_BO_ALLOC_PREFER_CPU_MAPPED);
++#endif
+    VkResult result =
+-      tu_bo_init_new(cs->device, NULL, &new_bo, size * sizeof(uint32_t),
+-                     (enum tu_bo_alloc_flags)(COND(!cs->writeable,
+-                                                   TU_BO_ALLOC_GPU_READ_ONLY) |
+-                                              TU_BO_ALLOC_ALLOW_DUMP),
+-                     cs->name);
++      tu_bo_init_new(cs->device, NULL, &new_bo, size * sizeof(uint32_t), flags, cs->name);
+    if (result != VK_SUCCESS) {
+       return result;
+    }
 diff --git a/src/freedreno/vulkan/tu_knl.cc b/src/freedreno/vulkan/tu_knl.cc
 index ab27798..9c545c6 100644
 --- a/src/freedreno/vulkan/tu_knl.cc
@@ -221,10 +240,16 @@ index ab27798..9c545c6 100644
     return VK_ERROR_INCOMPATIBLE_DRIVER;
  #endif
 diff --git a/src/freedreno/vulkan/tu_knl.h b/src/freedreno/vulkan/tu_knl.h
-index 4c2bf6a..a8ccd76 100644
 --- a/src/freedreno/vulkan/tu_knl.h
 +++ b/src/freedreno/vulkan/tu_knl.h
-@@ -58,6 +58,16 @@ struct tu_bo {
+@@ -29,4 +29,6 @@ enum tu_bo_alloc_flags {
+    TU_BO_ALLOC_DMABUF = 1 << 4,
+    TU_BO_ALLOC_SHAREABLE = 1 << 5,
+    TU_BO_ALLOC_IMPLICIT_SYNC = 1 << 6,
++   /* The caller intends to map this BO immediately. */
++   TU_BO_ALLOC_PREFER_CPU_MAPPED = 1 << 7,
+ };
+@@ -58,6 +60,16 @@ struct tu_bo {
     int shared_fd;
  #endif
  
@@ -241,7 +266,7 @@ index 4c2bf6a..a8ccd76 100644
     bool implicit_sync : 1;
     bool never_unmap : 1;
     bool cached_non_coherent : 1;
-@@ -140,6 +147,9 @@ struct tu_knl {
+@@ -140,6 +149,9 @@ struct tu_knl {
                         const char *name);
     VkResult (*bo_init_dmabuf)(struct tu_device *dev, struct tu_bo **out_bo,
                                uint64_t size, enum tu_bo_alloc_flags flags, int prime_fd);
@@ -251,7 +276,7 @@ index 4c2bf6a..a8ccd76 100644
     int (*bo_export_dmabuf)(struct tu_device *dev, struct tu_bo *bo);
     VkResult (*bo_alloc_lazy)(struct tu_device *dev, struct tu_bo *bo);
     VkResult (*bo_map)(struct tu_device *dev, struct tu_bo *bo, void *placed_addr);
-@@ -221,6 +231,9 @@ tu_bo_init_dmabuf(struct tu_device *dev,
+@@ -221,6 +233,9 @@ tu_bo_init_dmabuf(struct tu_device *dev,
  int
  tu_bo_export_dmabuf(struct tu_device *dev, struct tu_bo *bo);
  
@@ -261,7 +286,7 @@ index 4c2bf6a..a8ccd76 100644
  void
  tu_bo_finish(struct tu_device *dev, struct tu_bo *bo);
  
-@@ -262,6 +275,7 @@ void tu_sparse_vma_finish(struct tu_device *device,
+@@ -262,6 +277,7 @@ void tu_sparse_vma_finish(struct tu_device *device,
                            struct tu_sparse_vma *vma);
  
  VkResult tu_knl_kgsl_load(struct tu_instance *instance, int fd);
@@ -271,10 +296,9 @@ index 4c2bf6a..a8ccd76 100644
  VkResult tu_knl_drm_msm_load(struct tu_instance *instance,
 diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl_darwin.cc
 new file mode 100644
-index 0000000..b03c6ee
 --- /dev/null
 +++ b/src/freedreno/vulkan/tu_knl_darwin.cc
-@@ -0,0 +1,1608 @@
+@@ -0,0 +1,1647 @@
 +/*
 + * Native Darwin kernel backend for Turnip: talks to the NativeAdreno IOKit user client (NativeAdrenoABI.h, version 1).
 + * Modelled on tu_knl_kgsl.cc (no libdrm) and tu_knl_drm_msm.cc (the client chooses GPU addresses).
@@ -360,6 +384,7 @@ index 0000000..b03c6ee
 +};
 +struct darwin_bo_cache_stats {
 +   uint64_t lookups, hits, inserts, evictions, flushes, bytes_peak;
++   uint64_t cs_mapped_hits, cs_unmapped_hits, cs_misses;
 +};
 +
 +/* The GPU address space as two red-black trees over the free holes (Mesa's rb_tree, the same algorithm as XNU's libkern/tree.h): by
@@ -409,6 +434,21 @@ index 0000000..b03c6ee
 +   out[5] = retire->cache_bytes;
 +   out[6] = retire->cache_stats.bytes_peak;
 +   out[7] = retire->va.holes;
++   pthread_mutex_unlock(&retire->lock);
++}
++
++extern "C" __attribute__((visibility("default"))) void tu_darwin_cs_bo_stats(uint64_t out[3]);
++extern "C" __attribute__((visibility("default"))) void
++tu_darwin_cs_bo_stats(uint64_t out[3])
++{
++   struct darwin_retire_state *retire = darwin_stats_state;
++   memset(out, 0, 3 * sizeof(uint64_t));
++   if (!retire)
++      return;
++   pthread_mutex_lock(&retire->lock);
++   out[0] = retire->cache_stats.cs_mapped_hits;
++   out[1] = retire->cache_stats.cs_unmapped_hits;
++   out[2] = retire->cache_stats.cs_misses;
 +   pthread_mutex_unlock(&retire->lock);
 +}
 +
@@ -852,27 +892,50 @@ index 0000000..b03c6ee
 +   return true;
 +}
 +
-+/* The most recently cached BO of a class (its pages are the warmest). A BO the caller needs zeroed must have a CPU view to zero it by. */
++/* A caller that maps immediately prefers an existing CPU view. Otherwise use
++ * the smallest compatible BO, then the most recent one of that size.
++ * Zero-filled internal resources require a CPU view on a cache hit. */
 +static bool
-+darwin_cache_get(struct darwin_retire_state *retire, uint64_t size, bool read_only, bool need_mapping, struct darwin_cached_bo *out)
++darwin_cache_get(struct darwin_retire_state *retire, uint64_t size,
++                 enum tu_bo_alloc_flags flags, struct darwin_cached_bo *out)
 +{
-+   ++retire->cache_stats.lookups;
++   const bool read_only = flags & TU_BO_ALLOC_GPU_READ_ONLY;
++   const bool need_mapping = flags & TU_BO_ALLOC_INTERNAL_RESOURCE;
++   const bool prefer_mapped = flags & TU_BO_ALLOC_PREFER_CPU_MAPPED;
++   struct darwin_bo_cache_stats *stats = &retire->cache_stats;
++   ++stats->lookups;
 +   int best = -1;
++   bool best_mapped = false;
 +   for (unsigned i = 0; i < retire->cache_count; ++i) {
 +      const struct darwin_cached_bo *e = &retire->cache[i];
-+      /* The class asked for, or a BO up to a quarter larger (the smallest such, then the most recent). */
-+      if (e->size >= size && e->size - size <= size / 4 && e->read_only == read_only && (!need_mapping || e->mapping) &&
-+          (best < 0 || e->size < retire->cache[best].size ||
-+           (e->size == retire->cache[best].size && e->stamp > retire->cache[best].stamp)))
++      if (e->size < size || e->size - size > size / 4 ||
++          e->read_only != read_only || (need_mapping && !e->mapping))
++         continue;
++
++      const bool mapped = prefer_mapped && e->mapping;
++      if (best < 0 || mapped > best_mapped ||
++          (mapped == best_mapped &&
++           (e->size < retire->cache[best].size ||
++            (e->size == retire->cache[best].size && e->stamp > retire->cache[best].stamp)))) {
 +         best = (int)i;
++         best_mapped = mapped;
++      }
 +   }
 +   if (best >= 0) {
 +      *out = retire->cache[best];
 +      retire->cache_bytes -= out->size;
 +      retire->cache[best] = retire->cache[--retire->cache_count];
-+      ++retire->cache_stats.hits;
++      ++stats->hits;
 +   }
-+   if (!(retire->cache_stats.lookups & 4095))
++   if (prefer_mapped) {
++      if (best_mapped)
++         ++stats->cs_mapped_hits;
++      else if (best >= 0)
++         ++stats->cs_unmapped_hits;
++      else
++         ++stats->cs_misses;
++   }
++   if (!(stats->lookups & 4095))
 +      darwin_cache_log(retire);
 +   return best >= 0;
 +}
@@ -1044,7 +1107,7 @@ index 0000000..b03c6ee
 +   if (cacheable) {
 +      struct darwin_cached_bo hit;
 +      pthread_mutex_lock(&retire->lock);
-+      reused = darwin_cache_get(retire, alloc_size, read_only, !!(flags & TU_BO_ALLOC_INTERNAL_RESOURCE), &hit);
++      reused = darwin_cache_get(retire, alloc_size, flags, &hit);
 +      pthread_mutex_unlock(&retire->lock);
 +      if (reused) {
 +         handle = hit.handle;

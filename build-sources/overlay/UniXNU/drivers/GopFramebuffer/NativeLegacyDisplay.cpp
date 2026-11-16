@@ -61,6 +61,7 @@ extern "C" {volatile uint32_t native_legacy_surfaces[14];}
 extern "C" {volatile uint32_t native_legacy_direct[14];}
 extern "C" bool native_adreno_fences(uint32_t *submitted,uint32_t *retired) __attribute__((weak_import));
 extern "C" bool native_adreno_fences_detail(uint32_t *,uint32_t *,uint32_t *) __attribute__((weak_import));
+extern "C" IOReturn native_adreno_scanout_wait(const uint64_t *,unsigned,bool *,uint32_t *,uint32_t *) __attribute__((weak_import));
 extern "C" uint32_t native_adreno_reset_epoch() __attribute__((weak_import));
 // The swap lifecycle: native_legacy_ring holds the newest native_legacy_ring_cap events (allocated at start: a static array of this size no longer fits the kernel's data segment), {[0] microseconds since boot (64 bit), [1] event << 56 | slot + 1 << 48 |
 // swaps validated and not retired << 40 | GPU fences outstanding << 24 | the request's tag (24 bits)}. Events: 1 swap validated, 2 fence wait
@@ -292,12 +293,15 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     // Direct scanout state, used on the work loop only. DPU 9.2 inside the MDP block (0xae01000): VIG 0 and 1 at 0x4000 and 0x6000 (source
     // address 0 at +0x14, stride 0 at +0x24; VIG 1 takes the right half through its own source x), CTL 0 at 0x15000 (flush at +0x18, VIG 0
     // and 1 are bits 0 and 1). i562: a flush of the two pipes latched within 5.4 ms with no start (the panel refreshes by itself).
-    struct DirectSlot {OSObject *surface;IOMemoryDescriptor *memory;uint32_t iova;uint64_t used,physical;};
+    struct DirectSlot {OSObject *surface;IOMemoryDescriptor *memory;uint32_t iova;uint64_t used,physical;unsigned pageCount;};
     static constexpr unsigned kDirectSlots=4;
+    static constexpr unsigned kDirectMaxPages=8192;
+    static constexpr size_t kDirectPageBytes=(1+kDirectSlots)*kDirectMaxPages*sizeof(uint64_t);
     DirectSlot directSlots[kDirectSlots]={};
     IOMemoryMap *mdpMap=nullptr;
     volatile uint32_t *mdp=nullptr;
     uint64_t *directPages=nullptr;
+    uint64_t *scanoutPages(unsigned slot) {return directPages+(slot+1)*kDirectMaxPages;}
     IOTimerEventSource *latchTimer=nullptr;
     const OriginalLegacySwapRequest *latchRequest=nullptr;
     uint64_t latchStart=0,directClock=0;
@@ -306,8 +310,9 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     // Keep the first successful fence snapshot for this request across pending and busy polls.
     const OriginalLegacySwapRequest *fenceFor=nullptr;
     uint32_t fenceTarget=0;
+    uint32_t scanoutTargets[2];
     uint64_t fenceSince=0;
-    bool fenceCaptured=false,fenceSlow=false;
+    bool fenceCaptured=false,fenceSlow=false,scanoutCaptured=false;
     IOTimerEventSource *fenceTimer=nullptr;
     bool directOn=false,directBoot=true;
     static constexpr uint32_t kVig[2]={0x4000,0x6000},kCtlFlush=0x15018,kBootIova=0xb8000000U,kBootStride=0x2fa0;
@@ -317,13 +322,13 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         IODeviceMemory *memory=IODeviceMemory::withRange(0xae01000,0x8f000);
         mdpMap=memory?memory->map(kIOMapAnywhere|kIOMapInhibitCache):nullptr;
         if(memory)memory->release();
-        directPages=static_cast<uint64_t *>(IOMallocData(8192*sizeof(uint64_t)));
+        directPages=static_cast<uint64_t *>(IOMallocData(kDirectPageBytes));
         IOWorkLoop *loop=getWorkLoop();
         latchTimer=loop?IOTimerEventSource::timerEventSource(this,&NativeLegacyDisplay::latchFired):nullptr;
         fenceTimer=loop?IOTimerEventSource::timerEventSource(this,&NativeLegacyDisplay::fenceFired):nullptr;
         if(!mdpMap || !directPages || !latchTimer || !fenceTimer || loop->addEventSource(fenceTimer)!=kIOReturnSuccess || loop->addEventSource(latchTimer)!=kIOReturnSuccess) {
             OSSafeReleaseNULL(mdpMap);OSSafeReleaseNULL(latchTimer);OSSafeReleaseNULL(fenceTimer);
-            if(directPages){IOFreeData(directPages,8192*sizeof(uint64_t));directPages=nullptr;}
+            if(directPages){IOFreeData(directPages,kDirectPageBytes);directPages=nullptr;}
             return;
         }
         mdp=reinterpret_cast<volatile uint32_t *>(mdpMap->getVirtualAddress());
@@ -348,7 +353,28 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         mdp[kCtlFlush/4]=0x3;
         __asm__ volatile("dsb sy" ::: "memory");
     }
-    // The slot that holds this surface, mapping it into a free one (never the one on screen or the one waiting to latch) the first time.
+    static void sortScanoutPages(uint64_t *pages,unsigned count) {
+        // As in ArmSmmu4K's alias check, use a bounded heap sort without allocations.
+        auto sift=[&](unsigned at,unsigned size) {
+            const uint64_t value=pages[at];
+            while(at<size/2) {
+                unsigned larger=at*2+1;
+                if(larger+1<size && pages[larger+1]>pages[larger])++larger;
+                if(pages[larger]<=value)break;
+                pages[at]=pages[larger];
+                at=larger;
+            }
+            pages[at]=value;
+        };
+        for(unsigned i=count/2;i>0;--i)sift(i-1,count);
+        for(unsigned size=count;size>1;--size) {
+            const uint64_t largest=pages[0];
+            pages[0]=pages[size-1];
+            pages[size-1]=largest;
+            sift(0,size-1);
+        }
+    }
+    // Map into a free slot on first use. The active and pending hardware slots retain their backing.
     int directSlot(OSObject *surface,IOMemoryDescriptor *memory) {
         ++directClock;
         int pick=-1;
@@ -363,42 +389,74 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
             slot.memory->complete();OSSafeReleaseNULL(slot.memory);OSSafeReleaseNULL(slot.surface);
             native_legacy_direct[6]=native_legacy_direct[6]+1;
         }
-        if(memory->getLength()>8192ull*4096 || memory->prepare()!=kIOReturnSuccess){native_legacy_direct[2]=native_legacy_direct[2]+1;return -1;}
+        const IOByteCount bytes=memory->getLength();
+        if(!bytes || bytes>uint64_t(kDirectMaxPages)*4096 || memory->prepare()!=kIOReturnSuccess){native_legacy_direct[2]=native_legacy_direct[2]+1;return -1;}
         unsigned count=0;bool ok=true;
-        for(IOByteCount offset=0;offset<memory->getLength() && ok;) {
+        for(IOByteCount offset=0;offset<bytes && ok;) {
             IOByteCount length=0;
             const addr64_t pa=memory->getPhysicalSegment(offset,&length,kIOMemoryMapperNone);
-            if(!pa || (pa&0xfff) || !length){ok=false;break;}
-            for(IOByteCount at=0;at<length && offset+at<memory->getLength();at+=4096)directPages[count++]=pa+at;
+            if(length>bytes-offset)length=bytes-offset;
+            if(!pa || (pa&0xfff) || !length || ((length&0xfff) && length<bytes-offset)){ok=false;break;}
+            for(IOByteCount at=0;at<length;at+=4096)directPages[count++]=pa+at;
             offset+=length;
         }
         const uint32_t iova=ok?native_ufs_dpu_map(unsigned(pick),directPages,count):0;
         if(!iova){memory->complete();native_legacy_direct[2]=native_legacy_direct[2]+1;return -1;}
+        unsigned pageCount=0;
+        if(&native_adreno_scanout_wait) {
+            uint64_t *sorted=scanoutPages(unsigned(pick));
+            memcpy(sorted,directPages,count*sizeof(*sorted));
+            sortScanoutPages(sorted,count);
+            pageCount=count;
+        }
         surface->retain();memory->retain();
-        slot={surface,memory,iova,directClock,directPages[0]};
+        slot={surface,memory,iova,directClock,directPages[0],pageCount};
         native_legacy_direct[1]=native_legacy_direct[1]+1;
         return pick;
     }
     // A provider's failed query is not completion. Poll without blocking the display work loop;
     // a slow GPU leaves the previous frame on screen until completion or family cancellation.
     bool traceGpuComplete=false;
-    bool gpuWrote(const OriginalLegacySwapRequest *request) {
+    bool gpuWrote(const OriginalLegacySwapRequest *request,const uint64_t *pages=nullptr,unsigned count=0) {
         traceGpuComplete=false;
         if(fenceFor!=request) {
             fenceFor=request;fenceTarget=0;fenceSince=0;fenceCaptured=false;fenceSlow=false;
+            scanoutCaptured=false;scanoutTargets[0]=scanoutTargets[1]=0;
         }
         uint32_t submitted=0,retired=0,detail[3]={0,0,4};
         // Preserve the CPU-only backend when no GPU fence interface is linked.
         if(!&native_adreno_fences_detail && !&native_adreno_fences) {
             gpuTraceEvent(GpuTraceDisplayFence,0,traceId(request),0,0,0,0,0,0,0,4);return true;
         }
-        const bool known=&native_adreno_fences_detail?native_adreno_fences_detail(&submitted,&retired,detail):
-            (&native_adreno_fences && native_adreno_fences(&submitted,&retired));
-        if(discardResetSwap(request))return false;
-        if(known && !fenceCaptured) {
-            fenceTarget=submitted;fenceCaptured=true;
+        bool known=false,complete=false,scoped=false;
+        IOReturn result=kIOReturnUnsupported;
+        if(&native_adreno_scanout_wait && !fenceCaptured && (scanoutCaptured || (pages && count))) {
+            result=native_adreno_scanout_wait(pages,count,&scanoutCaptured,scanoutTargets,detail);
+            scoped=scanoutCaptured || result!=kIOReturnUnsupported;
+            if(scoped) {
+                known=result==kIOReturnSuccess || result==kIOReturnTimeout;
+                complete=result==kIOReturnSuccess;
+                // Provider code 5: "submitted" and "retired" carry the two scanout targets.
+                submitted=scanoutTargets[0];retired=scanoutTargets[1];
+                fenceTarget=submitted?submitted:retired;
+                detail[2]=scanoutCaptured?5:1;
+            }
         }
-        if(known && int32_t(retired-fenceTarget)>=0) {
+        if(!scoped) {
+            known=&native_adreno_fences_detail?native_adreno_fences_detail(&submitted,&retired,detail):
+                (&native_adreno_fences && native_adreno_fences(&submitted,&retired));
+            if(known && !fenceCaptured) {
+                fenceTarget=submitted;fenceCaptured=true;
+            }
+            complete=known && int32_t(retired-fenceTarget)>=0;
+        }
+        if(discardResetSwap(request))return false;
+        if(result==kIOReturnAborted) {
+            gpuTraceEvent(GpuTraceDisplayFence,0,traceId(request),6,fenceTarget,submitted,retired,0,detail[0],detail[1],detail[2]);
+            discardGpuSwap(request);
+            return false;
+        }
+        if(complete) {
             traceGpuComplete=true;
             gpuTraceEvent(GpuTraceDisplayFence,0,traceId(request),1,fenceTarget,submitted,retired,0,detail[0],detail[1],detail[2]);
             if(fenceSince)note(3,-1,request);
@@ -426,6 +484,13 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     void clearFenceWait() {
         if(fenceTimer)fenceTimer->cancelTimeout();
         fenceFor=nullptr;fenceTarget=0;fenceSince=0;fenceCaptured=false;fenceSlow=false;traceGpuComplete=false;
+        scanoutCaptured=false;
+    }
+    void discardGpuSwap(const OriginalLegacySwapRequest *request) {
+        clearFenceWait();
+        transferred=true;
+        if(retireSwap(request,true))rekick=true;
+        transferred=false;
     }
     bool discardResetSwap(const OriginalLegacySwapRequest *request) {
         const uint32_t epoch=gpuResetEpoch();
@@ -436,17 +501,22 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
             // The reset advances retired fences even for aborted work. Release the request
             // through the family and leave the previous scanout buffer on screen.
             gpuTraceEvent(GpuTraceDisplayFence,0,traceId(request),5,fenceTarget,0,0,0,validatedGpuEpoch[i],epoch,0);
-            clearFenceWait();
-            transferred=true;
-            if(retireSwap(request,true))rekick=true;
-            transferred=false;
+            discardGpuSwap(request);
             return true;
         }
         return false;
     }
     bool prepareDirectSwap(const OriginalLegacySwapRequest *request,OSObject *surface,
                            IOMemoryDescriptor *memory,int &slot) {
-        if(discardResetSwap(request) || !gpuWrote(request))return false;
+        if(discardResetSwap(request))return false;
+        if(&native_adreno_scanout_wait && (fenceFor!=request || !fenceCaptured)) {
+            // Mapping the spare slot pins the exact pages; only flip() gives that slot to the DPU.
+            slot=directSlot(surface,memory);
+            if(discardResetSwap(request))return false;
+            if(slot>=0)return gpuWrote(request,scanoutPages(unsigned(slot)),directSlots[slot].pageCount);
+            return gpuWrote(request);
+        }
+        if(!gpuWrote(request))return false;
         slot=directSlot(surface,memory);
         return !discardResetSwap(request);
     }
@@ -534,6 +604,8 @@ public:
         if(fenceTimer){fenceTimer->cancelTimeout();if(IOWorkLoop *loop=getWorkLoop())loop->removeEventSource(fenceTimer);OSSafeReleaseNULL(fenceTimer);}
         if(latchTimer){latchTimer->cancelTimeout();if(IOWorkLoop *loop=getWorkLoop())loop->removeEventSource(latchTimer);OSSafeReleaseNULL(latchTimer);}
         directOn=false;
+        if(directPages){IOFreeData(directPages,kDirectPageBytes);directPages=nullptr;}
+        for(auto &slot: directSlots)slot.pageCount=0;
         if(logicalPM){PMstop();logicalPM=false;}
         primary=false;IOMobileFramebufferLegacy::stop(provider);OSSafeReleaseNULL(bootMapping);
     }

@@ -1383,6 +1383,21 @@ extern "C" bool native_adreno_fences(uint32_t *submitted,uint32_t *retired)
 {
     return native_adreno_fences_detail(submitted,retired,nullptr);
 }
+/* The direct display pins the surface pages. Capture and poll under the same GPU lock used for submits and VM updates. */
+extern "C" IOReturn native_adreno_scanout_wait(const uint64_t *pages,unsigned count,
+    bool *captured,uint32_t *targets,uint32_t *retired)
+{
+    if(!g.published || !g.submit || (!*captured && (!pages || !count)))return kIOReturnUnsupported;
+    if(!IOLockTryLock(g.lock))return kIOReturnBusy;
+    IOReturn status=kIOReturnSuccess;
+    if(!*captured) {
+        status=g.submit->captureScanoutTargets(pages,count,targets);
+        *captured=status==kIOReturnSuccess;
+    }
+    if(!status)status=g.submit->scanoutProgress(targets,retired);
+    IOLockUnlock(g.lock);
+    return status;
+}
 /* Publishes the service once. Everything passed in must outlive the system (the board probe keeps them in statics) and
  * the VM, submit object and ring must already be attached to the live GPU context. The core must not be open. */
 extern "C" IOReturn native_adreno_publish(NativeAdrenoVm *vm,NativeAdrenoSubmit *submit,NativeAdrenoRing *ring,
