@@ -26,6 +26,9 @@ static const int kColumnMap[NVT_COLUMNS] = {
 // Across an unobserved frame only rejoin within the measured jitter range of
 // the predicted position. A nearby new keystroke can be inside TRACK_RADIUS.
 #define REJOIN_RADIUS (4*NVT_FUZZ)
+#define MOTION_CUTOFF_MHZ 34000
+#define MOTION_MIN_STEP 4 // 0.4 panel px, for a direction inferred from two samples
+#define MOTION_RESPONSE_FADE_US UINT64_C(125000)
 
 int nvt_touch_row_center(int row) {return row>=0 && row<NVT_ROWS ? kRowMap[row] : 0;}
 int nvt_touch_column_center(int column) {return column>=0 && column<NVT_COLUMNS ? kColumnMap[column] : 0;}
@@ -81,21 +84,53 @@ static long filter_alpha(long cutoff_mhz, uint64_t dt_us) {
     return (long)(65536-(numerator/denominator+(numerator%denominator!=0)));
 }
 
-// The reported position of a tracked finger for its raw one: an adaptive low-pass filter whose cutoff follows the finger's smoothed
-// speed (NvtTouchCore.h). It is continuous: no movement is held back and released in one step.
+static long response_weight(long value, long start, long width) {
+    if (value <= start) return 0;
+    if (value >= start + width) return 65536;
+    return (value - start) * 65536 / width;
+}
+
+static long position_weight(int step, int previous_step, long velocity, long carried_weight) {
+    const long distance=step<0 ? -step : step;
+    const long previous_distance=previous_step<0 ? -previous_step : previous_step;
+    // A large single step can be meaningful at first contact. Smaller steps
+    // need a consistent direction before they get the quicker response.
+    long weight=response_weight(distance,4*NVT_FUZZ,8*NVT_SUPER_RESOLUTION);
+    if (distance>=MOTION_MIN_STEP && previous_distance>=MOTION_MIN_STEP &&
+        ((step>0)==(previous_step>0))) {
+        const long span=response_weight(distance+previous_distance,2*NVT_FUZZ,NVT_FUZZ);
+        // Use speed magnitude here. An observed turn can reverse before the
+        // signed velocity estimate has crossed zero.
+        const long speed=response_weight(velocity<0 ? -velocity : velocity,
+                                         75*NVT_SUPER_RESOLUTION,25*NVT_SUPER_RESOLUTION);
+        if (span>weight) weight=span;
+        if (speed>weight) weight=speed;
+        // Sustained measured motion keeps part of the previous response while
+        // the signed velocity estimate crosses zero after a turn.
+        if (carried_weight>weight) weight=carried_weight;
+    }
+    return weight;
+}
+
+// Each axis can follow reliable movement faster while the ordinary adaptive
+// low-pass filter continues to handle small or inconsistent changes.
 // Measurement acceptance is owned by the tracker. Every accepted timed strong
 // or weak position reaches this function; source/rank cannot silently freeze q.
 // The legacy untimed API retains its old weak-follow behavior for comparison.
 static int follow(struct nvt_slot *slot, int x, int y, int weak, uint64_t dt_us) {
-    if (weak) return 0;
+    if (weak) {
+        slot->motion_weight_x=slot->motion_weight_y=0;
+        return 0;
+    }
     // Legacy calls keep their exact fixed-rate arithmetic. Timed calls use the
     // actual interval since this slot's position/filter state was updated.
     // The bounded coordinate residual is smaller than INT64_MAX; for a larger
     // elapsed value its integer derivative is0. Avoid unsigned-to-signed wrap.
     const uint64_t velocity_dt=dt_us>(uint64_t)INT64_MAX ? (uint64_t)INT64_MAX : dt_us;
-    const long sx=dt_us ? (long)(((int64_t)x-slot->filter_raw_x)*1000000/(int64_t)velocity_dt) :
+    const int dx=x-slot->filter_raw_x,dy=y-slot->filter_raw_y;
+    const long sx=dt_us ? (long)((int64_t)dx*1000000/(int64_t)velocity_dt) :
         ((long)x*16-slot->fx)*NVT_FRAME_HZ/16;
-    const long sy=dt_us ? (long)(((int64_t)y-slot->filter_raw_y)*1000000/(int64_t)velocity_dt) :
+    const long sy=dt_us ? (long)((int64_t)dy*1000000/(int64_t)velocity_dt) :
         ((long)y*16-slot->fy)*NVT_FRAME_HZ/16;
     // Do not extrapolate stale velocity memory across an observation gap. The
     // new endpoint difference still uses its actual elapsed measurement time.
@@ -104,7 +139,24 @@ static int follow(struct nvt_slot *slot, int x, int y, int weak, uint64_t dt_us)
     slot->vx+=(sx-slot->vx)*speed_alpha/65536;slot->vy+=(sy-slot->vy)*speed_alpha/65536;
     const long speed=(slot->vx<0?-slot->vx:slot->vx)+(slot->vy<0?-slot->vy:slot->vy);
     const long alpha=filter_alpha(NVT_MIN_CUTOFF_MHZ+speed*NVT_CUTOFF_PER_SPEED/2,dt_us);
-    slot->fx+=((long)x*16-slot->fx)*alpha/65536;slot->fy+=((long)y*16-slot->fy)*alpha/65536;
+    long x_alpha=alpha,y_alpha=alpha;
+    if (dt_us && dt_us<=NVT_DROPOUT_MAX_US) {
+        const int continuous=slot->last_interval_us && slot->last_interval_us<=NVT_DROPOUT_MAX_US;
+        const long decay=(long)(dt_us*65536/MOTION_RESPONSE_FADE_US);
+        const long x_weight=position_weight(dx,continuous ? slot->dx : 0,slot->vx,(long)slot->motion_weight_x-decay);
+        const long y_weight=position_weight(dy,continuous ? slot->dy : 0,slot->vy,(long)slot->motion_weight_y-decay);
+        slot->motion_weight_x=(uint32_t)x_weight;
+        slot->motion_weight_y=(uint32_t)y_weight;
+        const long fast=filter_alpha(MOTION_CUTOFF_MHZ,dt_us);
+        if (fast>alpha) {
+            x_alpha+=(long)((int64_t)(fast-alpha)*x_weight/65536);
+            y_alpha+=(long)((int64_t)(fast-alpha)*y_weight/65536);
+        }
+    } else {
+        slot->motion_weight_x=slot->motion_weight_y=0;
+    }
+    slot->fx+=((long)x*16-slot->fx)*x_alpha/65536;
+    slot->fy+=((long)y*16-slot->fy)*y_alpha/65536;
     slot->rx=(int)((slot->fx+8)/16);slot->ry=(int)((slot->fy+8)/16);
     slot->filter_raw_x=x;slot->filter_raw_y=y;
     return 1;
@@ -442,6 +494,11 @@ static void extract_candidates(struct nvt_touch_core *core,int first_row,int row
 static void accept_position(struct nvt_touch_core *core,struct nvt_slot *slot,
                             int s,struct nvt_contact *contact) {
         const int dx=(*contact).x-slot->x,dy=(*contact).y-slot->y,ax=dx<0?-dx:dx,ay=dy<0?-dy:dy;
+        const int px=slot->rx,py=slot->ry;
+        const int weak=!core->timed_enabled && (*contact).peak<NVT_DOWN_THRESHOLD;
+        const uint64_t filter_dt_us=!core->timed_enabled ? 0 :
+            core->now_us>slot->last_filter_us ? core->now_us-slot->last_filter_us : 1;
+        const int filter_applied=follow(slot,(*contact).x,(*contact).y,weak,filter_dt_us);
         uint64_t dt_us=0;
         if(core->timed_enabled) {
             dt_us=core->now_us>=slot->last_observed_us ? core->now_us-slot->last_observed_us : 1;
@@ -449,21 +506,13 @@ static void accept_position(struct nvt_touch_core *core,struct nvt_slot *slot,
             if(dt_us>NVT_OBSERVATION_MAX_US)dt_us=NVT_OBSERVATION_MAX_US;
             slot->last_interval_us=dt_us;slot->last_observed_us=core->now_us;
             slot->last_presence_us=core->now_us;
+            if(filter_applied)slot->last_filter_us=core->now_us;
         }
         slot->dx=core->timed_enabled ? dx : dx/(slot->missed+1);
         slot->dy=core->timed_enabled ? dy : dy/(slot->missed+1);
         if (slot->missed) {++core->holds_bridged;slot->missed=0;}
         (*contact).slot=s;(*contact).tracking_id=slot->tracking_id;
-        const int px=slot->rx,py=slot->ry;
         slot->x=(*contact).x;slot->y=(*contact).y;if(slot->age<__INT_MAX__)++slot->age;
-        const int weak=!core->timed_enabled && (*contact).peak<NVT_DOWN_THRESHOLD;
-        uint64_t filter_dt_us=0;
-        if(core->timed_enabled) {
-            filter_dt_us=core->now_us>=slot->last_filter_us ? core->now_us-slot->last_filter_us : 1;
-            if(filter_dt_us<1)filter_dt_us=1;
-        }
-        const int filter_applied=follow(slot,(*contact).x,(*contact).y,weak,filter_dt_us);
-        if(core->timed_enabled && filter_applied)slot->last_filter_us=core->now_us;
         // Timed reporting keeps origin separate; the report timeline owns the
         // historical DOWN. Never overwrite the newest measured output here.
         if (!core->timed_enabled && slot->age == 2) {
@@ -580,6 +629,7 @@ static int process_matrix(struct nvt_touch_core *core, const int16_t *matrix, un
             core->slots[s].rx=found[c].x;core->slots[s].ry=found[c].y;
             core->slots[s].fx=(long)found[c].x*16;core->slots[s].fy=(long)found[c].y*16;core->slots[s].vx=core->slots[s].vy=0;
             core->slots[s].dx=core->slots[s].dy=0;
+            core->slots[s].motion_weight_x=core->slots[s].motion_weight_y=0;
             if(!core->timed_enabled)core->slots[s].last_filter_us=0;
             found[c].slot=s;found[c].tracking_id=core->slots[s].tracking_id;used_contact[c]=1;break;
         }

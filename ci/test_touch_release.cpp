@@ -52,14 +52,18 @@ struct Panel {
         return engine.frame(raw.data(), raw.size(), when, matrix.data(), out, NVT_SLOTS);
     }
 
-    nvt_slot& begin() {
+    void finger(double column) {
         for (unsigned r = 0; r < NVT_ROWS; ++r) {
             for (unsigned c = 0; c < NVT_COLUMNS; ++c) {
-                const double x = c - 25.2, y = (r - 14.5) / .85;
+                const double x = c - column, y = (r - 14.5) / .85;
                 input[r * NVT_COLUMNS + c] =
                     static_cast<int16_t>(10000 + std::lround(1000 * std::exp(-.5 * (x * x + y * y))));
             }
         }
+    }
+
+    nvt_slot& begin() {
+        finger(25.2);
         frame(scan);
         assert(frame(last) == 1);
         return core->slots[out[0].slot];
@@ -175,6 +179,71 @@ static void check_queue() {
     assert(sink.mask == (1u << id));
 }
 
+static void check_motion() {
+    {
+        Panel panel;
+        const auto& contact = panel.begin();
+        const int origin = contact.x;
+        panel.finger(26.0);
+        assert(panel.frame(last + scan) == 1);
+        const int raw_step = contact.x - origin;
+        const int reported_step = panel.out[0].x - origin;
+        assert(raw_step > 32 * NVT_SUPER_RESOLUTION);
+        assert(reported_step * 2 >= raw_step && reported_step <= raw_step);
+    }
+    {
+        Panel panel;
+        const auto& contact = panel.begin();
+        nvt_contact measured = panel.out[0];
+        uint64_t time = last;
+        const auto measure = [&](int x) {
+            measured.x = x;
+            time += scan;
+            assert(nvt_touch_process_partial(panel.core.get(), &measured, 1, time, panel.out, NVT_SLOTS) == 1);
+            return panel.out[0].x;
+        };
+        int x = contact.x;
+        int reported = x;
+        const int step = 25; // 300 px/s at 120 Hz
+        for (unsigned i = 0; i < 36; ++i) {
+            x += step;
+            reported = measure(x);
+            assert(reported <= x);
+        }
+        assert(x - reported <= step);
+        x -= step;
+        int next = measure(x);
+        assert(next < reported && next >= x);
+        for (unsigned i = 0; i < 12; ++i) {
+            reported = next;
+            next = measure(x);
+            assert(next <= reported && next >= x);
+        }
+        for (unsigned i = 0; i < 36; ++i) {
+            x -= 40; // Establish motion in the old direction at 480 px/s.
+            measure(x);
+        }
+        for (unsigned i = 0; i < 48; ++i) {
+            x += step;
+            // The signed speed passes through zero during this steady return.
+            assert(x - measure(x) <= 3 * step);
+        }
+        measure(x);
+        assert(contact.motion_weight_x == 0);
+    }
+    {
+        Panel panel;
+        const int origin = panel.begin().x;
+        nvt_contact measured = panel.out[0];
+        measured.x = origin + 4 * NVT_FUZZ;
+        assert(nvt_touch_process_partial(panel.core.get(), &measured, 1, last + scan, panel.out, NVT_SLOTS) == 1);
+        assert(panel.out[0].x - origin <= 35);
+        measured.x = origin;
+        assert(nvt_touch_process_partial(panel.core.get(), &measured, 1, last + 2 * scan, panel.out, NVT_SLOTS) == 1);
+        assert(panel.out[0].x - origin <= 35);
+    }
+}
+
 int main() {
     check_stripe();
     std::puts("PASS covered, unrelated, moving, and skipped P stripes");
@@ -184,4 +253,6 @@ int main() {
     std::puts("PASS cancel, tip-state clear, retry, new down, and surviving finger reports");
     check_queue();
     std::puts("PASS queued cancellation survives an unsuccessful publication");
+    check_motion();
+    std::puts("PASS initial motion, sustained drag, reversal, stop, and isolated noise");
 }

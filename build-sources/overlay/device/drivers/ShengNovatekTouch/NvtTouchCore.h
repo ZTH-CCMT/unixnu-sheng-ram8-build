@@ -71,6 +71,7 @@ struct nvt_slot {
     uint64_t born_us, last_observed_us, last_interval_us;
     uint64_t last_filter_us; // Last actual accepted position/filter-state update.
     int filter_raw_x, filter_raw_y; // Previous accepted raw position, never origin/q.
+    uint32_t motion_weight_x, motion_weight_y; // Fast-follow weight in units of 1/65536.
     int origin_x, origin_y;         // Actual first sample for report confirmation.
     uint64_t generation;            // Changes when a slot is allocated to a new contact.
     uint64_t last_presence_us;       // Separate evidence; never grants position renewal.
