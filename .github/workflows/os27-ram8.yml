@@ -4,6 +4,21 @@ on:
   workflow_dispatch:
   push:
     branches: [ram8-v6.3-touch-release]
+  workflow_call:
+    inputs:
+      artifact_suffix:
+        type: string
+        default: ''
+    outputs:
+      elapsed_seconds:
+        description: Seconds from runner start to upload of the verified handoff
+        value: ${{ jobs.build.outputs.elapsed_seconds }}
+      gpu_cache_hit:
+        description: Exact match for the base GPU addon cache
+        value: ${{ jobs.build.outputs.gpu_cache_hit }}
+      ipsw_cache_hit:
+        description: Exact match for the encrypted system image cache
+        value: ${{ jobs.build.outputs.ipsw_cache_hit }}
 
 permissions:
   contents: read
@@ -16,7 +31,14 @@ jobs:
   build:
     runs-on: macos-26
     timeout-minutes: 180
+    outputs:
+      elapsed_seconds: ${{ steps.timing.outputs.seconds }}
+      gpu_cache_hit: ${{ steps.gpu-cache.outputs.cache-hit }}
+      ipsw_cache_hit: ${{ steps.ipsw-cache.outputs.cache-hit }}
     steps:
+      - name: Start build timer
+        id: start
+        run: echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v4
         with:
           path: pipeline
@@ -84,11 +106,13 @@ jobs:
           key=$(python3 pipeline/ci/gpu_cache_key.py)
           printf 'key=%s\n' "$key" >> "$GITHUB_OUTPUT"
       - name: Cache base GPU addon
+        id: gpu-cache
         uses: actions/cache@v4
         with:
           path: .cache/ios27-gpu
           key: ${{ steps.gpu-key.outputs.key }}
       - name: Cache encrypted iPadOS system image
+        id: ipsw-cache
         uses: actions/cache@v4
         with:
           path: |
@@ -107,7 +131,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: v6.3-touch-build-failure-${{ github.run_id }}-${{ github.run_attempt }}
+          name: v6.3-touch-build-failure-${{ github.run_id }}-${{ github.run_attempt }}${{ inputs.artifact_suffix }}
           path: build-failure-logs/
           if-no-files-found: warn
           retention-days: 7
@@ -129,9 +153,17 @@ jobs:
       - name: Upload verified generic boot handoff
         uses: actions/upload-artifact@v4
         with:
-          name: os27-ram8-v6.3-touch-handoff-${{ github.run_id }}-${{ github.run_attempt }}
+          name: os27-ram8-v6.3-touch-handoff-${{ github.run_id }}-${{ github.run_attempt }}${{ inputs.artifact_suffix }}
           path: os27-ram8-handoff/
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 1
           compression-level: 0
+      - name: Record time to verified handoff
+        id: timing
+        env:
+          BUILD_STARTED: ${{ steps.start.outputs.epoch }}
+        run: |
+          elapsed=$(( $(date +%s) - BUILD_STARTED ))
+          echo "seconds=$elapsed" >> "$GITHUB_OUTPUT"
+          echo "Verified handoff uploaded after $elapsed seconds."

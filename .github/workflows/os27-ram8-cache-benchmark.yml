@@ -1,0 +1,50 @@
+name: V6.3 Touch cache benchmark
+
+on:
+  push:
+    branches: [ram8-v6.3-touch-cache-benchmark]
+
+permissions:
+  contents: read
+
+jobs:
+  seed:
+    name: Build and seed caches
+    uses: ./.github/workflows/os27-ram8.yml
+    with:
+      artifact_suffix: -seed
+  warm:
+    name: Build with warm caches
+    needs: seed
+    uses: ./.github/workflows/os27-ram8.yml
+    with:
+      artifact_suffix: -warm
+  report:
+    name: Report against the 20-minute target
+    needs: [seed, warm]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Summarize time to verified handoff
+        env:
+          SEED_RESULT: ${{ needs.seed.result }}
+          SEED_SECONDS: ${{ needs.seed.outputs.elapsed_seconds }}
+          WARM_RESULT: ${{ needs.warm.result }}
+          WARM_SECONDS: ${{ needs.warm.outputs.elapsed_seconds }}
+          GPU_HIT: ${{ needs.warm.outputs.gpu_cache_hit }}
+          IPSW_HIT: ${{ needs.warm.outputs.ipsw_cache_hit }}
+        run: |
+          {
+            echo '## V6.3 Touch build timing'
+            printf '\n| Build | Result | Time to verified handoff |\n| --- | --- | --- |\n'
+            printf '| Seed | %s | %s |\n' "$SEED_RESULT" "${SEED_SECONDS:+$SEED_SECONDS s}"
+            printf '| Warm | %s | %s |\n' "$WARM_RESULT" "${WARM_SECONDS:+$WARM_SECONDS s}"
+            printf '\nGPU cache hit: %s. iPadOS image cache hit: %s.\n\n' "${GPU_HIT:-no}" "${IPSW_HIT:-no}"
+            if [[ "$WARM_RESULT" != success || "$GPU_HIT" != true || "$IPSW_HIT" != true || -z "$WARM_SECONDS" ]]; then
+              echo 'The warm benchmark requires a verified handoff and both cache hits.'
+            elif (( WARM_SECONDS <= 1200 )); then
+              echo '**20-minute target met.**'
+            else
+              echo "**20-minute target missed by $(( WARM_SECONDS - 1200 )) s.**"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
