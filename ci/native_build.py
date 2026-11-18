@@ -11,6 +11,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 import urllib.request
 
@@ -235,7 +236,9 @@ def gpu_diagnostic_symbols(tree, kernel):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--top', type=Path, required=True)
-    top = parser.parse_args().top.resolve()
+    parser.add_argument('--gpu-cache', type=Path, help='reuse or save the base iPadOS GPU addon')
+    args = parser.parse_args()
+    top = args.top.resolve()
     require(sys.platform == 'darwin', 'This build requires a macOS runner')
     validate_tools()
     core, device, uefi = (top / name for name in ('UniXNU', 'device', 'uefi-sheng'))
@@ -252,6 +255,17 @@ def main():
     spec = board['payload']['runtime']
     require(spec['data_gib'] == 215 and spec['wifi_launchd_cache'] and spec['appsync']
             and spec['bluetooth_tool'], 'Required author runtime features differ')
+    config_name = board['package']['defconfig'][PROFILE].removesuffix('_defconfig')
+    work = core / 'out/sheng' / PROFILE / config_name
+    tree = work / 'tree'
+    runtime = work / 'runtime'
+    gpu_outputs = {
+        'gpuaddon.bin': runtime / 'gpuaddon.bin',
+        'turnip-profile.json': tree / 'build/mesa-tu-ios27/builtin-build-profile.json',
+        'gpu-build.json': tree / 'build/adreno-metal-plugin27/NativeAdrenoMetal.bundle/gpu-build.json',
+    }
+    gpu_cache = args.gpu_cache.resolve() if args.gpu_cache else None
+    reuse_gpu = gpu_cache is not None and all((gpu_cache / name).is_file() for name in gpu_outputs)
 
     sys.path.insert(0, str(core / 'scripts'))
     from unixnu.runtime import seed_uuid
@@ -267,15 +281,15 @@ def main():
     print(f'Available before Wi-Fi preparation: {shutil.disk_usage(top).free / 1024**3:.1f} GiB', flush=True)
     notices = prepare_wifi(top, device, env)
     print(f'Available before native package: {shutil.disk_usage(top).free / 1024**3:.1f} GiB', flush=True)
+    gpu_options = ['--gpu-addon', gpu_cache / 'gpuaddon.bin'] if reuse_gpu else []
+    print('GPU addon: reusing cached base' if reuse_gpu else 'GPU addon: building from source', flush=True)
+    package_started = time.monotonic()
     run('bash', device / 'scripts/package.sh', '--os', '27', '--uefi', uefi,
         '--local-module', f'soc:sm8550={top / "UniXNU-sm8550-common"}',
-        '--data-ramdisk', seed, cwd=device, env=env)
+        '--data-ramdisk', seed, *gpu_options, cwd=device, env=env)
+    print(f'Native package took {time.monotonic() - package_started:.1f} seconds', flush=True)
 
-    config_name = board['package']['defconfig'][PROFILE].removesuffix('_defconfig')
     print(f'Available after native package: {shutil.disk_usage(top).free / 1024**3:.1f} GiB', flush=True)
-    work = core / 'out/sheng' / PROFILE / config_name
-    tree = work / 'tree'
-    runtime = work / 'runtime'
     boot = work / 'boot/boot.img'
     payload = work / 'payload/payload.img'
     kernel = work / 'kernel/kernel.macho'
@@ -304,8 +318,9 @@ def main():
         runtime_files[key] = path
     require(digest(runtime_files['data_ramdisk']) == SEED_SHA, 'Runtime repacked the original Data seed')
 
-    turnip = json_file(tree / 'build/mesa-tu-ios27/builtin-build-profile.json')
-    plugin = json_file(tree / 'build/adreno-metal-plugin27/NativeAdrenoMetal.bundle/gpu-build.json')
+    gpu_reports = {name: gpu_cache / name for name in gpu_outputs} if reuse_gpu else gpu_outputs
+    turnip = json_file(gpu_reports['turnip-profile.json'])
+    plugin = json_file(gpu_reports['gpu-build.json'])
     require(plugin['target'] == 'ios27' and plugin['turnip'] == turnip
             and turnip['profile']['extra_sources'][TURNIP_KMD] == TURNIP_KMD_SHA,
             'GPU addon did not use the V4.1 Turnip source')
@@ -404,6 +419,10 @@ def main():
                   for p in sorted(stage.rglob('*')) if p.is_file()},
     }
     (stage / 'handoff.json').write_text(json.dumps(handoff, indent=2) + '\n')
+    if gpu_cache is not None and not reuse_gpu:
+        gpu_cache.mkdir(parents=True, exist_ok=True)
+        for name, source in gpu_outputs.items():
+            shutil.copyfile(source, gpu_cache / name)
     stage.rename(top / 'os27-ram8-handoff')
     print('Verified generic 8 GiB boot handoff. Personalize locally before any boot attempt.')
 

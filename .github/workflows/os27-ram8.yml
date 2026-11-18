@@ -74,11 +74,28 @@ jobs:
           rustup toolchain install 1.98.0 --profile minimal --component rust-src
           cargo +1.98.0 --version
           printf '%s\n' "$tools" "$(brew --prefix rustup)/bin" "$HOME/.cargo/bin" "$(brew --prefix llvm)/bin" "$(brew --prefix lld)/bin" "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
+      - name: Identify GPU cache inputs
+        id: gpu-key
+        run: |
+          key=$(python3 pipeline/ci/gpu_cache_key.py)
+          printf 'key=%s\n' "$key" >> "$GITHUB_OUTPUT"
+      - name: Cache base GPU addon
+        uses: actions/cache@v4
+        with:
+          path: .cache/ios27-gpu
+          key: ${{ steps.gpu-key.outputs.key }}
+      - name: Cache encrypted iPadOS system image
+        uses: actions/cache@v4
+        with:
+          path: |
+            UniXNU/out/ipsw/24A446/043-68950-668.dmg.aea
+            UniXNU/out/ipsw/24A446/043-68950-668.dmg.aea.json
+          key: sheng-24A446-043-68950-668-aea-v1
       - name: Build and verify generic boot handoff
         id: native
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: python3 pipeline/ci/native_build.py --top "$GITHUB_WORKSPACE"
+        run: python3 pipeline/ci/native_build.py --top "$GITHUB_WORKSPACE" --gpu-cache "$GITHUB_WORKSPACE/.cache/ios27-gpu"
       - name: Preserve complete failure logs and print first compiler errors
         if: failure()
         run: python3 pipeline/ci/report_build_failure.py "$GITHUB_WORKSPACE"
