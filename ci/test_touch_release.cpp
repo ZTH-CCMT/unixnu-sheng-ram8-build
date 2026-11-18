@@ -72,8 +72,8 @@ struct Panel {
         }
     }
 
-    nvt_slot& begin() {
-        finger(25.2);
+    nvt_slot& begin(double column = 25.2, double row = 14.5) {
+        finger(column, 1000, row);
         frame(scan);
         assert(frame(last) == 1);
         return core->slots[out[0].slot];
@@ -442,14 +442,49 @@ static void check_moving_region_peaks() {
     assert(find_track(panel, second)->x == point(1649, 806).x);
 }
 
+static void check_full_release() {
+    for (bool common_drift : {false, true}) {
+        Panel panel;
+        auto& contact = panel.begin(25, 15);
+        panel.input.fill(common_drift ? 9860 : 10000);
+        if (!common_drift) panel.input[15 * NVT_COLUMNS + 27] -= 140;
+        assert(panel.frame(last + scan) == 0);
+        assert(contact.last_covered_negative_us == last + scan);
+        assert(!panel.core->cancelled_ids);
+    }
+    for (bool resolved : {false, true}) {
+        Panel panel;
+        auto& contact = panel.begin(25, 15);
+        const int id = contact.tracking_id;
+        panel.input.fill(10000);
+        panel.input[15 * NVT_COLUMNS + 25] -= 300;
+        assert(panel.frame(last + scan) == 1);
+        assert(contact.missed == 1 && contact.miss_reason == NVT_MISS_NONE);
+        assert(contact.last_observed_us == last && !panel.core->cancelled_ids);
+        if (resolved) panel.input.fill(10000);
+        assert(panel.frame(last + 2 * scan) == 0);
+        assert(panel.core->cancelled_ids == (resolved ? 0u : 1u << id));
+        assert(contact.last_covered_negative_us == (resolved ? last + 2 * scan : 0));
+    }
+}
+
 static void check_stripe() {
+    for (int unrelated_column : {-1, 2}) {
+        Panel panel;
+        auto& contact = panel.begin();
+        panel.input.fill(10000);
+        if (unrelated_column >= 0) panel.input[14 * NVT_COLUMNS + unrelated_column] += 140;
+        assert(panel.frame(last + scan, 2) == 0);
+        assert(contact.last_covered_negative_us == last + scan);
+        assert(!panel.core->cancelled_ids);
+    }
     {
         Panel panel;
         auto& contact = panel.begin();
         panel.input.fill(10000);
-        assert(panel.frame(last + scan, 2) == 0);
-        assert(contact.last_covered_negative_us == last + scan);
-        assert(!panel.core->cancelled_ids);
+        panel.input[14 * NVT_COLUMNS + 25] += 140;
+        assert(panel.frame(last + scan, 2) == TouchEngine::SpecialP);
+        assert(contact.active && contact.last_observed_us == last);
     }
     {
         Panel panel;
@@ -489,6 +524,42 @@ static void check_deadline() {
         panel.input.fill(10000);
         assert(panel.frame(last + NVT_OBSERVATION_MAX_US + scan) == 0);
         assert(!panel.core->cancelled_ids);
+    }
+    for (bool finger_stays : {false, true}) {
+        Panel panel;
+        auto& contact = panel.begin(25, 15);
+        const int id = contact.tracking_id;
+        const auto generation = contact.generation;
+        panel.input.fill(10000);
+        panel.input[15 * NVT_COLUMNS + 25] += 180;
+        assert(panel.frame(last + scan) == 1 && contact.missed == 1);
+        if (finger_stays) panel.finger(25, 1000, 15);
+        else panel.input.fill(10000);
+        const auto time = last + NVT_DROPOUT_MAX_US + 1;
+        assert(panel.frame(time) == (finger_stays ? 1 : 0));
+        assert(!panel.core->cancelled_ids);
+        if (finger_stays) {
+            assert(contact.tracking_id == id && contact.generation == generation);
+            assert(contact.last_observed_us == time);
+        } else {
+            assert(contact.last_covered_negative_us == time);
+        }
+    }
+    for (bool full_frame : {false, true}) {
+        Panel panel;
+        auto& contact = panel.begin(25, 15);
+        const int id = contact.tracking_id;
+        panel.input.fill(10000);
+        panel.input[15 * NVT_COLUMNS + 25] += 180;
+        assert(panel.frame(last + scan) == 1 && contact.missed == 1);
+        const auto deadline = last + NVT_DROPOUT_MAX_US;
+        if (full_frame) {
+            panel.input.fill(10000);
+            assert(panel.frame(deadline + scan + 1) == 0);
+        } else {
+            assert(panel.engine.expire(deadline, panel.out, NVT_SLOTS) == 0);
+        }
+        assert(panel.core->cancelled_ids == (1u << id));
     }
     Panel panel;
     auto& contact = panel.begin();
@@ -551,6 +622,72 @@ static void check_queue() {
     sink.ready = true;
     assert(timeline->flush(deadline + 1, submit, &sink) == 1);
     assert(sink.mask == (1u << id));
+}
+
+static void check_lift_submission() {
+    for (bool full_frame : {true, false}) {
+        Panel panel;
+        const int id = panel.begin(25, 15).tracking_id;
+        auto timeline = std::make_unique<TouchReportTimeline>();
+        timeline->reset();
+        struct Sink {
+            nht_state ack{};
+            nht_plan reports{};
+            uint64_t ticks = 0;
+        } sink;
+        const auto submit = [](void *data, unsigned count, const nvt_contact *points,
+                               uint64_t ticks, uint32_t cancelled) {
+            auto& s = *static_cast<Sink *>(data);
+            nht_point current[NHT_CONTACTS];
+            for (unsigned i = 0; i < count; ++i) {
+                current[i] = {points[i].tracking_id, points[i].x, points[i].y};
+            }
+            const int count_reports = nht_build_with_cancel(&s.ack, current, count,
+                s.ack.sequence + 2, cancelled, &s.reports);
+            assert(count_reports > 0);
+            for (int i = 0; i < count_reports; ++i) {
+                assert(nht_commit(&s.ack, &s.reports, i, 1));
+            }
+            s.ticks = ticks;
+            return true;
+        };
+        const auto publish = [&](uint64_t when) {
+            assert(timeline->feed(when, when * 10, *panel.core));
+            return timeline->flush(when, submit, &sink);
+        };
+        assert(publish(last) == 1 && sink.ack.count == 1);
+
+        const auto move = last + scan;
+        panel.finger(25.5, 1000, 15);
+        assert(panel.frame(move) == 1);
+        assert(publish(move) == 1 && sink.ack.count == 1);
+        const nht_point last_down = sink.ack.point[0];
+        assert(last_down.id == id);
+
+        panel.input.fill(10000);
+        panel.input[15 * NVT_COLUMNS + 25] += 180;
+        assert(panel.frame(move + scan) == 1);
+        assert(panel.out[0].tracking_id == id);
+        assert(publish(move + scan) == 0);
+
+        const auto end = move + NVT_DROPOUT_MAX_US + 1;
+        if (full_frame) {
+            panel.input.fill(10000);
+            assert(panel.frame(end) == 0);
+        } else {
+            assert(panel.engine.expire(end, panel.out, NVT_SLOTS) == 0);
+        }
+        assert(timeline->feed(end, end * 10, *panel.core));
+        assert(timeline->flush(end + scan, submit, &sink) == 1);
+        assert(sink.ticks == end * 10 && !sink.ack.count);
+        assert(sink.reports.count == (full_frame ? 1u : 2u));
+        if (!full_frame) assert(sink.reports.packet[0].bytes[1] == NHT_CANCEL);
+        const auto& up = sink.reports.packet[sink.reports.count - 1].bytes;
+        assert(up[1] == NHT_UP && up[2] == last_down.id);
+        assert((up[3] | (up[4] << 8)) == last_down.x);
+        assert((up[5] | (up[6] << 8)) == last_down.y);
+        assert(up[NHT_REPORT_BYTES - 1] == 1);
+    }
 }
 
 static void check_motion() {
@@ -631,14 +768,18 @@ int main() {
     check_pending_region();
     check_moving_region_peaks();
     std::puts("PASS elapsed-time rejoin, confirmed-slot priority, crossing IDs, and pending P expiry");
+    check_full_release();
+    std::puts("PASS full-frame lifts with unrelated residue, common drift, and ambiguous local signal");
     check_stripe();
-    std::puts("PASS covered, unrelated, moving, and skipped P stripes");
+    std::puts("PASS covered, unrelated, moving, and skipped P stripes with local signal checks");
     check_deadline();
-    std::puts("PASS same-ID recovery at the deadline and cancellation after silence");
+    std::puts("PASS same-ID recovery, full-frame lift at the dropout boundary, and cancellation after silence");
     check_hid();
     std::puts("PASS cancel, tip-state clear, retry, new down, and surviving finger reports");
     check_queue();
     std::puts("PASS queued cancellation survives an unsuccessful publication");
+    check_lift_submission();
+    std::puts("PASS frame-to-HID lift versus stream loss, with original ticks and last acknowledged XY");
     check_motion();
     std::puts("PASS initial motion, sustained drag, reversal, stop, and isolated noise");
 }

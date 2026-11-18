@@ -208,13 +208,13 @@
       "repository": "device/drivers/ShengNovatekTouch",
       "path": "NvtTouchCore.c",
       "before_sha256": "9a972542ebcc3e53fc2470f2f4526f16a1f3a144989b1167d22fbbcdf75112b4",
-      "sha256": "69a73b0cae86176acf41a48805ed419c4c02c8bb0a30f93e74383c726b8e94f2"
+      "sha256": "cb0dd3504ef0b1aae52326bda8fec4c1a271aa66ae43d42f1599a029134f7f31"
     },
     "device/drivers/ShengNovatekTouch/NvtTouchCore.h": {
       "repository": "device/drivers/ShengNovatekTouch",
       "path": "NvtTouchCore.h",
       "before_sha256": "d3bb77c1b7e47a00defce855d1c7b2e55c542eb8068a488722afcbcd3201d08e",
-      "sha256": "384c07f8e12a3e2a02e9e5619850e2d05e150723bf8bcd522732ca53ac6f50f7"
+      "sha256": "9f40d5e420515c15a0d0095069d950f603c2aea607b5b836cdd0a2726b9d84e4"
     },
     "device/drivers/ShengNovatekTouch/README.md": {
       "repository": "device/drivers/ShengNovatekTouch",

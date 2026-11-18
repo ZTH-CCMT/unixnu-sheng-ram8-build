@@ -132,8 +132,8 @@ int nvt_touch_process(struct nvt_touch_core *core, const int16_t *matrix, unsign
 #define NVT_PENDING_MAX_US UINT64_C(25000)
 #define NVT_DROPOUT_MAX_US UINT64_C(25000)
 #define NVT_OBSERVATION_MAX_US UINT64_C(100000)
-// Like the legacy API, but timestamps are monotonic microseconds. Retire
-// overdue slots first and allow a qualified observation at the exact deadline.
+// Timestamps are monotonic microseconds. An already-read full frame can
+// resolve a visible dropout up to one scan interval past its deadline.
 int nvt_touch_process_timed(struct nvt_touch_core *core, const int16_t *matrix,
                            unsigned frame_type, uint64_t now_us,
                            struct nvt_contact *out, int max);

@@ -283,7 +283,7 @@ static struct electrode_span contact_span(int measured, int predicted, int short
 }
 
 static int matrix_contact_quiet(const struct nvt_touch_core *core, const struct track_projection *projection,
-                                const struct peak_bounds *bounds, uint32_t survivor_labels) {
+                                const struct peak_bounds *bounds, uint32_t survivor_labels, int background_delta) {
     const struct electrode_span rows = contact_span(projection->raw_y, projection->y, 1);
     const struct electrode_span cols = contact_span(projection->raw_x, projection->x, 0);
     const int top = rows.first >= NVT_MERGE_SPAN ? rows.first - NVT_MERGE_SPAN : 0;
@@ -293,11 +293,16 @@ static int matrix_contact_quiet(const struct nvt_touch_core *core, const struct 
     for (int r = top; r <= bottom; ++r) {
         for (int c = left; c <= right; ++c) {
             const int node = r * NVT_COLUMNS + c;
-            const int delta = core->delta[node];
-            if (delta <= -NVT_NOISE_THRESHOLD) return 0;
-            if (delta < NVT_NOISE_THRESHOLD) continue;
+            const int delta = core->delta[node] - background_delta;
+            const int inside = r >= rows.first && r <= rows.last && c >= cols.first && c <= cols.last;
+            if (delta < NVT_NOISE_THRESHOLD) {
+                // A negative residual makes the contact footprint uncertain.
+                // The surrounding ring is only needed to attribute positive signal.
+                if (inside && delta <= -NVT_NOISE_THRESHOLD) return 0;
+                continue;
+            }
             // The measured-to-predicted footprint itself must be quiet.
-            if (r >= rows.first && r <= rows.last && c >= cols.first && c <= cols.last) return 0;
+            if (inside) return 0;
             // A matched neighbor can account for its tail only if its whole peak group is outside.
             const int label = core->label[node];
             if (label < 0 || !(survivor_labels & (UINT32_C(1) << label))) return 0;
@@ -320,6 +325,9 @@ static int miss_reason(const struct track_projection *projection, const struct n
         const int64_t distance = weak && projection->timed ?
             track_distance(projection, found[c].x, found[c].y) :
             point_cost(found[c].x, found[c].y, projection->raw_x, projection->raw_y);
+        // Leave unassigned weak residue outside rejoin range to the footprint test.
+        if (projection->timed && weak && !used[c] &&
+            distance > projection->rejoin_radius * projection->rejoin_radius) continue;
         if (best >= 0 && distance >= best) continue;
         best = distance;
         reason = used[c] ? NVT_MISS_TAKEN : weak ? NVT_MISS_WEAK : NVT_MISS_FAR;
@@ -473,7 +481,7 @@ static int common_reference_delta(const struct nvt_touch_core *core, const int16
     return samples[grid * grid / 2];
 }
 
-static void measure_and_update_reference(struct nvt_touch_core *core, const int16_t *matrix) {
+static int measure_and_update_reference(struct nvt_touch_core *core, const int16_t *matrix) {
     _Static_assert(NVT_COLUMNS <= 64, "A reference row must fit in one bit mask");
     const int common = common_reference_delta(core, matrix);
     const int guard_threshold = common + NVT_NOISE_THRESHOLD / 2;
@@ -516,6 +524,7 @@ static void measure_and_update_reference(struct nvt_touch_core *core, const int1
         }
     }
     core->reference_frames += moved;
+    return common;
 }
 
 struct peak {int index, value;};
@@ -883,7 +892,7 @@ static int process_matrix(struct nvt_touch_core *core, const int16_t *matrix, un
         return -1;
     }
     ++core->frames_by_type[frame_type==4];
-    measure_and_update_reference(core, matrix);
+    const int background_delta = measure_and_update_reference(core, matrix);
 
     struct track_projection projections[NVT_SLOTS];
     project_tracks(core, core->now_us, projections);
@@ -917,23 +926,21 @@ static int process_matrix(struct nvt_touch_core *core, const int16_t *matrix, un
         if (best<0) {
             const int visible = core->timed_enabled && slot->age >= 2;
             const int covered_negative = visible &&
-                matrix_contact_quiet(core, &projections[s], candidates.peak_bounds, survivor_labels);
+                matrix_contact_quiet(core, &projections[s], candidates.peak_bounds, survivor_labels,
+                                     background_delta);
             int reason = NVT_MISS_NONE;
             if (!covered_negative) {
                 reason = miss_reason(&projections[s], found, used_contact, nfound, palms, npalms,
                                      core->timed_enabled ? spatial_weak : NULL);
-                // A local residual may have no publishable blob, for example
-                // if the extractor discarded a one-electrode peak.
-                if (visible && reason == NVT_MISS_NONE) reason = NVT_MISS_WEAK;
             }
+            // An ambiguous footprint without a candidate gets one scan to resolve.
+            const int retry_uncertain = !covered_negative && reason == NVT_MISS_NONE && !slot->missed;
             if (!slot->missed) slot->miss_reason = reason;
             // Keep a partial dropout, including a fading signal at the finger.
             // An otherwise quiet matrix with only distant noise is a release.
             ++slot->missed;
             const int legacy_hold=(peak_active || reason == NVT_MISS_WEAK) && slot->age >= 2 && slot->missed <= NVT_HOLD_FRAMES;
-            // Aggressive policy never keeps an unmatched old point alongside a
-            // distant/reassigned/palm peak. Only a weak nearby dropout is bridged.
-            const int timed_hold=reason==NVT_MISS_WEAK && slot->age>=2 &&
+            const int timed_hold=(reason==NVT_MISS_WEAK || retry_uncertain) && slot->age>=2 &&
                 core->now_us>=slot->last_observed_us && core->now_us-slot->last_observed_us<NVT_DROPOUT_MAX_US;
             if(core->timed_enabled ? timed_hold : legacy_hold)continue;
             if(core->timed_enabled) {
@@ -1155,11 +1162,6 @@ int nvt_touch_quiet_stripe_for_ids(struct nvt_touch_core *core, const int16_t *r
        first_row<0 || row_count<1 || first_row>NVT_ROWS-row_count ||
        !ids || now_us<=previous_us || (core->clock_valid && now_us<core->now_us))return -1;
     const int last_row=first_row+row_count-1;
-    // Check the entire width of the observed stripe for a moving contact.
-    for(int i=0;i<row_count*NVT_COLUMNS;++i) {
-        const int delta=(int)rows[i]-core->reference[first_row*NVT_COLUMNS+i];
-        if(delta<=-NVT_NOISE_THRESHOLD || delta>=NVT_NOISE_THRESHOLD)return -1;
-    }
     const int top=nvt_touch_map_edge_axis(kRowMap[first_row]*NVT_SUPER_RESOLUTION,NVT_SHORT_AXIS_MAX,1);
     const int bottom=nvt_touch_map_edge_axis(kRowMap[last_row]*NVT_SUPER_RESOLUTION,NVT_SHORT_AXIS_MAX,1);
     struct track_projection projections[NVT_SLOTS];
@@ -1181,7 +1183,24 @@ int nvt_touch_quiet_stripe_for_ids(struct nvt_touch_core *core, const int16_t *r
         const int low=(p->y<p->raw_y ? p->y : p->raw_y)-radius;
         const int high=(p->y>p->raw_y ? p->y : p->raw_y)+radius;
         if((first_row!=0 && low<top) || (last_row!=NVT_ROWS-1 && high>bottom))continue;
-        if(nvt_touch_covered_negative(core,slot->tracking_id,slot->generation,now_us,out,max)>=0)changed=1;
+        const struct electrode_span covered_rows=contact_span(low,high,1);
+        if(covered_rows.first<first_row || covered_rows.last>last_row)continue;
+        const int left=(p->x<p->raw_x ? p->x : p->raw_x)-radius;
+        const int right=(p->x>p->raw_x ? p->x : p->raw_x)+radius;
+        const struct electrode_span covered_cols=contact_span(left,right,0);
+        int quiet=1;
+        for(int row=covered_rows.first;quiet && row<=covered_rows.last;++row) {
+            for(int col=covered_cols.first;col<=covered_cols.last;++col) {
+                const int delta=(int)rows[(row-first_row)*NVT_COLUMNS+col]-
+                    core->reference[row*NVT_COLUMNS+col];
+                if(delta<=-NVT_NOISE_THRESHOLD || delta>=NVT_NOISE_THRESHOLD) {
+                    quiet=0;
+                    break;
+                }
+            }
+        }
+        if(quiet && nvt_touch_covered_negative(core,slot->tracking_id,slot->generation,now_us,out,max)>=0)
+            changed=1;
     }
     return changed ? visible_set(core,out,max) : -1;
 }
@@ -1193,11 +1212,14 @@ int nvt_touch_quiet_stripe(struct nvt_touch_core *core, const int16_t *rows,
                                          UINT32_MAX, out, max);
 }
 
-static int expire_contacts(struct nvt_touch_core *core, uint64_t now_us, int before_observation,
+enum expiry_phase { EXPIRY_TIMER, EXPIRY_REGION, EXPIRY_FULL_FRAME };
+
+static int expire_contacts(struct nvt_touch_core *core, uint64_t now_us, enum expiry_phase phase,
                            struct nvt_contact *out, int max) {
     if(!core || !out || max<0)return -1;
     core->timed_enabled=1;
     const int rollback=core->clock_valid && now_us<core->now_us;
+    const int before_observation=phase!=EXPIRY_TIMER;
     if (before_observation && (!core->clock_valid || now_us != core->now_us)) {
         core->previous_retired_ids=core->retired_ids;
         core->retired_ids=0;
@@ -1214,10 +1236,11 @@ static int expire_contacts(struct nvt_touch_core *core, uint64_t now_us, int bef
         const int pending=slot->age<2;
         const uint64_t since=pending ? slot->born_us : slot->last_observed_us;
         const uint64_t elapsed=now_us>=since ? now_us-since : 0;
-        const uint64_t deadline=pending ? NVT_PENDING_MAX_US :
+        uint64_t deadline=pending ? NVT_PENDING_MAX_US :
             slot->missed ? NVT_DROPOUT_MAX_US : NVT_OBSERVATION_MAX_US;
-        // An observation stamped exactly at a visible deadline gets a chance
-        // to match before the timer expires the remaining slots.
+        // A full frame is already in hand. Let it resolve a dropout even if
+        // completing the read ran past the deadline by one scan interval.
+        if(phase==EXPIRY_FULL_FRAME && !pending && slot->missed)deadline+=SCAN_INTERVAL_US;
         const int overdue=elapsed>deadline || (elapsed==deadline && (pending || !before_observation));
         if(!rollback && !overdue)continue;
         if(pending)++core->pending_expired;
@@ -1234,11 +1257,11 @@ static int expire_contacts(struct nvt_touch_core *core, uint64_t now_us, int bef
 
 int nvt_touch_begin_observation(struct nvt_touch_core *core, uint64_t now_us,
                                 struct nvt_contact *out, int max) {
-    return expire_contacts(core,now_us,1,out,max);
+    return expire_contacts(core,now_us,EXPIRY_REGION,out,max);
 }
 
 int nvt_touch_expire(struct nvt_touch_core *core,uint64_t now_us,struct nvt_contact *out,int max) {
-    return expire_contacts(core,now_us,0,out,max);
+    return expire_contacts(core,now_us,EXPIRY_TIMER,out,max);
 }
 
 uint64_t nvt_touch_wait_us(const struct nvt_touch_core *core,uint64_t now_us) {
@@ -1259,7 +1282,7 @@ uint64_t nvt_touch_wait_us(const struct nvt_touch_core *core,uint64_t now_us) {
 int nvt_touch_process_timed(struct nvt_touch_core *core,const int16_t *matrix,unsigned frame_type,
                            uint64_t now_us,struct nvt_contact *out,int max) {
     if(!core || !matrix || !out || max<0 || (frame_type!=2 && frame_type!=4))return -1;
-    const int expired=nvt_touch_begin_observation(core,now_us,out,max);
+    const int expired=expire_contacts(core,now_us,EXPIRY_FULL_FRAME,out,max);
     core->previous_matrix_us=now_us;core->matrix_clock_valid=1;
     const int observed=process_matrix(core,matrix,frame_type,out,max);
     return observed>=0 ? observed : expired;
