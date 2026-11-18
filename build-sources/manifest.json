@@ -268,7 +268,7 @@
       "repository": "device",
       "path": "package/TouchReportTimeline.h",
       "before_sha256": null,
-      "sha256": "f7ae5625c38f02ec800ef3dad68b5996216360a6dd62aeb298ea8b3687d1c6b6"
+      "sha256": "1fd0c7041a07f9edf1150d280588133f3dc50109de356b5a891f0949e827ee7b"
     },
     "device/scripts/build-gop-legacy-display-27.py": {
       "repository": "device",

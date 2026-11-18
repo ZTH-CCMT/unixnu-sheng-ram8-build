@@ -54,6 +54,10 @@ jobs:
           python3 -B -m unittest discover -s UniXNU/kits/XnuPrelink -p 'test_*.py'
           python3 device/scripts/check-bluetooth-platform.py
           python3 device/scripts/extract-files.py --section Keyboard
+      - name: Check touch timeline with the XNU queue macro
+        run: |
+          printf '%s\n' '#define enqueue(queue, elt) enqueue_tail(queue, elt)' '#include "TouchReportTimeline.h"' |
+            xcrun clang++ -std=c++17 -fsyntax-only -x c++ -I device/package -I device/drivers/ShengNovatekTouch -
       - name: Check Metal frontend before the expensive native build
         run: python3 pipeline/ci/check_metal_frontend.py --top "$GITHUB_WORKSPACE"
       - name: Install author build dependencies

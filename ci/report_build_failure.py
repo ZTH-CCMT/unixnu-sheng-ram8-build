@@ -3,6 +3,7 @@
 import pathlib,re,shutil,sys
 root=pathlib.Path(sys.argv[1]).resolve(); dest=root/'build-failure-logs';dest.mkdir(exist_ok=True)
 paths=sorted((root/'UniXNU/out/sheng').glob('*/*/logs/*.log'))
+paths[:0]=sorted((root/'UniXNU/out/sheng').glob('*/*/tree/build/sheng-source-drivers/*.log'))
 if (root/'metal-frontend-check.log').is_file():paths.insert(0,root/'metal-frontend-check.log')
 pattern=re.compile(r'(?:fatal )?error:|undefined symbols|Undefined symbols|Traceback \(most recent call last\)')
 for path in paths:

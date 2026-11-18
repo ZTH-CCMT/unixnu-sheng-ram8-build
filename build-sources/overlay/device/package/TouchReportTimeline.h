@@ -57,7 +57,7 @@ struct TouchReportTimeline {
         point.generation=slot.generation;
     }
 
-    void enqueue(Frame &frame) {
+    void enqueueSnapshot(Frame &frame) {
         if (used==Capacity) {
             // Keep the head for retry, including any partial HID submission.
             // Only the first disappearance of each head identity can end it.
@@ -89,7 +89,7 @@ struct TouchReportTimeline {
         release.timeUs=nowUs;
         release.timeTicks=ticks;
         release.cancelledIds=cancelledIds;
-        enqueue(release);
+        enqueueSnapshot(release);
     }
 
     bool unchanged(const Frame &frame) const {
@@ -160,11 +160,11 @@ struct TouchReportTimeline {
                 origin.timeTicks=starts[s].ticks;
                 origin.point[0].contact.x=slot.origin_x;
                 origin.point[0].contact.y=slot.origin_y;
-                enqueue(origin);
+                enqueueSnapshot(origin);
             }
         }
         for (unsigned s=0;s<NVT_SLOTS;++s) if (visible(core.slots[s])) starts[s]={};
-        if (!unchanged(frame)) enqueue(frame);
+        if (!unchanged(frame)) enqueueSnapshot(frame);
         return true;
     }
 
