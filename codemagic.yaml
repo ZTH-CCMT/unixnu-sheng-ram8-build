@@ -49,6 +49,9 @@ definitions:
         cd "$top"
         python3 device/scripts/check-bluetooth-platform.py
         python3 device/scripts/extract-files.py --section Keyboard
+        printf '%s\n' '#define enqueue(queue, elt) enqueue_tail(queue, elt)' '#include "TouchReportTimeline.h"' |
+          xcrun clang++ -std=c++17 -fsyntax-only -x c++ -I device/package -I device/drivers/ShengNovatekTouch -
+        python3 "$CM_BUILD_DIR/ci/check_metal_frontend.py" --top "$top"
 
     - &build_handoff
       name: Build and verify the generic boot handoff
@@ -69,7 +72,9 @@ definitions:
         ipsw version
         rustup toolchain install 1.98.0 --profile minimal --component rust-src
         cargo +1.98.0 --version
-        if python3 "$CM_BUILD_DIR/ci/native_build.py" --top "$top"; then
+        gpu_key=$(python3 "$CM_BUILD_DIR/ci/gpu_cache_key.py")
+        gpu_cache="$HOME/.cache/unixnu/ios27-gpu/$gpu_key"
+        if python3 "$CM_BUILD_DIR/ci/native_build.py" --top "$top" --gpu-cache "$gpu_cache"; then
           :
         else
           status=$?
@@ -78,19 +83,22 @@ definitions:
         fi
         (
           cd "$top/os27-ram8-handoff"
-          zip -0 -q -r "$CM_BUILD_DIR/os27-ram8-v6.3-touch-handoff.zip" .
+          zip -0 -q -r "$CM_BUILD_DIR/os27-ram8-v6.3-touch-lift-handoff.zip" .
         )
 
 workflows:
   unixnu-v63-touch-release-handoff:
-    name: UniXNU V6.3 Touch ARM64e boot handoff
+    name: UniXNU V6.3 Touch Lift ARM64e boot handoff
     instance_type: mac_mini_m2
     max_build_duration: 120
     environment: *macos_environment
+    cache:
+      cache_paths:
+        - ~/.cache/unixnu/ios27-gpu
     scripts:
       - *check_runner
       - *stage_sources
       - *build_handoff
     artifacts:
-      - os27-ram8-v6.3-touch-handoff.zip
+      - os27-ram8-v6.3-touch-lift-handoff.zip
       - .unixnu-build/build-failure-logs/**/*.log
