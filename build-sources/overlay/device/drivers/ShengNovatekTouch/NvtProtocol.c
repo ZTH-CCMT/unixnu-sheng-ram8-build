@@ -315,6 +315,22 @@ unsigned nvt_frame_counter(const uint8_t *frame) {return (unsigned)frame[NVT_THP
 unsigned nvt_frame_data_type(const uint8_t *frame) {return frame[NVT_THP_DATA_TYPE_OFFSET];}
 int nvt_frame_is_stylus(const uint8_t *frame) {return nvt_frame_data_type(frame)==0x1d;}
 
+enum nvt_frame_kind nvt_classify_frame(const uint8_t *frame, size_t length) {
+    if (!frame || length != NVT_THP_FRAME_LEN || !nvt_frame_header_valid(frame))
+        return NVT_FRAME_INVALID;
+    const unsigned type = nvt_frame_type(frame);
+    if (type != 2 && type != 4) return NVT_FRAME_INVALID;
+
+    const unsigned data_type = nvt_frame_data_type(frame);
+    // Also accept the zero-tag form of the type-2 reference frame.
+    if (data_type == 0x03 || (type == 2 && data_type == 0))
+        return NVT_FRAME_MUTUAL;
+    const unsigned block = frame[NVT_THP_PARTIAL_BLOCK_OFFSET];
+    if (data_type == 0x1d && block >= 1 && block <= NVT_THP_PARTIAL_BLOCKS)
+        return NVT_FRAME_PARTIAL;
+    return NVT_FRAME_INVALID;
+}
+
 int nvt_get_fw_info(struct nvt_chip *c, struct nvt_fw_info *info) {
     uint8_t b[38];
     memset(info,0,sizeof *info);
@@ -329,13 +345,21 @@ int nvt_get_fw_info(struct nvt_chip *c, struct nvt_fw_info *info) {
     info->defaulted=1;
     return NVT_ERR_FW;
 }
+int nvt_write_custom_cmd(struct nvt_chip *c, uint8_t cmd, uint16_t value) {
+    const uint8_t b[5] = {0xbf, cmd, 0x00, (uint8_t)value, (uint8_t)(value >> 8)};
+    return nvt_write(c, c->map->event_buf + NVT_EVENT_HOST_CMD, b, sizeof b);
+}
+
+int nvt_read_custom_cmd_status(struct nvt_chip *c, uint8_t *status) {
+    return nvt_read(c, c->map->event_buf + NVT_EVENT_HOST_CMD, status, 1);
+}
+
 int nvt_set_custom_cmd(struct nvt_chip *c, uint8_t cmd, uint16_t value) {
-    delay(c,35);
-    for (int tries=0;tries<5;++tries) {
-        uint8_t b[5]={0xbf,cmd,0x00,(uint8_t)value,(uint8_t)(value>>8)};
-        int r=nvt_write(c,c->map->event_buf+NVT_EVENT_HOST_CMD,b,sizeof b);if (r) return r;
-        delay(c,20);
-        uint8_t st=0xff;r=nvt_read(c,c->map->event_buf+NVT_EVENT_HOST_CMD,&st,1);if (r) return r;
+    delay(c,NVT_CUSTOM_CMD_SETTLE_MS);
+    for (int tries=0;tries<NVT_CUSTOM_CMD_TRIES;++tries) {
+        int r=nvt_write_custom_cmd(c,cmd,value);if (r) return r;
+        delay(c,NVT_CUSTOM_CMD_REPLY_MS);
+        uint8_t st=0xff;r=nvt_read_custom_cmd_status(c,&st);if (r) return r;
         if (!st) return 0;
     }
     return NVT_ERR_TIMEOUT;

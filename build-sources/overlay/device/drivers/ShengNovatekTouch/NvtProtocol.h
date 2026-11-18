@@ -11,6 +11,10 @@
 #define NVT_THP_PAYLOAD_LEN 5160
 #define NVT_THP_FRAME_LEN (NVT_THP_HEADER_LEN+NVT_THP_PAYLOAD_LEN)
 #define NVT_THP_MATRIX_OFFSET (NVT_THP_HEADER_LEN+0x40)
+#define NVT_THP_PARTIAL_BLOCK_OFFSET 332
+#define NVT_THP_PARTIAL_VALUES_OFFSET 4217
+#define NVT_THP_PARTIAL_BLOCK_ROWS 10
+#define NVT_THP_PARTIAL_BLOCKS 4
 #define NVT_MAX_PARTITIONS 64
 #define NVT_READ_MAX 8192
 
@@ -99,11 +103,16 @@ int nvt_read_frame(struct nvt_chip *c, uint8_t *frame);
 void nvt_frame_matrix(const uint8_t *frame, int16_t *matrix);
 unsigned nvt_frame_type(const uint8_t *frame);
 unsigned nvt_frame_counter(const uint8_t *frame);
-// Full-frame callers validate the header and freshness before classifying.
-// The upstream sheng THP adapter routes data type0x1d to its stylus pipeline.
+// Raw tag accessors and classification of complete THP frames.
 #define NVT_THP_DATA_TYPE_OFFSET (NVT_THP_HEADER_LEN+0x38)
 unsigned nvt_frame_data_type(const uint8_t *frame);
 int nvt_frame_is_stylus(const uint8_t *frame);
+enum nvt_frame_kind {
+    NVT_FRAME_INVALID,
+    NVT_FRAME_MUTUAL,
+    NVT_FRAME_PARTIAL,
+};
+enum nvt_frame_kind nvt_classify_frame(const uint8_t *frame, size_t length);
 
 // After the download (mirrors the Linux boot flow): firmware info, idle-baseline update, doze delay, doze mode.
 #define NVT_EVENT_HOST_CMD 0x50
@@ -117,6 +126,9 @@ struct nvt_fw_info {
 };
 int nvt_get_fw_info(struct nvt_chip *c, struct nvt_fw_info *info);
 // Host command {0xbf, cmd, 0, lo, hi} at the event buffer; the firmware clears the first byte when it has taken it.
+enum { NVT_CUSTOM_CMD_SETTLE_MS = 35, NVT_CUSTOM_CMD_REPLY_MS = 20, NVT_CUSTOM_CMD_TRIES = 5 };
+int nvt_write_custom_cmd(struct nvt_chip *c, uint8_t cmd, uint16_t value);
+int nvt_read_custom_cmd_status(struct nvt_chip *c, uint8_t *status);
 int nvt_set_custom_cmd(struct nvt_chip *c, uint8_t cmd, uint16_t value);
 int nvt_set_doze_delay(struct nvt_chip *c, uint16_t value);
 int nvt_start_scanning(struct nvt_chip *c, struct nvt_fw_info *info);

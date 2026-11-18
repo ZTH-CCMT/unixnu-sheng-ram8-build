@@ -202,6 +202,7 @@ struct Session {
     unsigned fwParts, fwCasc, fwIlm, fwDlm, fwSize;
     // Frame loop evidence.
     uint32_t reads, bad, irqHigh, irqSeen, irqIdle, peeks, fresh, lastType;
+    uint32_t lastRejectedFormat;
     uint8_t head[24], thp[24];
     int mn, mx;
     int loopRc = 99;                  // engine loopback self-test (99 = not run)
@@ -341,6 +342,7 @@ void traceRows(const Session &s) {
     f.add(" type%u", s.lastType);
     f.add(" reads%u", s.reads);
     f.add(" bad%u", s.bad);
+    if (s.lastRejectedFormat) f.add(" badfmt%06x", s.lastRejectedFormat);
     f.add(" irq%u", s.irqHigh);
     f.add(" seen%u", s.irqSeen);
     f.add(" min%d", static_cast<unsigned>(s.mn));
@@ -444,10 +446,10 @@ extern "C" {volatile uint32_t native_touch_jitter[3];}
 // peak table and frames that moved the reference.
 extern "C" {volatile uint32_t native_touch_hold[14];}
 // The controller leaves its doze mode at the first touch and then announces a frame for every scan for good, whatever the frame's type;
-// the host puts it back (the same host command as after the firmware download) once no finger has been down for three seconds.
-// [0] requests, [1] requests the firmware did not take, [2] wakes after the last request, [3] the type of the last frame announced.
+// the host schedules the same command once no finger has been down for three seconds.
+// [0] requests sent, [1] failed requests, [2] wakes after the last request, [3] last frame type.
 extern "C" {volatile uint32_t native_touch_doze[4];}
-// Where the touch thread's time goes: [0] wakes, [1] peeks, [2] peeks with no new frame, [3] invalid headers, [4] full reads,
+// Where the touch thread's time goes: [0] wakes, [1] peeks, [2] stale frames, [3] invalid frames, [4] full reads,
 // [5] frames processed, then microseconds in [6] peeks, [7] full reads, [8] processing and publishing.
 extern "C" {volatile uint32_t native_touch_cost[9];}
 static inline uint64_t touchTicks() {return mach_absolute_time();}
@@ -462,6 +464,7 @@ extern "C" void native_touch_set_sink(void (*sink)(void *), void *context) {gTou
 // Set while the scripted input (swipe) holds a contact down: the panel's own empty frames, which it reports about 110 times a second
 // with no finger on it, would lift that contact after every scripted frame (int-283: 1247 one-frame strokes, no swipe ever reached the UI).
 volatile bool gScriptedDown;
+static bool gTouchReportResync;
 bool publishAt(unsigned count, const nvt_contact *c, uint64_t ticks,uint32_t cancelledIds=0) {
     int ids[NVT_SLOTS], xs[NVT_SLOTS], ys[NVT_SLOTS];
     for (unsigned i = 0; i < count && i < NVT_SLOTS; ++i) {
@@ -487,6 +490,7 @@ bool publishAt(unsigned count, const nvt_contact *c, uint64_t ticks,uint32_t can
 }
 void publish(unsigned count, const nvt_contact *c) {
     (void)publishAt(count,c,mach_absolute_time());
+    __atomic_store_n(&gTouchReportResync,true,__ATOMIC_RELEASE);
 }
 
 bool snapshot(Session &s) {
@@ -732,41 +736,83 @@ static void aggressiveStats(const nvt_touch_core &core) {
 static bool sendTimeline(void *,unsigned count,const nvt_contact *contacts,uint64_t ticks,uint32_t cancelledIds) {
     return publishAt(count,contacts,ticks,cancelledIds);
 }
-static bool timelineResetPending;
-static bool captureTimeline(TouchEngine &engine,TouchReportTimeline &timeline,uint64_t ticks) {
+static void captureTimeline(TouchEngine &engine,TouchReportTimeline &timeline,uint64_t ticks,
+                            bool observed=true) {
+    if(gScriptedDown)return;
+    const bool resync=__atomic_exchange_n(&gTouchReportResync,false,__ATOMIC_ACQ_REL);
+    if(resync)ticks=mach_absolute_time();
     const uint64_t nowUs=touchUs(ticks);
-    if(timelineResetPending) {
-        if(!publishAt(0,nullptr,ticks,UINT32_MAX))return false;
-        timeline.reset();nvt_touch_reset(engine.core);
-        engine.resetPartial();
-        timelineResetPending=false;
-        return false;
-    }
-    if(!timeline.feed(nowUs,ticks,*engine.core)) {
-        native_touch_astra_stats[4]=native_touch_astra_stats[4]+1;
-        timelineResetPending=true;
-        if(publishAt(0,nullptr,ticks,UINT32_MAX)) {
-            timeline.reset();nvt_touch_reset(engine.core);
-            engine.resetPartial();
-            timelineResetPending=false;
-        }
-        return false;
-    }
+    if(resync)timeline.restartReports(nowUs,ticks,0);
+    if(observed || resync || timeline.clockMovedBack(nowUs,ticks))
+        timeline.feed(nowUs,ticks,*engine.core);
     timeline.flush(nowUs,sendTimeline,nullptr);
     native_touch_astra_stats[0]=engine.partialFrames;
     native_touch_astra_stats[1]=engine.partialPositions;
     native_touch_astra_stats[2]=engine.partialRejected;
     native_touch_astra_stats[3]=engine.transportCancelled;
+    native_touch_astra_stats[4]=static_cast<uint32_t>(timeline.capacityFaults+timeline.clockFaults);
     native_touch_astra_stats[5]=static_cast<uint32_t>(timeline.pendingDropped);
     native_touch_astra_stats[6]=static_cast<uint32_t>(timeline.submitFailures);
     native_touch_astra_stats[7]=timeline.used;
-    return true;
 }
-static unsigned inputWaitMs(TouchEngine &engine,TouchReportTimeline &timeline,uint64_t ticks) {
-    const uint64_t nowUs=touchUs(ticks);
+struct TouchIdleDoze {
+    static constexpr uint64_t IdleUs = 3000000;
+    uint64_t lastContactUs, lastWakeUs, dueUs = 0;
+    unsigned writes = 0;
+    bool requested = false;
+
+    explicit TouchIdleDoze(uint64_t nowUs) : lastContactUs(nowUs), lastWakeUs(nowUs) {}
+
+    uint64_t waitUs(uint64_t nowUs) const {
+        return dueUs ? (dueUs > nowUs ? dueUs - nowUs : 1) : 0;
+    }
+
+    void service(nvt_chip &chip, uint64_t nowUs, bool busy) {
+        if (busy || nowUs - lastWakeUs >= IdleUs) {
+            lastContactUs = nowUs;
+            dueUs = 0;
+            writes = 0;
+            requested = false;
+        }
+        lastWakeUs = nowUs;
+        if (!dueUs) {
+            if (requested) {
+                native_touch_doze[2] = native_touch_doze[2] + 1;
+            } else if (nowUs - lastContactUs >= IdleUs) {
+                requested = true;
+                dueUs = nowUs + NVT_CUSTOM_CMD_SETTLE_MS * 1000;
+            }
+            return;
+        }
+        if (nowUs < dueUs) return;
+
+        if (writes) {
+            uint8_t status = 0xff;
+            const int rc = nvt_read_custom_cmd_status(&chip, &status);
+            if (rc || !status || writes == NVT_CUSTOM_CMD_TRIES) {
+                dueUs = 0;
+                if (rc || status) native_touch_doze[1] = native_touch_doze[1] + 1;
+                return;
+            }
+        } else {
+            native_touch_doze[0] = native_touch_doze[0] + 1;
+            native_touch_doze[2] = 0;
+        }
+        if (nvt_write_custom_cmd(&chip, 0x01, 0x02)) {
+            dueUs = 0;
+            native_touch_doze[1] = native_touch_doze[1] + 1;
+            return;
+        }
+        ++writes;
+        // The same thread can drain IRQs while the controller handles the command.
+        dueUs = touchUs(mach_absolute_time()) + NVT_CUSTOM_CMD_REPLY_MS * 1000;
+    }
+};
+
+static unsigned inputWaitMs(TouchEngine &engine,TouchReportTimeline &timeline,uint64_t nowUs,uint64_t dozeWait) {
     uint64_t wait=engine.waitUs(nowUs),queue=timeline.waitUs(nowUs);
     if(queue && (!wait || queue<wait))wait=queue;
-    if(timelineResetPending)wait=1000;
+    if(dozeWait && (!wait || dozeWait<wait))wait=dozeWait;
     if(!wait)return 0;
     if(gScriptedDown && wait==1)return 100;
     // A ready queue whose synchronous HID callback failed gets a bounded retry.
@@ -779,7 +825,7 @@ static void expireTouchStream(TouchEngine &engine,TouchReportTimeline &timeline,
     nvt_contact out[NVT_SLOTS];
     const int n=engine.expire(nowUs,out,NVT_SLOTS);
     aggressiveStats(*engine.core);
-    if(n>=0 || timelineResetPending) {
+    if(n>=0) {
         native_touch_stream_stats[0]=native_touch_stream_stats[0]+1;
         native_touch_contacts=n>=0?static_cast<uint32_t>(n):0;
         captureTimeline(engine,timeline,ticks);
@@ -789,7 +835,7 @@ static void expireTouchStream(TouchEngine &engine,TouchReportTimeline &timeline,
             end.count=n>=0?n:0;end.peer_distance=UINT16_MAX;end.miss_reason=UINT8_MAX;
             recordPaths(*engine.core,end);
         }
-    } else timeline.flush(nowUs,sendTimeline,nullptr);
+    } else captureTimeline(engine,timeline,ticks,false);
 }
 
 static void touchIrq(void *) {
@@ -948,29 +994,30 @@ static void touchThread(void *, wait_result_t) {
         uint32_t lastCounter = 0xffffffffu;
         unsigned tick = 0, rowTick = 0;
         s->mn = 0; s->mx = 0;
-        // The firmware may not pulse GPIO25 in its idle (doze) mode, so the trigger is the frame counter: a 32-byte peek of the
-        // THP header every few milliseconds (cheap), and a full 5 KB read only for a new, valid touch frame. The interrupt line
-        // is still sampled and counted.
-        // Event driven (int-189): the controller pulses its interrupt line (GPIO 25, rising edge, devicetree novatek,irq-gpio flags 0x2001) for every
-        // frame, the TLMM raises its summary interrupt (SPI 208), the handler acknowledges it and wakes this thread, which then reads the frame. Nothing
-        // wakes while nobody touches the panel. The earlier loop polled the frame counter every 2 ms (int-185: 93 of 300 s of CPU); touch-poll=1
-        // brings that back for diagnosis only, and it is also the fallback if the interrupt cannot be armed (then native_touch_irq_stats[0] says 2).
+        // A GPIO25 pulse starts a full SPI read. Polling uses a short header
+        // to avoid fetching the same 5 KB frame while the controller is idle.
         unsigned pollOnly = 0;
         PE_parse_boot_argn("touch-poll", &pollOnly, sizeof pollOnly);
         initPathTrace();
-        uint64_t dozeAfter = 0, lastContact = mach_absolute_time(), lastWake = lastContact;
-        nanoseconds_to_absolutetime(3000000000ull, &dozeAfter);
-        bool dozeAsked = false;
+        TouchIdleDoze doze(touchUs(mach_absolute_time()));
         TouchEngine engine(s->core,s->partial);
         // Snapshot before enabling: do not absorb the first IRQ into seen.
         uint32_t seen = __atomic_load_n(&gTouchIrqEvents, __ATOMIC_ACQUIRE);
         const bool irqArmed = !pollOnly && armTouchIrq(*s);
         armSpiEngineIrq(*s);
+        auto serviceIdle = [&] {
+            if (irqArmed && __atomic_load_n(&gTouchIrqEvents, __ATOMIC_ACQUIRE) != seen) return;
+            expireTouchStream(engine,*s->timeline,mach_absolute_time(),lastCounter);
+            if (irqArmed && __atomic_load_n(&gTouchIrqEvents, __ATOMIC_ACQUIRE) != seen) return;
+            const uint64_t nowUs = touchUs(mach_absolute_time());
+            doze.service(s->chip, nowUs, gScriptedDown || engine.waitUs(nowUs));
+        };
         for (;;) {
             if (irqArmed) {
                 // Pending hidden candidates also need deadline wakes. A timer
                 // wake expires state only, without issuing an SPI transaction.
-                const unsigned waitMs = inputWaitMs(engine,*s->timeline,mach_absolute_time());
+                const uint64_t nowUs = touchUs(mach_absolute_time());
+                const unsigned waitMs = inputWaitMs(engine,*s->timeline,nowUs,doze.waitUs(nowUs));
                 if (waitMs) assert_wait_timeout((event_t)&gTouchIrqEvents, THREAD_UNINT, waitMs, kMillisecondScale);
                 else assert_wait((event_t)&gTouchIrqEvents, THREAD_UNINT);
                 // Register first, then recheck: an IRQ cannot fall between the
@@ -981,12 +1028,10 @@ static void touchThread(void *, wait_result_t) {
                 const uint32_t ready = __atomic_load_n(&gTouchIrqEvents, __ATOMIC_ACQUIRE);
                 if (ready == seen) {
                     native_touch_stream_stats[4] = native_touch_stream_stats[4] + 1;
-                    // A timer/spurious wake is not a fresh frame: no SPI peek.
-                    if (__atomic_load_n(&gTouchIrqEvents, __ATOMIC_ACQUIRE) == seen)
-                        expireTouchStream(engine,*s->timeline,mach_absolute_time(),lastCounter);
+                    // Timer wakes handle expiry and idle commands without sampling a frame.
+                    serviceIdle();
                     continue;
                 }
-                seen = ready;
             }
             native_touch_cost[0] = native_touch_cost[0] + 1;
             for (;;) {   // every frame that is ready now
@@ -995,58 +1040,77 @@ static void touchThread(void *, wait_result_t) {
                 const bool high = (rd32(s->tlmmIrq.va, 4) & 1) != 0;
                 s->irqHigh = high;
                 if (high) ++s->irqSeen;
-                uint8_t pk[NVT_THP_PEEK_LEN];
-                native_touch_loop_step = 2;
-                const uint64_t peekAt = touchTicks();
-                if (nvt_peek_frame_header(&s->chip, pk)) {fail(11, NVT_ERR_BUS); break;}
-                touchCostAdd(6, peekAt);
-                native_touch_cost[1] = native_touch_cost[1] + 1;
-                native_touch_loop_step = 3;
-                ++s->peeks;
-                for (unsigned q = 0; q < 24; ++q) s->thp[q] = pk[q];
-                if ((++rowTick & 255) == 0) rows(*s);
-                if (!nvt_peek_valid(pk)) {++s->bad; native_touch_cost[3] = native_touch_cost[3] + 1; break;}
-                if (nvt_peek_counter(pk) == lastCounter) {native_touch_cost[2] = native_touch_cost[2] + 1; break;}
-                ++s->fresh;
-                const unsigned peekType = nvt_peek_type(pk);
-                native_touch_doze[3] = peekType;
-                if (peekType != 2 && peekType != 4) {lastCounter = nvt_peek_counter(pk); break;}
+                if (!irqArmed) {
+                    uint8_t pk[NVT_THP_PEEK_LEN];
+                    native_touch_loop_step = 2;
+                    const uint64_t peekAt = touchTicks();
+                    if (nvt_peek_frame_header(&s->chip, pk)) {fail(11, NVT_ERR_BUS); break;}
+                    touchCostAdd(6, peekAt);
+                    native_touch_cost[1] = native_touch_cost[1] + 1;
+                    native_touch_loop_step = 3;
+                    ++s->peeks;
+                    for (unsigned q = 0; q < 24; ++q) s->thp[q] = pk[q];
+                    if (!nvt_peek_valid(pk)) {++s->bad; native_touch_cost[3] = native_touch_cost[3] + 1; break;}
+                    const unsigned peekCounter = nvt_peek_counter(pk);
+                    if (peekCounter == lastCounter) {native_touch_cost[2] = native_touch_cost[2] + 1; break;}
+                    const unsigned peekType = nvt_peek_type(pk);
+                    if (peekType != 2 && peekType != 4) {lastCounter = peekCounter; break;}
+                } else {
+                    // Another pulse during the transfer still requests a read.
+                    seen = __atomic_load_n(&gTouchIrqEvents, __ATOMIC_ACQUIRE);
+                }
                 native_touch_loop_step = 4;
                 const uint64_t readAt = touchTicks();
                 if (nvt_read_frame(&s->chip, s->frame)) {fail(11, NVT_ERR_BUS); break;}
+                const uint64_t readTime = mach_absolute_time();
                 touchCostAdd(7, readAt);
                 native_touch_cost[4] = native_touch_cost[4] + 1;
-                const uint64_t readTime = mach_absolute_time();
                 native_touch_loop_step = 5;
                 ++s->reads;
                 for (unsigned q = 0; q < 24; ++q) s->head[q] = s->frame[q];
-                if (!nvt_frame_header_valid(s->frame)) {++s->bad; break;}
+                if (irqArmed) {
+                    for (unsigned q = 0; q < 24; ++q) s->thp[q] = s->frame[NVT_THP_HEADER_LEN + q];
+                }
+                if ((++rowTick & 255) == 0) rows(*s);
                 const unsigned counter = nvt_frame_counter(s->frame), type = nvt_frame_type(s->frame);
-                if (counter == lastCounter) break;
-                lastCounter = counter;
-                s->lastType = type;
-                if (type != 2 && type != 4) break;
-                const uint64_t nowUs=touchUs(readTime);
-                native_touch_valid = native_touch_valid + 1;
+                const uint64_t nowUs = touchUs(readTime);
                 const uint64_t processAt = touchTicks();
-                native_touch_kind_stats[0] = native_touch_kind_stats[0] + 1;
-                native_touch_kind_stats[6] = type;
-                native_touch_kind_stats[7] = nvt_frame_data_type(s->frame);
-                native_touch_kind_stats[8] = counter;
                 struct nvt_contact out[NVT_SLOTS];
                 const auto merges=s->core->merges;
                 native_touch_loop_step=6;
                 // This exact shared production entry is also exercised offline.
                 const int n=engine.frame(s->frame,NVT_THP_FRAME_LEN,nowUs,s->matrix,out,NVT_SLOTS);
-                if(n==TouchEngine::Rejected){++s->bad;break;}
+                if (n == TouchEngine::Rejected) {
+                    ++s->bad;
+                    native_touch_cost[3] = native_touch_cost[3] + 1;
+                    // Poll past an unsupported packet. A broken header gives no cursor.
+                    if (nvt_frame_header_valid(s->frame)) {
+                        lastCounter = counter;
+                        s->lastRejectedFormat = (type << 16) | (nvt_frame_data_type(s->frame) << 8) |
+                            s->frame[NVT_THP_PARTIAL_BLOCK_OFFSET];
+                    }
+                    break;
+                }
+                lastCounter = counter;
+                if (n == TouchEngine::Stale) {native_touch_cost[2] = native_touch_cost[2] + 1; break;}
+                s->lastType = type;
+                native_touch_doze[3] = type;
+                ++s->fresh;
+                native_touch_valid = native_touch_valid + 1;
+                native_touch_kind_stats[0] = native_touch_kind_stats[0] + 1;
+                native_touch_kind_stats[6] = type;
+                native_touch_kind_stats[7] = nvt_frame_data_type(s->frame);
+                native_touch_kind_stats[8] = counter;
                 if (n == TouchEngine::SpecialP) {
                     native_touch_kind_stats[2] = native_touch_kind_stats[2] + 1;
                     // No accepted two-dimensional PM position in this packet.
                     // Pen planes and unknown regions never renew a finger lease.
+                    if (s->timeline->used || __atomic_load_n(&gTouchReportResync,__ATOMIC_ACQUIRE))
+                        captureTimeline(engine,*s->timeline,readTime,false);
                     touchCostAdd(8, processAt);
                     native_touch_cost[5] = native_touch_cost[5] + 1;
                     if ((++tick & 15) == 0) rows(*s);
-                    if (irqArmed && gTouchIrqEvents == seen) break;   // Same frame-drain boundary as the mutual path.
+                    if (irqArmed && __atomic_load_n(&gTouchIrqEvents, __ATOMIC_ACQUIRE) == seen) break;
                     continue;   // Never decode stylus data as a mutual matrix or reference.
                 }
                 if(engine.isPartial)native_touch_kind_stats[2]=native_touch_kind_stats[2]+1;
@@ -1108,28 +1172,9 @@ static void touchThread(void *, wait_result_t) {
                 touchCostAdd(8, processAt);
                 native_touch_cost[5] = native_touch_cost[5] + 1;
                 if ((++tick & 15) == 0) rows(*s);
-                if (irqArmed && gTouchIrqEvents == seen) break;   // no further pulse: the frame just read was the only one
+                if (irqArmed && __atomic_load_n(&gTouchIrqEvents, __ATOMIC_ACQUIRE) == seen) break;
             }
-            // A pending IRQ gets its chance to update the active touch state.
-            const uint64_t now = mach_absolute_time();
-            if (!irqArmed || __atomic_load_n(&gTouchIrqEvents, __ATOMIC_ACQUIRE) == seen)
-                expireTouchStream(engine, *s->timeline, now, lastCounter);
-            // Check every controller wake, including unsupported frame types.
-            // Pending and visible tracks defer doze regardless of HID delivery.
-            if (now - lastWake >= dozeAfter || gScriptedDown || engine.waitUs(touchUs(now))) {
-                lastContact = now;
-                dozeAsked = false;
-            }
-            lastWake = now;
-            if (dozeAsked) {
-                native_touch_doze[2] = native_touch_doze[2] + 1;
-            } else if (now - lastContact >= dozeAfter &&
-                       (!irqArmed || __atomic_load_n(&gTouchIrqEvents, __ATOMIC_ACQUIRE) == seen)) {
-                dozeAsked = true;
-                native_touch_doze[0] = native_touch_doze[0] + 1;
-                native_touch_doze[2] = 0;
-                if (nvt_set_custom_cmd(&s->chip, 0x01, 0x02)) native_touch_doze[1] = native_touch_doze[1] + 1;
-            }
+            serviceIdle();
             if (!irqArmed) IOSleep(pollOnly ? 2 : 10);   // fallback / diagnosis only
         }
     } while (0);
@@ -1155,8 +1200,8 @@ static void stroke(int id, int x0, int uiY0, int x1, int uiY1, unsigned frames) 
         native_swipe_stats[3] = native_swipe_stats[3] + 1;
         IOSleep(8);
     }
-    gScriptedDown = false;
     publish(0, &c);
+    gScriptedDown = false;
     native_swipe_stats[2] = touchMs();
 }
 // HidInputProbe.cpp's mailbox: 1 asks the HID device for one Home press (sent on its next 1 s timer tick).

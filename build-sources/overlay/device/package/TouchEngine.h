@@ -8,15 +8,17 @@ extern "C" {
 #include "NvtPartialObservation.h"
 #include "NvtCoverage.h"
 }
-// One owner, no allocation or device I/O. Frame freshness is validated by caller.
+// One owner, no allocation or device I/O. Only accepted frames advance the input stream.
 // Only typed mutual observations create/update fingers; pen planes stay separate.
 struct TouchEngine {
-    enum { SpecialP=-2, Rejected=-3 };
+    enum { SpecialP=-2, Rejected=-3, Stale=-4 };
     nvt_touch_core *core;
     nvt_partial_state *partial;
-    uint64_t streamUs, mutualUs, previousUs;
+    uint64_t streamUs, previousUs;
     uint16_t streamCounter=0;
     bool haveStreamCounter=false;
+    uint16_t recoveryCounter=0;
+    bool haveRecoveryCounter=false;
     unsigned partialFrames, partialPositions, partialRejected, transportCancelled;
     bool isPartial;
     struct CoverageFacts {
@@ -32,7 +34,7 @@ struct TouchEngine {
     void *coverageContext;
     uint64_t sampleToken;
     explicit TouchEngine(nvt_touch_core *value,nvt_partial_state *pm=nullptr):
-        core(value),partial(pm),streamUs(0),mutualUs(0),previousUs(0),
+        core(value),partial(pm),streamUs(0),previousUs(0),
         partialFrames(0),partialPositions(0),partialRejected(0),transportCancelled(0),isPartial(false),
         coverageProvider(nullptr),coverageContext(nullptr),sampleToken(0) {}
     // The owner supplied this configuration explicitly. Reset clears templates
@@ -47,21 +49,33 @@ struct TouchEngine {
     void setCoverageProvider(CoverageProvider provider,void *context) {
         coverageProvider=provider;coverageContext=context;
     }
-    int coveredNegative(const uint8_t *raw,uint64_t nowUs,nvt_contact *out,int max) {
+private:
+    static constexpr unsigned PartialSamples = NVT_THP_PARTIAL_BLOCK_ROWS * NVT_COLUMNS;
+    static_assert(NVT_THP_PARTIAL_BLOCK_ROWS * NVT_THP_PARTIAL_BLOCKS == NVT_ROWS,
+                  "P block layout must cover the physical panel");
+    static_assert(NVT_THP_PARTIAL_VALUES_OFFSET + 2 * PartialSamples <= NVT_THP_FRAME_LEN,
+                  "P samples must fit in the THP frame");
+    int coveredNegative(const uint8_t *values, unsigned firstRow, uint64_t nowUs,
+                        uint32_t &fallbackIds, nvt_contact *out, int max) {
         if(!coverageProvider || !core->have_reference)return -1; // UNKNOWN
         int changed=-1;
-        const unsigned block=raw[332];
-        if(block<1 || block>4)return -1;
         for(int i=0;i<NVT_SLOTS;++i) {
             const nvt_slot slot=core->slots[i];
-            if(!slot.active || slot.age<2 || slot.last_observed_us>=nowUs)continue;
+            if(!slot.active || slot.age<2 || slot.last_observed_us>=nowUs ||
+               slot.last_presence_us>=nowUs)continue;
             CoverageFacts facts={};
             if(!coverageProvider(coverageContext,slot,nowUs,&facts) ||
-               facts.contact.position_us!=slot.last_observed_us)continue;
+               facts.contact.position_us!=slot.last_observed_us ||
+               !facts.policy.motion_bounds_verified ||
+               !facts.contact.position_support_bounds_verified)continue;
+            // A verified motion policy owns this contact, including cases
+            // where its uncertainty needs more rows or signal is present.
+            fallbackIds &= ~(UINT32_C(1) << slot.tracking_id);
             nvt_coverage_observation observation={};
             observation.epoch=facts.observed_epoch;observation.sample_token=sampleToken;
-            observation.time_us=nowUs;observation.row0=(block-1)*10;observation.row_count=10;
-            observation.values_le=raw+4217;observation.value_bytes=1200;
+            observation.time_us=nowUs;observation.row0=firstRow;
+            observation.row_count=NVT_THP_PARTIAL_BLOCK_ROWS;
+            observation.values_le=values;observation.value_bytes=2 * PartialSamples;
             observation.baseline=core->reference;observation.fresh=1;
             observation.epoch_trusted=facts.epoch_trusted;
             observation.baseline_trusted=facts.baseline_trusted;
@@ -75,13 +89,42 @@ struct TouchEngine {
         }
         return changed;
     }
+public:
     void clock(uint64_t nowUs) {
         if(previousUs && nowUs<previousUs) {
             resetPartial();
-            streamUs=mutualUs=0;
+            streamUs=0;
             haveStreamCounter=false;
+            haveRecoveryCounter=false;
         }
         previousUs=nowUs;
+    }
+    bool acceptCounter(uint16_t counter,uint64_t nowUs,bool &rebased) {
+        if(!haveStreamCounter || nowUs<previousUs)return true;
+        const uint16_t step=static_cast<uint16_t>(counter-streamCounter);
+        if(step && step<0x8000) {
+            haveRecoveryCounter=false;
+            return true;
+        }
+        if(!step || nowUs-streamUs<NVT_OBSERVATION_MAX_US) {
+            haveRecoveryCounter=false;
+            return false;
+        }
+
+        // A long silence can hide a controller restart. Require a second
+        // advancing frame before reopening the counter at the new position.
+        if(haveRecoveryCounter) {
+            const uint16_t recoveryStep=static_cast<uint16_t>(counter-recoveryCounter);
+            if(!recoveryStep)return false;
+            if(recoveryStep<0x8000) {
+                haveRecoveryCounter=false;
+                rebased=true;
+                return true;
+            }
+        }
+        recoveryCounter=counter;
+        haveRecoveryCounter=true;
+        return false;
     }
     int finishFrame(uint64_t nowUs,nvt_contact *out,int max,int observed,int before=-1) {
         const int expired=nvt_touch_expire(core,nowUs,out,max);
@@ -90,35 +133,39 @@ struct TouchEngine {
     }
     int frame(const uint8_t *raw,size_t rawLength,uint64_t nowUs,int16_t *matrix,nvt_contact *out,int max) {
         isPartial=false;
-        if(!core || !raw || rawLength!=NVT_THP_FRAME_LEN || !matrix || !out || !nvt_frame_header_valid(raw))return Rejected;
-        const unsigned type=nvt_frame_type(raw);
-        if(type!=2 && type!=4)return Rejected;
+        const auto kind=nvt_classify_frame(raw,rawLength);
+        if(!core || !matrix || !out || kind==NVT_FRAME_INVALID)return Rejected;
+        const uint16_t counter=static_cast<uint16_t>(nvt_frame_counter(raw));
+        bool rebased=false;
+        if(!acceptCounter(counter,nowUs,rebased))return Stale;
         core->cancelled_ids=0;
-        // A clock reset ends the old epoch before considering the new one.
+        // Retire old contacts before allowing a restarted counter to match.
         int before=-1;
-        if(core->clock_valid && nowUs<core->now_us)before=nvt_touch_expire(core,nowUs,out,max);
+        if(rebased || (core->clock_valid && nowUs<core->now_us))
+            before=nvt_touch_expire(core,nowUs,out,max);
         clock(nowUs);
         const uint64_t previousFrameUs=streamUs;
-        const uint16_t counter=static_cast<uint16_t>(nvt_frame_counter(raw));
-        const bool adjacent=haveStreamCounter && nowUs>previousFrameUs &&
-            static_cast<uint16_t>(counter-streamCounter)==1;
+        const bool freshStripe=!rebased && haveStreamCounter && nowUs>previousFrameUs;
+        if(rebased)resetPartial();
         streamCounter=counter;haveStreamCounter=true;
         streamUs=nowUs;++sampleToken;
-        if(nvt_frame_is_stylus(raw)) {
+        if(kind==NVT_FRAME_PARTIAL) {
             isPartial=true;++partialFrames;
+            const int overdue=nvt_touch_begin_observation(core,nowUs,out,max);
+            if(overdue>=0)before=overdue;
             if(!partial)return finishFrame(nowUs,out,max,SpecialP,before);
-            const unsigned block=raw[332];
-            if(block<1 || block>4){++partialRejected;return finishFrame(nowUs,out,max,SpecialP,before);}
+            const unsigned firstRow=(raw[NVT_THP_PARTIAL_BLOCK_OFFSET]-1)*NVT_THP_PARTIAL_BLOCK_ROWS;
+            const uint8_t *values=raw+NVT_THP_PARTIAL_VALUES_OFFSET;
             // Complete supported peaks use the exact ordinary-M candidate path.
             // A clipped peak is excluded here, and may be localized by K below.
-            int16_t rows[600];
-            for(unsigned j=0;j<600;++j) {
-                const unsigned v=(unsigned)raw[4217+2*j]|((unsigned)raw[4218+2*j]<<8);
+            int16_t rows[PartialSamples];
+            for(unsigned j=0;j<PartialSamples;++j) {
+                const unsigned v=(unsigned)values[2*j]|((unsigned)values[2*j+1]<<8);
                 rows[j]=static_cast<int16_t>((v&0x8000u)?(int)v-65536:(int)v);
             }
             nvt_region_candidates region={};
             int result=-1;
-            if(nvt_touch_extract_region(core,rows,static_cast<int>((block-1)*10),10,&region)>=0)
+            if(nvt_touch_extract_region_at(core,rows,firstRow,NVT_THP_PARTIAL_BLOCK_ROWS,nowUs,&region)>=0)
                 result=nvt_touch_process_region(core,&region,nowUs,out,max);
             nvt_contact measured[NVT_SLOTS];
             const int count=nvt_partial_measure(partial,core,raw,rawLength,nowUs,measured,NVT_SLOTS);
@@ -132,16 +179,19 @@ struct TouchEngine {
                 const int fitted=nvt_touch_process_partial(core,measured,count,nowUs,out,max);
                 if(fitted>=0){result=fitted;partialPositions+=static_cast<unsigned>(count);}
             }
-            const int negative=coverageProvider ? coveredNegative(raw,nowUs,out,max) :
-                adjacent ? nvt_touch_quiet_stripe(core,rows,static_cast<int>((block-1)*10),10,
-                                                  previousFrameUs,nowUs,out,max) : -1;
-            if(negative>=0)result=negative;
+            if (freshStripe) {
+                uint32_t fallbackIds=UINT32_MAX;
+                const int covered=coveredNegative(values,firstRow,nowUs,fallbackIds,out,max);
+                const int quiet=nvt_touch_quiet_stripe_for_ids(core,rows,firstRow,NVT_THP_PARTIAL_BLOCK_ROWS,
+                                                               previousFrameUs,nowUs,fallbackIds,out,max);
+                if(quiet>=0)result=quiet;
+                else if(covered>=0)result=covered;
+            }
             if(result<0)++partialRejected;
             return finishFrame(nowUs,out,max,result>=0?result:SpecialP,before);
         }
-        mutualUs=nowUs;
         nvt_frame_matrix(raw,matrix);
-        const int result=nvt_touch_process_timed(core,matrix,type,nowUs,out,max);
+        const int result=nvt_touch_process_timed(core,matrix,nvt_frame_type(raw),nowUs,out,max);
         if(partial)nvt_partial_seed(partial,core,matrix,nowUs);
         return finishFrame(nowUs,out,max,result,before);
     }

@@ -428,16 +428,15 @@ int nvt_partial_measure(struct nvt_partial_state *s,const struct nvt_touch_core 
     s->presence_ids=0;s->one_axis_ids=0;
     if(!s->config_valid){s->last_reason=NVT_PM_NOT_CONFIGURED;++s->rejected[NVT_PM_NOT_CONFIGURED];return -1;}
     s->last_reason=NVT_PM_BAD_PACKET;
-    if(length!=NVT_THP_FRAME_LEN || !nvt_frame_header_valid(raw) || !nvt_frame_is_stylus(raw) ||
-       (nvt_frame_type(raw)!=2 && nvt_frame_type(raw)!=4) || raw[332]<1 || raw[332]>4) {
+    if (nvt_classify_frame(raw, length) != NVT_FRAME_PARTIAL) {
         ++s->rejected[NVT_PM_BAD_PACKET];return -1;
     }
     if(s->packet_clock_valid && now<=s->last_packet_us) {
         s->last_reason=NVT_PM_STALE_PACKET;++s->rejected[NVT_PM_STALE_PACKET];return -1;
     }
-    s->packet_clock_valid=1;s->last_packet_us=now;s->last_block=raw[332];
+    s->packet_clock_valid=1;s->last_packet_us=now;s->last_block=raw[NVT_THP_PARTIAL_BLOCK_OFFSET];
     if(!core->have_reference)return 0;
-    const int row0=(raw[332]-1)*10;int found=0;
+    const int row0=(s->last_block-1)*NVT_THP_PARTIAL_BLOCK_ROWS;int found=0;
     for(int i=0;i<NVT_SLOTS && found<max;++i) {
         const struct nvt_slot *slot=&core->slots[i];
         struct nvt_partial_template *t=&s->finger[i];
@@ -449,9 +448,9 @@ int nvt_partial_measure(struct nvt_partial_state *s,const struct nvt_touch_core 
         if(!isolated(core,i,row,col)){++s->rejected[NVT_PM_AMBIGUOUS];continue;}
         const int cr=(row+128)/256,cc=(col+128)/256;
         int count=0,peak=0,above=0,in_range=1;
-        for(int r=maxi(row0,cr-5);r<=mini(row0+9,cr+5);++r)
+        for(int r=maxi(row0,cr-5);r<=mini(row0+NVT_THP_PARTIAL_BLOCK_ROWS-1,cr+5);++r)
             for(int c=maxi(0,cc-5);c<=mini(NVT_COLUMNS-1,cc+5);++c) {
-                const unsigned off=4217u+2u*(unsigned)((r-row0)*NVT_COLUMNS+c);
+                const unsigned off=NVT_THP_PARTIAL_VALUES_OFFSET+2u*(unsigned)((r-row0)*NVT_COLUMNS+c);
                 const unsigned wire=(unsigned)raw[off]|((unsigned)raw[off+1]<<8);
                 const int value=(wire&0x8000u)?(int)wire-65536:(int)wire;
                 const int delta=(int)value-core->reference[r*NVT_COLUMNS+c];
