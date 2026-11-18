@@ -10,6 +10,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import tomllib
 import urllib.request
 
@@ -71,6 +72,25 @@ def get_locked(path, source, size, sha):
     path.write_bytes(content)
 
 
+def prepare_locked_freebsd(wifi, env):
+    destination = wifi / 'deps/freebsd'
+    if destination.exists():
+        return
+    source = json_file(wifi / 'tools/source-lock.json')['freebsd']
+    destination.parent.mkdir(exist_ok=True)
+    # The driver validates the lock after cloning a moving release branch.
+    # Seed its sparse checkout directly at the locked commit instead.
+    with tempfile.TemporaryDirectory(prefix='freebsd-', dir=destination.parent) as temporary:
+        checkout = Path(temporary) / 'checkout'
+        run('git', 'init', '--quiet', checkout, env=env)
+        run('git', '-C', checkout, 'remote', 'add', 'origin', source['url'], env=env)
+        run('git', '-C', checkout, 'fetch', '--no-tags', '--depth=1', '--filter=blob:none',
+            'origin', source['commit'], env=env)
+        run('git', '-C', checkout, 'sparse-checkout', 'set', '--no-cone', *source['paths'], env=env)
+        run('git', '-C', checkout, 'checkout', '--quiet', '--detach', 'FETCH_HEAD', env=env)
+        checkout.rename(destination)
+
+
 def prepare_wifi(top, device, env):
     firmware = device / 'firmware/wcn7850'
     manifest = firmware / 'manifest.json'
@@ -85,6 +105,7 @@ def prepare_wifi(top, device, env):
     wifi = device / 'drivers/Ath12kWifi'
     sparse = dict(env, GIT_CONFIG_COUNT='1', GIT_CONFIG_KEY_0='core.sparseCheckoutCone',
                   GIT_CONFIG_VALUE_0='false')
+    prepare_locked_freebsd(wifi, sparse)
     run('bash', wifi / 'tools/fetch-sources.sh', env=sparse)
     for name in ('linux', 'freebsd'):
         run('git', '-C', wifi / 'deps' / name, 'sparse-checkout', 'reapply',
