@@ -76,7 +76,7 @@
       "repository": "UniXNU/drivers/ArmCpu",
       "path": "ArmCpu.cpp",
       "before_sha256": "6fedbb45f78690e6c5d50c9f371491f8bb45bac0f676ec23dd87507dd1adf02d",
-      "sha256": "edcd0f7b65f7f2dd2e03748f74a1316f7a853b0f24855ee7dc50082a77a540fb"
+      "sha256": "07ba7845549a0e924490293fc7129a3bbf3c0ce8dad674df11b22d1b7da509f5"
     },
     "UniXNU/drivers/GopFramebuffer/NativeLegacyDisplay.cpp": {
       "repository": "UniXNU/drivers/GopFramebuffer",

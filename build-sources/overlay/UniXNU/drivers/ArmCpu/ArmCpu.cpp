@@ -6,6 +6,9 @@
 #include <libkern/c++/OSData.h>
 #include <libkern/c++/OSSymbol.h>
 #include <libkern/libkern.h>
+#include <kern/clock.h>
+#include <kern/thread_call.h>
+#include <mach/clock_types.h>
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
 
@@ -35,11 +38,12 @@ volatile uint32_t armcpu_core_timer[8], armcpu_core_sgi[8];   // per logical cor
 static bool gSpiIpi = false;                // boot-arg armcpu-spi-ipi=1: IPIs are software-pended SPIs 1008+core routed to that core (ICC_SGI1R_EL1 generates nothing on this board)
 static bool gSelfIpi = false;               // boot-arg armcpu-self-ipi=1: every core sends itself SGI 0 from initCPU
 volatile uint32_t armcpu_irq_phase = 0,armcpu_irq_id = 1023;
-// IRQ drains (ArmCpu::interrupt takes interrupts until none is pending) that took more than 128, and the most one took. A burst
+// IRQ drains that took more than 128, the most one took, and returns at the service limit. A burst
 // of timer pops is normal under a hypervisor: a vCPU held off its core finds the next deadline rtclock_intr set already past
 // when it signals end of interrupt, and the virtual timer fires again.
 volatile uint64_t armcpu_irq_long_drains = 0;
 volatile uint32_t armcpu_irq_drain_most = 0;
+volatile uint64_t armcpu_irq_budget_exits = 0;
 volatile uint32_t armcpu_quiesce_calls = 0,armcpu_halt_calls = 0;
 // Secondary-CPU bring-up evidence (smp=1). Step values: 1 nub started, 2 registered, 3 start thread running,
 // 4 PSCI CPU_ON issued, 5 entered initCPU on the new core, 6 GIC redistributor ready, 7 running.
@@ -289,6 +293,19 @@ static uint32_t gSpiRoutes[1024];
 static volatile uint32_t gSpiUsed = 0;
 static uint64_t gBootAffinity = 0;
 static IOLock *gSpiRegistrationLock;
+static const unsigned kIrqDrainBudget = 256;
+static const unsigned kSpiRepeatLimit = 32;
+struct ArmCpuSpiLine {
+  thread_call_t retry;
+  bool driverMasked;
+  bool stormMasked;
+};
+static ArmCpuSpiLine gSpiLine[ARMCPU_SPI_SLOTS]; // Only the first handler slot owns the line.
+static IOSimpleLock *gSpiControlLock;
+extern "C" {
+volatile uint64_t armcpu_spi_storms = 0;
+volatile uint32_t armcpu_spi_storm_id = 0;
+}
 static IOLock *spiRegistrationLock (void)
 {
   IOLock *lock = __atomic_load_n (&gSpiRegistrationLock, __ATOMIC_ACQUIRE);
@@ -300,18 +317,58 @@ static IOLock *spiRegistrationLock (void)
   }
   return candidate;
 }
-static bool spiDispatch (uint32_t intid)
+static unsigned spiDispatch (uint32_t intid)
 {
-  bool handled = false;
-  if (intid < 32 || intid >= 1024) { return false; }
+  if (intid < 32 || intid >= 1020) { return ARMCPU_SPI_SLOTS; }
   uint32_t routes = __atomic_load_n (&gSpiRoutes[intid], __ATOMIC_ACQUIRE);
+  if (!routes) { return ARMCPU_SPI_SLOTS; }
+  const unsigned first = __builtin_ctz (routes);
   while (routes) {
     const uint32_t slot = __builtin_ctz (routes); routes &= routes - 1;
     ArmCpuSpi &spi = gSpi[slot];
     spi.count = spi.count + 1;
-    spi.handler (spi.context); handled = true;
+    spi.handler (spi.context);
   }
-  return handled;
+  return first;
+}
+
+static void spiSetEnabled (uint32_t intid, bool enabled)
+{
+  write32 (gDist, (enabled ? 0x100U : 0x180U) + (intid / 32) * 4, 1U << (intid % 32));
+  __asm__ volatile ("dsb sy" ::: "memory");
+}
+
+static void spiRetry (thread_call_param_t owner, thread_call_param_t)
+{
+  const auto *spi = static_cast<const ArmCpuSpi *> (owner);
+  ArmCpuSpiLine &line = gSpiLine[spi - gSpi];
+  const IOInterruptState state = IOSimpleLockLockDisableInterrupt (gSpiControlLock);
+  line.stormMasked = false;
+  if (!line.driverMasked) { spiSetEnabled (spi->id, true); }
+  IOSimpleLockUnlockEnableInterrupt (gSpiControlLock, state);
+}
+
+static void spiBackOff (unsigned slot)
+{
+  ArmCpuSpiLine &line = gSpiLine[slot];
+  if (!line.retry) { return; } // Edge-triggered lines do not need level-source backoff.
+  const uint32_t intid = gSpi[slot].id;
+  const uint32_t pending = read32 (gDist, 0x200 + (intid / 32) * 4);
+  if (!(pending & (1U << (intid % 32)))) { return; }
+  const IOInterruptState state = IOSimpleLockLockDisableInterrupt (gSpiControlLock);
+  const bool schedule = !line.driverMasked && !line.stormMasked;
+  if (schedule) {
+    spiSetEnabled (intid, false);
+    line.stormMasked = true;
+    armcpu_spi_storms = armcpu_spi_storms + 1;
+    armcpu_spi_storm_id = intid;
+  }
+  IOSimpleLockUnlockEnableInterrupt (gSpiControlLock, state);
+  if (schedule) {
+    uint64_t deadline;
+    clock_interval_to_deadline (2, NSEC_PER_MSEC, &deadline);
+    (void)thread_call_enter_delayed (line.retry, deadline);
+  }
 }
 extern "C" {
 volatile uint64_t armcpu_spi_unhandled = 0;
@@ -756,23 +813,18 @@ void ArmCpu::idleNotify (cpu_id_t cpu, boolean_t enter, uint64_t *)
 
 void ArmCpu::interrupt (void)
 {
-  unsigned drained=0;
+  unsigned drained = 0;
+  unsigned repeats[ARMCPU_SPI_SLOTS] = {};
   ArmCpuCoreStats &core = gCore[logicalId & 7];
   const bool fromIdle = core.wakeOpen != 0;
-  for (;;) {
+  while (drained < kIrqDrainBudget) {
     armcpu_irq_phase=1;
     uint64_t id;
     __asm__ volatile ("mrs %0, icc_iar1_el1" : "=r" (id));
     armcpu_irq_id=static_cast<uint32_t>(id & 0xffffff);
-    if ((id & 0xffffff) >= 1020) {
-      armcpu_irq_phase=0;
-      if (drained > 128) { armcpu_irq_long_drains = armcpu_irq_long_drains + 1; }
-      if (drained > armcpu_irq_drain_most) { armcpu_irq_drain_most = drained; }
-      break;
-    }
-    // Only an interrupt that never stops coming (a level line nobody clears) is a fault: a million in one drain.
+    if ((id & 0xffffff) >= 1020) { break; }
     ++drained;
-    if(diagnosePower && drained>1000000)panic("ArmCpu: IRQ drain exceeds 1000000 id=%llx timer=%llu IPI=%llu",id,armcpu_timer_interrupts,armcpu_ipi_interrupts);
+    unsigned spiSlot = ARMCPU_SPI_SLOTS;
     if ((id & 0xffffff) == 27) {
       armcpu_timer_interrupts = armcpu_timer_interrupts + 1;
       armcpu_core_timer[logicalId & 7] = armcpu_core_timer[logicalId & 7] + 1;
@@ -802,18 +854,23 @@ void ArmCpu::interrupt (void)
       core.deviceInterrupts = core.deviceInterrupts + 1;
       wokenBy (core, 2);
       armcpu_irq_phase = 7;
-      if (spiDispatch (intid)) {
-      } else if (intid >= 32 && gDist != 0) {
+      spiSlot = spiDispatch (intid);
+      if (spiSlot == ARMCPU_SPI_SLOTS) {
+        if (intid < 32 || gDist == 0) { panic ("ArmCpu: unexpected architectural IRQ %llu", id); }
         armcpu_spi_unhandled = armcpu_spi_unhandled + 1;
         armcpu_spi_unhandled_id = intid;
-        write32 (gDist, 0x180 + (intid / 32) * 4, 1U << (intid % 32));
-      } else {
-        panic ("ArmCpu: unexpected architectural IRQ %llu", id);
+        spiSetEnabled (intid, false);
       }
     }
     armcpu_irq_phase=6;
     __asm__ volatile ("msr icc_eoir1_el1, %0; isb" :: "r" (id) : "memory");
+    // EOImode 0 has deactivated this interrupt. Check for a renewed pending level.
+    if (spiSlot < ARMCPU_SPI_SLOTS && ++repeats[spiSlot] >= kSpiRepeatLimit) { spiBackOff (spiSlot); }
   }
+  armcpu_irq_phase = 0;
+  if (drained == kIrqDrainBudget) { __atomic_fetch_add (&armcpu_irq_budget_exits, 1, __ATOMIC_RELAXED); }
+  if (drained > 128) { armcpu_irq_long_drains = armcpu_irq_long_drains + 1; }
+  if (drained > armcpu_irq_drain_most) { armcpu_irq_drain_most = drained; }
 }
 
 void ArmCpu::signalCPU (IOCPU *target)
@@ -1056,6 +1113,13 @@ static IOReturn spiAttachUnlocked (uint32_t intid, bool edge, void (*handler) (v
   const uint32_t word = (intid / 32) * 4, bit = 1U << (intid % 32);
   write32 (gDist, 0x180 + word, bit); // ICENABLER while it is reconfigured
   if (!waitClear (gDist, 0, 1U << 31)) { return kIOReturnTimeout; }
+  if (!gSpiControlLock) { gSpiControlLock = IOSimpleLockAlloc (); }
+  if (!gSpiControlLock) { return kIOReturnNoResources; }
+  if (!edge) {
+    gSpiLine[used].retry = thread_call_allocate_with_options (spiRetry, &gSpi[used],
+        THREAD_CALL_PRIORITY_KERNEL, THREAD_CALL_OPTIONS_ONCE);
+    if (!gSpiLine[used].retry) { return kIOReturnNoResources; }
+  }
   write32 (gDist, 0x80 + word, read32 (gDist, 0x80 + word) | bit); // IGROUPR: group 1 (RAZ/WI if secure owns it)
   *reinterpret_cast<volatile uint8_t *> (gDist + 0x400 + intid) = 0xa0;
   const unsigned cfg = 0xc00 + (intid / 16) * 4, shift = (intid % 16) * 2 + 1;
@@ -1115,9 +1179,13 @@ extern "C" IOReturn armcpu_spi_share (uint32_t intid, void (*handler) (void *), 
 extern "C" IOReturn armcpu_spi_mask (uint32_t intid, bool masked)
 {
   if (!gDist || !armcpu_gic_ready || intid < 32 || intid >= 1020) { return kIOReturnNotReady; }
-  if (!__atomic_load_n (&gSpiRoutes[intid], __ATOMIC_ACQUIRE)) { return kIOReturnNotFound; }
-  write32 (gDist, (masked ? 0x180U : 0x100U) + (intid / 32) * 4, 1U << (intid % 32));
-  __asm__ volatile ("dsb sy" ::: "memory");
+  const uint32_t routes = __atomic_load_n (&gSpiRoutes[intid], __ATOMIC_ACQUIRE);
+  if (!routes) { return kIOReturnNotFound; }
+  ArmCpuSpiLine &line = gSpiLine[__builtin_ctz (routes)];
+  const IOInterruptState state = IOSimpleLockLockDisableInterrupt (gSpiControlLock);
+  line.driverMasked = masked;
+  spiSetEnabled (intid, !masked && !line.stormMasked);
+  IOSimpleLockUnlockEnableInterrupt (gSpiControlLock, state);
   return kIOReturnSuccess;
 }
 
@@ -1162,6 +1230,13 @@ extern "C" unsigned armcpu_stats_row (unsigned index, char *row, unsigned size)
       } else {
         snprintf (row + n, size - n, "version=%x suspend=%d mode=%d", static_cast<uint32_t> (armcpu_psci[1]), armcpu_psci[2], armcpu_psci[3]);
       }
+    }
+    const auto budget = __atomic_load_n (&armcpu_irq_budget_exits, __ATOMIC_RELAXED);
+    const auto storms = armcpu_spi_storms;
+    const unsigned end = static_cast<unsigned> (strnlen (row, size));
+    if ((budget || storms) && end + 1 < size) {
+      snprintf (row + end, size - end, " | irq budget=%llu storm=%llu last=%u",
+                static_cast<unsigned long long> (budget), static_cast<unsigned long long> (storms), armcpu_spi_storm_id);
     }
     return static_cast<unsigned> (strnlen (row, size));
   }
