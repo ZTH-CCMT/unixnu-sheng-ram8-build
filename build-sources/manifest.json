@@ -64,7 +64,7 @@
       "repository": "UniXNU/drivers/Adreno740",
       "path": "tests/test_preempt.cpp",
       "before_sha256": "e9be5cead892741646432e069bc26c443e584359ca82b403049ea6a859129cdb",
-      "sha256": "ccda9639e7d069cc57f3e117472bad40cfe56a8e536778da9dce5ec17aaea246"
+      "sha256": "6ff92030f558341bdd2313a616ed67cc3eb6cf8d0db9e808bd59e1b48aa6c6d0"
     },
     "UniXNU/drivers/Adreno740/tests/test_submit.cpp": {
       "repository": "UniXNU/drivers/Adreno740",
