@@ -117,6 +117,23 @@ static int exposed(Path &p,bool write_combined=false)
         return kIOReturnBadArgument;
     return p.submit.attach(&p.vm,&p.ring);
 }
+static void attachProcess(Path &process,ArmSmmu4KContextConfig &config)
+{
+    CHECK(NativeAdrenoPrepareSmmuMemory(&process.tables,32,40,0x800000,65536,0,16,
+        &process.arena,&process.state,&process.visibility)==kIOReturnSuccess);
+    config=context;
+    config.lower=&process.arena.config;
+    config.lower_tables=&process.state.tables;
+    config.asid=16;
+    config.ttbr0_switched=1;
+    process.state.detached=1;
+    process.state.context_offset=CB;
+    const NativeAdrenoVmRegion lower{&process.tables,&process.arena,&process.state};
+    process.vm.keepStreamsOnFailure();
+    CHECK(process.vm.attach(&smmuio,&config,&streams,&lower,nullptr,32,1000)==kIOReturnSuccess);
+    CHECK(process.object.allocate(8192,40,false,8192)==kIOReturnSuccess);
+    CHECK(process.vm.map(&process.object,0,0x800000,3,0,2,&process.handle)==kIOReturnSuccess);
+}
 void NativeAdrenoNotePhase(unsigned,size_t) {}
 extern "C" {extern volatile uint32_t native_adreno_submit_ibs[4],native_adreno_diag,native_adreno_ib_log[4][4+28],native_adreno_ib_log_count;
     extern volatile uint64_t native_adreno_submit_us[8];
@@ -347,21 +364,9 @@ static void testSwitchTimeoutRecovery(bool reverse)
     CHECK(same_context>uncertain && p.submit.fencePending(same_context));
 
     // A separate VM gets a new command after STOP was armed. It has not been exposed in either ring's write pointer.
+    ArmSmmu4KContextConfig independent_config{};
     Path independent;
-    CHECK(NativeAdrenoPrepareSmmuMemory(&independent.tables,32,40,0x800000,65536,0,16,
-        &independent.arena,&independent.state,&independent.visibility)==kIOReturnSuccess);
-    ArmSmmu4KContextConfig process=context;
-    process.lower=&independent.arena.config;
-    process.lower_tables=&independent.state.tables;
-    process.asid=16;
-    process.ttbr0_switched=1;
-    independent.state.detached=1;
-    independent.state.context_offset=CB;
-    const NativeAdrenoVmRegion lower{&independent.tables,&independent.arena,&independent.state};
-    independent.vm.keepStreamsOnFailure();
-    CHECK(independent.vm.attach(&smmuio,&process,&streams,&lower,nullptr,32,1000)==kIOReturnSuccess);
-    CHECK(independent.object.allocate(8192,40,false,8192)==kIOReturnSuccess);
-    CHECK(independent.vm.map(&independent.object,0,0x800000,3,0,2,&independent.handle)==kIOReturnSuccess);
+    attachProcess(independent,independent_config);
     const NativeAdrenoSubmitBuffer buffer{independent.handle,0x800000,4096};
     uint32_t pending=0;
     p.submit.nextPriority(priority);
@@ -950,8 +955,82 @@ static void testStallDrainStatus()
     std::puts("PASS stall handler preserves pending buffers and records drain failure instead of success");
 }
 
+static void testCpuTableRecovery(bool complete)
+{
+    ArmSmmu4KContextConfig process_config{};
+    Path primary,process;
+    CHECK(exposed(primary)==kIOReturnSuccess);
+    attachProcess(process,process_config);
+    const uint64_t kernel_table=primary.vm.ttbr0(),process_table=process.vm.ttbr0();
+    CHECK(kernel_table!=process_table);
+    struct Replay {
+        NativeAdrenoRing &ring;
+        bool complete;
+        unsigned pauses=0;
+        uint64_t us=0;
+        std::vector<std::pair<uint64_t,uint32_t>> tables;
+    } replay{primary.ring,complete};
+    const auto write=[](void *cookie,uint64_t table)->IOReturn {
+        auto &model=*static_cast<Replay *>(cookie);
+        model.tables.emplace_back(table,fencemem[1]);
+        return kIOReturnSuccess;
+    };
+    CHECK(primary.submit.setTableSwitching(1,write,&replay)==kIOReturnSuccess);
+    const NativeAdrenoSubmitBuffer buffer{process.handle,0x800000,4096};
+    uint32_t fence=0;
+    CHECK(primary.submit.submit(&process.vm,&buffer,1,7,&fence,&ringclock)==0 && fence==1);
+    CHECK(primary.submit.submit(&process.vm,&buffer,1,7,&fence,&ringclock)==0 && fence==2);
+    // A ring-owned packet has no submit Job. Recovery fills its fence with a kernel-table NOP.
+    uint32_t nop=0;
+    CHECK(AdrenoPM4Type7(0x10,0,&nop)==AdrenoPM4Success);
+    CHECK(primary.ring.submit(&nop,1,&fence)==0 && fence==3);
+    CHECK(primary.submit.submit(&process.vm,&buffer,1,7,&fence,&ringclock)==0 && fence==4);
+    CHECK(process.object.deviceReferences()==4);
+    replay.tables.clear();
+
+    const NativeAdrenoRingClock clock{&replay,
+        [](void *cookie) {return static_cast<Replay *>(cookie)->us;},
+        [](void *cookie)->int {
+            auto &model=*static_cast<Replay *>(cookie);
+            CHECK(model.ring.lastSubmitted()==2 || model.ring.lastSubmitted()==3);
+            ++model.pauses;
+            model.us+=100000;
+            if(model.complete && model.pauses%3==0)fencemem[1]=model.ring.lastSubmitted();
+            return 0;
+        }};
+    const auto restart=[](void *,NativeAdrenoRing *ring,uint32_t completed)->IOReturn {
+        CHECK(completed==1);return ring->restart(completed);
+    };
+    NativeAdrenoRecovery result{};
+    const IOReturn status=primary.submit.recover(restart,nullptr,&clock,&result);
+    if(complete) {
+        CHECK(status==kIOReturnSuccess && result.replayed==3);
+        const std::vector<std::pair<uint64_t,uint32_t>> expected{
+            {kernel_table,1},{process_table,1},{kernel_table,2},{process_table,3}};
+        CHECK(replay.tables==expected && replay.pauses==6);
+        CHECK(primary.ring.lastSubmitted()==4 && primary.submit.fencePending(4));
+        CHECK(process.object.deviceReferences()==3 && primary.submit.stats().references_retired==1);
+        CHECK(primary.submit.retireCompleted()==0 && process.object.deviceReferences()==2);
+        fencemem[1]=4;
+        CHECK(primary.submit.wait(4,&clock,0)==0 && process.object.deviceReferences()==1);
+        CHECK(primary.submit.wait(4,&clock,0)==0 && primary.submit.stats().references_retired==3);
+        CHECK(primary.submit.outstanding()==0 && primary.submit.stats().restarts==1);
+        std::puts("PASS CPU-table replay waits only for already-issued fences and preserves IDs and references");
+    } else {
+        CHECK(status==kIOReturnIOError && result.status==kIOReturnTimeout && result.replayed==1);
+        CHECK(replay.tables.size()==2 && replay.tables.back().first==process_table && replay.pauses==20);
+        CHECK(primary.ring.lastSubmitted()==2 && primary.submit.poisoned());
+        CHECK(process.object.deviceReferences()==3 && primary.submit.stats().references_retired==1);
+        CHECK(primary.submit.stats().restarts==0);
+        std::puts("PASS CPU-table replay timeout preserves the live table and unresolved references");
+    }
+}
+
 int main(int argc,char **argv)
 {
+    if(argc==2 && !std::strcmp(argv[1],"--replay-cpu-table")) {
+        testCpuTableRecovery(true);testCpuTableRecovery(false);return 0;
+    }
     if(argc==2 && !std::strcmp(argv[1],"--stall-drain")) {
         testStallDrainStatus();return 0;
     }

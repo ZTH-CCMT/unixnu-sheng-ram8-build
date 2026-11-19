@@ -128,7 +128,9 @@ private:
     NativeAdrenoVm *table_vm_=nullptr;
     void *table_cookie_=nullptr;
     IOReturn (*write_table_)(void *,uint64_t ttbr0)=nullptr;
+    IOReturn installCpuTable(NativeAdrenoVm *);
     IOReturn useVm(NativeAdrenoVm *,const NativeAdrenoRingClock *,unsigned index=0);
+    IOReturn useVmForReplay(NativeAdrenoVm *,const NativeAdrenoRingClock *,uint32_t restart_fence);
     NativeAdrenoRing *ring_=nullptr;
     /* Ring 0 serves requested high priorities; ring 1 serves normal and low work in mode 2.
      * Queue ordering is preserved across priority changes. Board policy enables preemption. */

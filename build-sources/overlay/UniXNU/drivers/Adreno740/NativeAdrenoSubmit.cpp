@@ -249,12 +249,32 @@ IOReturn NativeAdrenoSubmit::useVm(NativeAdrenoVm *vm,const NativeAdrenoRingCloc
     if(table_mode_==2) {ring(index)->useTable(vm->ttbr0());table_vm_=vm;return kIOReturnSuccess;}
     if(vm==table_vm_)return kIOReturnSuccess;
     if(!clock)return kIOReturnBadArgument;
-    IOReturn status=waitAll(clock,2000000);
-    if(status)return status;
-    status=write_table_(table_cookie_,vm->ttbr0());
-    if(status)return poison();
+    const IOReturn status=waitAll(clock,2000000);
+    return status?status:installCpuTable(vm);
+}
+
+IOReturn NativeAdrenoSubmit::installCpuTable(NativeAdrenoVm *vm)
+{
+    if(write_table_(table_cookie_,vm->ttbr0()))return poison();
     native_adreno_table_switches[1]=native_adreno_table_switches[1]+1;
     table_vm_=vm;return kIOReturnSuccess;
+}
+
+IOReturn NativeAdrenoSubmit::useVmForReplay(NativeAdrenoVm *vm,const NativeAdrenoRingClock *clock,uint32_t restart_fence)
+{
+    if(table_mode_!=1)return useVm(vm,clock);
+    if(vm==table_vm_)return kIOReturnSuccess;
+
+    /* Recovery issues all work on ring 0 in order. restart() seeds its counter
+     * at restart_fence. The job list still includes work not yet reissued. */
+    NativeAdrenoRing *const target=ring(0);
+    const uint32_t issued=target->lastSubmitted();
+    if(issued!=restart_fence) {
+        const auto state=target->observeFence(issued,clock,2000000,nullptr);
+        if(state==NativeAdrenoRingFenceTimeout)return kIOReturnTimeout;
+        if(state!=NativeAdrenoRingFenceComplete)return kIOReturnIOError;
+    }
+    return installCpuTable(vm);
 }
 IOReturn NativeAdrenoSubmit::forgetVm(NativeAdrenoVm *vm,const NativeAdrenoRingClock *clock,uint32_t timeout_us)
 {
@@ -1274,8 +1294,12 @@ IOReturn NativeAdrenoSubmit::recoverDual(NativeAdrenoRestart restart,void *cooki
         if(!job)break;
         const uint32_t next=job->fence;
         previous=next;
-        status=useVm(job->vm,clock);
-        if(status)return poison();
+        status=useVmForReplay(job->vm,clock,floor);
+        if(status) {
+            out->status=status;
+            native_adreno_recover_trace[0]=5;native_adreno_recover_trace[1]=uint32_t(status);
+            return poison();
+        }
         ring(0)->useContext(job->context);
         uint32_t value=0;
         job->ring=0;noteFence(next,0);
@@ -1334,8 +1358,12 @@ IOReturn NativeAdrenoSubmit::recover(NativeAdrenoRestart restart,void *cookie,co
         Job *job=find(next);
         NativeAdrenoVm *vm=job && job->vm?job->vm:vm_;
         const bool run=job && !vm->unusable() && job->word_count;
-        status=useVm(vm,clock);
-        if(status) {native_adreno_recover_trace[0]=5;native_adreno_recover_trace[1]=uint32_t(status);return poison();}
+        status=useVmForReplay(vm,clock,hung);
+        if(status) {
+            out->status=status;
+            native_adreno_recover_trace[0]=5;native_adreno_recover_trace[1]=uint32_t(status);
+            return poison();
+        }
         ring(0)->useContext(job?job->context:0);
         uint32_t value=0;
         status=ring(0)->submitFramed(run?job->words:&nop,run?job->word_count:1,&value);
