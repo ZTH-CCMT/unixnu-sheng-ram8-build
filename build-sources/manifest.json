@@ -388,7 +388,7 @@
       "repository": "UniXNU/drivers/AdrenoMetal",
       "path": "NativeAdrenoMetalPlugin.mm",
       "before_sha256": "ade7f1657e5979699609d858fd2201df675f4d9fefe40cdf54f312ee1d8f6a0e",
-      "sha256": "8cb350e7e33b92483fc2a7ecd2cbf608aadcda6892d9262f6ed7d4ad8b2bac3a"
+      "sha256": "8ddd33c96bf360f648bb94618de5599bd60345c8ceb0281360c7fd5997af75b5"
     },
     "UniXNU/drivers/AdrenoMetal/NativeBridgeMetalFrontend.mm": {
       "repository": "UniXNU/drivers/AdrenoMetal",

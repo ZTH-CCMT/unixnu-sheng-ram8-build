@@ -25,6 +25,7 @@
 #include <pwd.h>
 #include <fts.h>
 #include <mach/mach.h>
+#include <mach-o/loader.h>
 #include <sys/sysctl.h>
 #include <libkern/OSCacheControl.h>
 #include <objc/message.h>
@@ -99,8 +100,57 @@ static bool readTask(uintptr_t address, void *out, size_t size) {
     return vm_read_overwrite(mach_task_self(), address, size, (vm_address_t) out, &got) == KERN_SUCCESS && got == size;
 }
 [[maybe_unused]] static bool writeTask(uintptr_t address, const void *data, size_t size) {   // iPadOS only (24A446 QuartzCore)
+    vm_address_t start = address;
+    vm_size_t length = 0;
+    vm_region_basic_info_data_64_t info = {};
+    mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t object = MACH_PORT_NULL;
+    const kern_return_t result = vm_region_64(mach_task_self(), &start, &length, VM_REGION_BASIC_INFO_64,
+        reinterpret_cast<vm_region_info_t>(&info), &count, &object);
+    if (object != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), object);
+    if (result != KERN_SUCCESS || start > address || address - start > length ||
+        size > length - (address - start) || !(info.protection & VM_PROT_WRITE) ||
+        (info.protection & VM_PROT_EXECUTE)) return false;
     return vm_write(mach_task_self(), address, (vm_offset_t) data, (mach_msg_type_number_t) size) == KERN_SUCCESS;
 }
+#if defined(__arm64e__) && !TARGET_OS_OSX
+static bool quartzCoreSlide(uintptr_t &slide) {
+    // Mach-O LC_UUID of QuartzCore itself, from the 24A446 SystemOS image.
+    static const uint8_t expected[16] = {0x76,0xce,0x2a,0x6e,0xdb,0xa4,0x33,0x5d,0xa5,0xac,0x77,0xa1,0xc1,0xb2,0x86,0xa6};
+    constexpr uintptr_t imageBase = 0x1843e7000, renderStart = 0x1846dce88;
+    constexpr uint32_t maxCommandBytes = 65536;
+    void *symbol = dlsym(RTLD_DEFAULT, "CARenderServerStart");
+    if (!symbol) return false;
+    const auto *entry = ptrauth_strip(symbol, ptrauth_key_function_pointer);
+    Dl_info image = {};
+    if (!dladdr(entry, &image) || !image.dli_fbase) return false;
+    const uintptr_t base = reinterpret_cast<uintptr_t>(image.dli_fbase);
+    if (base < imageBase || reinterpret_cast<uintptr_t>(entry) < base ||
+        reinterpret_cast<uintptr_t>(entry) - base != renderStart - imageBase) return false;
+
+    mach_header_64 header = {};
+    if (base > UINTPTR_MAX - sizeof header - maxCommandBytes || !readTask(base, &header, sizeof header) ||
+        header.magic != MH_MAGIC_64 || header.sizeofcmds > maxCommandBytes ||
+        header.ncmds > header.sizeofcmds / sizeof(load_command)) return false;
+    uint32_t offset = 0;
+    for (uint32_t i = 0; i < header.ncmds; ++i) {
+        const uintptr_t address = base + sizeof header + offset;
+        const uint32_t remaining = header.sizeofcmds - offset;
+        load_command command = {};
+        if (remaining < sizeof command || !readTask(address, &command, sizeof command) ||
+            command.cmdsize < sizeof command || command.cmdsize > remaining || command.cmdsize % 8) return false;
+        if (command.cmd == LC_UUID) {
+            uuid_command uuid = {};
+            if (command.cmdsize != sizeof uuid || !readTask(address, &uuid, sizeof uuid) ||
+                memcmp(uuid.uuid, expected, sizeof expected)) return false;
+            slide = base - imageBase;
+            return true;
+        }
+        offset += command.cmdsize;
+    }
+    return false;
+}
+#endif
 // EXPERIMENT (second report onward): this display path takes plain 8-bit BGRA only, so tell the render server's display that it has neither the deep
 // (10-bit) framebuffer nor universal buffer compression. Whether the state it reads those from is the whole story is what the markers show.
 // EXPERIMENT (boot-arg fb-bgra=1): the render server's framebuffer format with every other virtualized answer left as it is.
@@ -140,6 +190,55 @@ static bool bootArgSet(const char *key) {
     if (!restored) return 0x6E53;
     return 0x6E42;
 }
+#if defined(__arm64e__) && !TARGET_OS_OSX
+static void configureQuartzCoreFramebuffer(Gpu *gpu) {
+    uintptr_t slide = 0;
+    if (!quartzCoreSlide(slide)) {
+        gpu->mark(0x6E4F); // Unsupported QuartzCore layout.
+        return;
+    }
+    const float one = 1.0f, never = 1e30f;
+    gpu->mark(writeTask(0x1e7021014 + slide, &one, sizeof one) ? 0x6E01 : 0x6EF1);
+    gpu->mark(writeTask(0x1e7021104 + slide, &never, sizeof never) ? 0x6E02 : 0x6EF2);
+    const uint8_t off = 0;
+    gpu->mark(writeTask(0x1e702116c + 156 + slide, &off, sizeof off) ? 0x6E03 : 0x6EF3);
+    if (strcmp(getprogname(), "backboardd")) return;
+    if (bootArgSet("fb-bgra=1")) gpu->mark(patchFramebufferBranch(0x184461928 + slide));
+
+    pthread_t reader;
+    if (pthread_create(&reader, nullptr, [](void *arg) -> void * {
+        sleep(30);
+        Gpu *gpu = static_cast<Gpu *>(arg);
+        uintptr_t slide = 0;
+        if (!quartzCoreSlide(slide)) {gpu->mark(0x6E4F); return nullptr;}
+        float headroom = 0, threshold = 0;
+        uint8_t force = 0, mirroring = 0, virtualized = 0;
+        if (!readTask(0x1e7021014 + slide, &headroom, sizeof headroom) ||
+            !readTask(0x1e7021104 + slide, &threshold, sizeof threshold) ||
+            !readTask(0x1e702116c + 128 + slide, &force, sizeof force) ||
+            !readTask(0x1e702116c + 156 + slide, &mirroring, sizeof mirroring) ||
+            !readTask(0x1e701bdd9 + slide, &virtualized, sizeof virtualized)) {
+            gpu->mark(0x6E5E);
+            return nullptr;
+        }
+        gpu->mark(0x6E20 | (headroom == 1.0f ? 1 : 0) | (threshold > 1.0f ? 2 : 0) |
+            (force ? 4 : 0) | (mirroring ? 8 : 0) | (virtualized ? 0x10 : 0));
+        uint64_t cf[4] = {};
+        if (!readTask(0x1e9021680 + slide, cf, sizeof cf)) return nullptr;
+        char text[64] = {}, note[96];
+        const uintptr_t bytes = reinterpret_cast<uintptr_t>(ptrauth_strip(reinterpret_cast<void *>(cf[2]),
+            ptrauth_key_process_independent_data));
+        if (uint32_t(cf[1]) == 0x7c8 && cf[3] > 0 && cf[3] < sizeof text &&
+            readTask(bytes, text, size_t(cf[3]))) {
+            snprintf(note, sizeof note, "ca virtualized key %.*s = %u", int(cf[3]), text, virtualized);
+        } else {
+            snprintf(note, sizeof note, "ca virtualized key ? flags %llx = %u", (unsigned long long)cf[1], virtualized);
+        }
+        native_bridge_metal_note(note);
+        return nullptr;
+    }, gpu) == 0) pthread_detach(reader);
+}
+#endif
 // Every process other than the render server: the same runtime on its own connection, with none of the render server's threads (no
 // display hand-off, telemetry, benchmark or cache export). Its shader cache lives in its own cache or temp directory.
 // The reason a client's device failed, as a text line the driver keeps per process (the render server's report row is rewritten every ten seconds):
@@ -448,47 +547,7 @@ static id deviceForPort(unsigned port) {
         setenv("CA_FP16_MIN_HEADROOM", "1e30", 1);
         setenv("CA_ALLOW_EDR_MIRRORING", "0", 1);
 #if !TARGET_OS_OSX
-        // The stored option values and the framebuffer branch are addresses of iPadOS 27's QuartzCore (24A446).
-        if (void *start = dlsym(RTLD_DEFAULT, "CARenderServerStart")) {
-            const uintptr_t slide = (uintptr_t)ptrauth_strip(start, ptrauth_key_function_pointer) - 0x1846dce88;
-            const float one = 1.0f, never = 1e30f;
-            gpu->mark(writeTask(0x1e7021014 + slide, &one, sizeof one) ? 0x6E01 : 0x6EF1);
-            gpu->mark(writeTask(0x1e7021104 + slide, &never, sizeof never) ? 0x6E02 : 0x6EF2);
-            const uint8_t off = 0;
-            gpu->mark(writeTask(0x1e702116c + 156 + slide, &off, sizeof off) ? 0x6E03 : 0x6EF3);
-            if (!strcmp(getprogname(), "backboardd") && bootArgSet("fb-bgra=1")) gpu->mark(patchFramebufferBranch(0x184461928 + slide));
-            // What framebuffer_pixel_format reads in the render server, once the desktop has started (other processes draw no
-            // framebuffer): 0x6E20 | 1 headroom override 1, 2 threshold above 1, 4 CA_FORCE_FP16_FRAMEBUFFER (_ca_debug_options
-            // 0x1e702116c + 128), 8 CA_ALLOW_EDR_MIRRORING (+ 156), 0x10 the device-is-virtualized byte (0x1e701bdd9).
-            // i35abaf83 read 0x6E23 and the framebuffer stayed RGhA (48388K swap surfaces, 8 bytes a pixel). The function has two more
-            // ways to RGhA: the display's own flag (+0x6840 of the display) and, when no compression format was picked, the virtualized
-            // byte, which sub_184541f10 stores once from a call with the constant CFString at 0x1e9021680; the string's text is noted
-            // ("ca virtualized key ...") so the answer behind it can be found.
-            static uintptr_t gSlide;
-            gSlide = slide;
-            pthread_t reader;
-            if (!strcmp(getprogname(), "backboardd") && pthread_create(&reader, nullptr, [](void *arg) -> void * {
-                sleep(30);
-                const float headroom = *reinterpret_cast<volatile const float *>(0x1e7021014 + gSlide);
-                const float threshold = *reinterpret_cast<volatile const float *>(0x1e7021104 + gSlide);
-                const uint8_t force = *reinterpret_cast<volatile const uint8_t *>(0x1e702116c + 128 + gSlide);
-                const uint8_t mirroring = *reinterpret_cast<volatile const uint8_t *>(0x1e702116c + 156 + gSlide);
-                const uint8_t virtualized = *reinterpret_cast<volatile const uint8_t *>(0x1e701bdd9 + gSlide);
-                static_cast<Gpu *>(arg)->mark(0x6E20 | (headroom == 1.0f ? 1 : 0) | (threshold > 1.0f ? 2 : 0) | (force ? 4 : 0) | (mirroring ? 8 : 0) |
-                                              (virtualized ? 0x10 : 0));
-                // A constant CFString: isa, flags, bytes, length. Only an 8-bit constant (flags 0x7c8) with a short length is read.
-                const uint64_t *cf = reinterpret_cast<const uint64_t *>(0x1e9021680 + gSlide);
-                char note[96];
-                if ((uint32_t)cf[1] == 0x7c8 && cf[3] > 0 && cf[3] < 64) {
-                    const char *text = reinterpret_cast<const char *>(ptrauth_strip(reinterpret_cast<void *>(cf[2]), ptrauth_key_process_independent_data));
-                    snprintf(note, sizeof note, "ca virtualized key %.*s = %u", (int)cf[3], text, virtualized);
-                } else
-                    snprintf(note, sizeof note, "ca virtualized key ? flags %llx = %u", (unsigned long long)cf[1], virtualized);
-                native_bridge_metal_note(note);
-                return nullptr;
-            }, gpu) == 0)
-                pthread_detach(reader);
-        }
+        configureQuartzCoreFramebuffer(gpu);
 #else
         // macOS: the framebuffer format is changed as a fixup of signed text (the board's payload text_fixups), applied when the page
         // passes code signing validation. A write into the mapped page from here made the page invalid, and code signing killed
