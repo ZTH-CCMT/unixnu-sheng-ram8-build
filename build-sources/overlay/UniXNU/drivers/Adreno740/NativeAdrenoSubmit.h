@@ -184,7 +184,7 @@ private:
         uint32_t timeout_us,uint32_t *observed);
     NativeAdrenoSubmitStats stats_{};
     /* The CP's state for a fence that stopped advancing (native_adreno_stall); waited is the fence the timed-out wait was for. */
-    void noteStall(uint32_t observed,const NativeAdrenoRingClock *clock,uint32_t waited);
+    IOReturn noteStall(uint32_t observed,const NativeAdrenoRingClock *clock,uint32_t waited);
     /* A retired job's GPU time into native_adreno_job_time and the two job tables (stamped: NativeAdrenoRing::timeline's status). */
     void noteJobTime(const Job &job,uint32_t stamped,uint64_t start,uint64_t end);
     /* noteStall's CP snapshot (native_adreno_stall, _stall_mem, _stall_ring), taken before the first stage acts. */

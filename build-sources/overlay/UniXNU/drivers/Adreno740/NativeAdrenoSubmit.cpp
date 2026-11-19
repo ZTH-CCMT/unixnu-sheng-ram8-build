@@ -116,13 +116,15 @@ static void peekFetch(const NativeAdrenoVm *vm,uint64_t fetch,volatile uint32_t 
     slot[0]=0xffff0000u+before;
     for(unsigned i=0;i<16;++i)slot[1+i]=words[i];
 }
-static uint32_t stall_fence,stall_timeouts,stall_stage;   /* stage: 0 none yet, 1 write pointer given again, 2 translations dropped, 3 bus drained */
+enum : uint32_t {StallInitial=0, StallKicked=1, StallDrained=3, StallDrainFailed=4};
+static uint32_t stall_fence,stall_timeouts,stall_stage;
 static uint64_t stall_began_us,stall_last_us;   /* the fence's first and latest timed-out wait */
 /* How long fences stayed pending from their first timed-out wait to their last: [i] under 1 << i ms for i < 7, [7] 64 ms or more. */
 extern "C" {volatile uint32_t native_adreno_fence_pending[8];}
 /* What the stall handler tried: [0] attempts, [1] the fence of the last attempt, [2] attempts after which that fence completed, [3] the
  * timed-out waits that fence had seen when it did. */
-/* [4] bus drains, [5] client halt acknowledge, [6] arbiter halt acknowledge, [7] the fence of the last drain, [8] drains after which that fence completed */
+/* [4] bus drain attempts, [5]/[6] client/arbiter halt acknowledge, [7] last drain fence, [9..11] ended by stage,
+ * [12] longest stall in timeouts, [13] last wait timeout in us, [14] last drain IOReturn. */
 extern "C" {volatile uint32_t native_adreno_unstick[15];}
 /* The IBs of the last submissions: [slot] fence, iova low/high, bytes, then the first 28 dwords of the first IB. The words are a
  * diagnostic (diag=1, zero otherwise) and are read through NativeAdrenoVm::headWords: the board's uncached reader makes and removes
@@ -809,17 +811,17 @@ static bool snapshot_due(uint32_t *taken,uint64_t pending)
     if(want<=*taken)return false;
     *taken=want;return true;
 }
-void NativeAdrenoSubmit::noteStall(uint32_t observed,const NativeAdrenoRingClock *clock,uint32_t waited)
+IOReturn NativeAdrenoSubmit::noteStall(uint32_t observed,const NativeAdrenoRingClock *clock,uint32_t waited)
 {
     uint32_t next=observed+1;
     NativeAdrenoRing *stalled=ring(0);
     if(preemption()) {
         const Job *const waited_job=find(waited);
-        if(!waited_job || preempt_.inFlight() || preempt_dead_)return;
+        if(!waited_job || preempt_.inFlight() || preempt_dead_)return kIOReturnSuccess;
         stalled=ring(waited_job->ring);
-        if(!stalled->current())return;
+        if(!stalled->current())return kIOReturnSuccess;
         const Job *const head=pendingOn(waited_job->ring);
-        if(!head)return;
+        if(!head)return kIOReturnSuccess;
         next=head->fence;
     }
     const uint64_t now=clock && clock->now_us?clock->now_us(clock->cookie):0;
@@ -841,16 +843,17 @@ void NativeAdrenoSubmit::noteStall(uint32_t observed,const NativeAdrenoRingClock
         stall_began_us=now;stall_snapshots=0;
         /* The CP moved on: what the stall that just ended took to clear. [9] first-stage recoveries, [10] second, [11] third, [12] timeouts of the longest. */
         if(stall_stage && stall_timeouts) {
-            native_adreno_unstick[8+stall_stage]=native_adreno_unstick[8+stall_stage]+1;
+            if(stall_stage!=StallDrainFailed)
+                native_adreno_unstick[8+stall_stage]=native_adreno_unstick[8+stall_stage]+1;
             if(stall_timeouts>native_adreno_unstick[12])native_adreno_unstick[12]=stall_timeouts;
         }
-        stall_fence=next;stall_timeouts=0;stall_stage=0;
+        stall_fence=next;stall_timeouts=0;stall_stage=StallInitial;
         /* Where the CP was at the fence's first timed-out wait, to tell at the first stage whether it moved since. */
         if(stalled->progressState(stall_begin_cp_))for(unsigned i=0;i<6;++i)stall_begin_cp_[i]=~0u;
     }
     stall_last_us=now;
     const uint64_t pending=now-stall_began_us;
-    const bool kick_due=now && stage_due(stall_stage,0,pending,50000);
+    const bool kick_due=now && stage_due(stall_stage,StallInitial,pending,50000);
     /* Before the first stage acts: where the CP is now and 500 us later. Unchanged since the first wait and over the 500 us, the CP
      * stopped; changed, it is still working through the job (a long job, not a lost write pointer). The snapshot below is taken
      * before the stage too, so its registers are the stall's and not the stage's result. */
@@ -885,7 +888,7 @@ void NativeAdrenoSubmit::noteStall(uint32_t observed,const NativeAdrenoRingClock
      * drop) and invalidating at map time changed nothing. i553: the handler ran on 6712 of 6911 jobs. It now waits for 50 ms without
      * progress, measured in time (a timed-out wait is one poll, 100 us or less), and so does the snapshot below. */
     if(kick_due) {
-        native_adreno_unstick[0]=native_adreno_unstick[0]+1;native_adreno_unstick[1]=stall_fence;stall_stage=1;
+        native_adreno_unstick[0]=native_adreno_unstick[0]+1;native_adreno_unstick[1]=stall_fence;stall_stage=StallKicked;
         const uint32_t r0=stalled->readPointer(),w0=stalled->writePointer()&0xffff;
         uint64_t handoffSample[11]{};
         if(preemption() && stalled->current()) {
@@ -904,14 +907,18 @@ void NativeAdrenoSubmit::noteStall(uint32_t observed,const NativeAdrenoRingClock
         log(stall_fence,1,pending,r0&0xffff,w0);
     }
     /* Still stopped well after that: the way a6xx drains the bus before a reset, which lets a write that was never acknowledged end. */
-    if(now && stage_due(stall_stage,1,pending,200000)) {
+    if(now && stage_due(stall_stage,StallKicked,pending,200000)) {
         uint32_t ack[2]={};
-        native_adreno_unstick[4]=native_adreno_unstick[4]+1;native_adreno_unstick[7]=stall_fence;stall_stage=3;
+        native_adreno_unstick[4]=native_adreno_unstick[4]+1;native_adreno_unstick[7]=stall_fence;
         const uint32_t r0=stalled->readPointer(),w0=stalled->writePointer()&0xffff;
-        (void)stalled->drainBus(ack);
+        const IOReturn status=stalled->drainBus(ack);
+        stall_stage=status?StallDrainFailed:StallDrained;
         native_adreno_unstick[5]=ack[0];native_adreno_unstick[6]=ack[1];
-        log(stall_fence,3,pending,r0&0xffff,w0);
+        native_adreno_unstick[14]=uint32_t(status);
+        log(stall_fence,status?5u:3u,pending,r0&0xffff,w0);    /* 5 = drain failed */
+        return status;
     }
+    return kIOReturnSuccess;
 }
 /* The CP snapshot of a stalled fence (native_adreno_stall, _stall_mem, _stall_ring, and a stall log entry). */
 void NativeAdrenoSubmit::snapshot(uint32_t next,uint32_t waited,uint64_t now,uint64_t pending,NativeAdrenoRing *stalled)
@@ -1007,8 +1014,8 @@ IOReturn NativeAdrenoSubmit::wait(uint32_t fence,const NativeAdrenoRingClock *cl
             ++stats_.timeouts;
             native_adreno_fence_wait[1]=native_adreno_fence_wait[1]+1;native_adreno_fence_wait[2]=fence;native_adreno_fence_wait[3]=observed;
             native_adreno_fence_wait[4]=r->lastSubmitted();native_adreno_fence_wait[5]=r->completedFence();
-            noteStall(observed,clock,fence);
-            return kIOReturnTimeout;
+            const IOReturn status=noteStall(observed,clock,fence);
+            return status?status:kIOReturnTimeout;
         }
         return kIOReturnSuccess;
     }
@@ -1019,8 +1026,8 @@ IOReturn NativeAdrenoSubmit::wait(uint32_t fence,const NativeAdrenoRingClock *cl
         ++stats_.timeouts;
         native_adreno_fence_wait[1]=native_adreno_fence_wait[1]+1;native_adreno_fence_wait[2]=fence;native_adreno_fence_wait[3]=observed;
         native_adreno_fence_wait[4]=r->lastSubmitted();native_adreno_fence_wait[5]=r->completedFence();
-        noteStall(observed,clock,fence);
-        return kIOReturnTimeout;
+        const IOReturn status=noteStall(observed,clock,fence);
+        return status?status:kIOReturnTimeout;
     }
     IOReturn status=release(*job);
     if(status)return status;

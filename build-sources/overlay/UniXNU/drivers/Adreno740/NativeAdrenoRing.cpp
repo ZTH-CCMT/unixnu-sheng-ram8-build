@@ -206,14 +206,24 @@ IOReturn NativeAdrenoRing::kick()
 IOReturn NativeAdrenoRing::drainBus(uint32_t *ack)
 {
     enum : uint32_t {GbifHalt = 0x3c45, GbifHaltAck = 0x3c46, ClientHalt = 1u, ArbHalt = 2u};
+    constexpr unsigned max_polls=20000;
     if(!attached_ || poisoned_ || !ack)return kIOReturnNotReady;
     ack[0]=ack[1]=0;
-    if(io_.write32(io_.cookie,GbifHalt,ClientHalt))return poison();
-    for(unsigned i=0;i<20000 && !(ack[0]&ClientHalt);++i)if(io_.read32(io_.cookie,GbifHaltAck,&ack[0]))return poison();
-    if(io_.write32(io_.cookie,GbifHalt,ClientHalt|ArbHalt))return poison();
-    for(unsigned i=0;i<20000 && !(ack[1]&ArbHalt);++i)if(io_.read32(io_.cookie,GbifHaltAck,&ack[1]))return poison();
+    const auto requestHalt=[&](uint32_t request,uint32_t mask,uint32_t &last_ack)->IOReturn {
+        if(io_.write32(io_.cookie,GbifHalt,request))return kIOReturnIOError;
+        for(unsigned i=0;i<max_polls;++i) {
+            uint32_t value=0;
+            if(io_.read32(io_.cookie,GbifHaltAck,&value))return kIOReturnIOError;
+            last_ack=value;
+            if(value&mask)return kIOReturnSuccess;
+        }
+        return kIOReturnTimeout;
+    };
+    IOReturn status=requestHalt(ClientHalt,ClientHalt,ack[0]);
+    if(!status)status=requestHalt(ClientHalt|ArbHalt,ArbHalt,ack[1]);
+    /* This is a temporary stall intervention. Hangcheck runs the board's own halt sequence before a reset. */
     if(io_.write32(io_.cookie,GbifHalt,0))return poison();
-    return kIOReturnSuccess;
+    return status;
 }
 /* Packs one TYPE7 packet into words; returns the next free index or 0 when the header cannot be built. */
 static size_t packet(uint32_t *words,size_t at,uint32_t opcode,const uint32_t *payload,uint32_t count)

@@ -2195,13 +2195,12 @@ static size_t compose(char *out, size_t cap, uint32_t slot, unsigned now) {
     at = put(out, at, cap, row, sizeof row);
   }
   if (log_gpu_on && (&native_adreno_unstick && native_adreno_unstick[0])) {
-    char row[200];
-    // [0] write-pointer retries, [1] fence of the last, [2] translation drops, [4] bus drains with ack [5]/[6], [9..11] stalls that ended after
-    // the write pointer / translations / drain stage, [12] the most timeouts one stall took, [13] a wait's timeout in us.
-    snprintf(row, sizeof row, "[gpu unstick] kick=%u last=%u tlb=%u drain=%u ack=%x/%x ended: kick=%u tlb=%u drain=%u longest=%u unit=%uus",
+    char row[224];
+    // [4] bus drain attempts, [5]/[6] acknowledgements, [14] last drain's IOReturn.
+    snprintf(row, sizeof row, "[gpu unstick] kick=%u last=%u tlb=%u drain=%u ack=%x/%x ended: kick=%u tlb=%u drain=%u longest=%u unit=%uus drainstatus=0x%08x",
              native_adreno_unstick[0], native_adreno_unstick[1], native_adreno_unstick[2], native_adreno_unstick[4],
              native_adreno_unstick[5], native_adreno_unstick[6], native_adreno_unstick[9], native_adreno_unstick[10],
-             native_adreno_unstick[11], native_adreno_unstick[12], native_adreno_unstick[13]);
+             native_adreno_unstick[11], native_adreno_unstick[12], native_adreno_unstick[13], native_adreno_unstick[14]);
     at = put(out, at, cap, row, sizeof row);
   }
   if (log_gpu_on && (&native_adreno_fence_pending)) {

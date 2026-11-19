@@ -11,6 +11,7 @@ struct Peer {
     std::vector<std::pair<uint32_t,uint32_t>> writes;
     unsigned read_calls=0,publish=0,acquire=0,barriers=0;
     unsigned fail_write=0,fail_read=0,fail_barrier=0,fail_publish=0,fail_acquire=0;
+    unsigned client_ack_after=0,arb_ack_after=0,halt_polls=0;
     bool log_order=false;std::vector<const char *> order;
     Peer():regs(0x10000,0){}
 };
@@ -21,6 +22,7 @@ static int write32(void *cookie,uint32_t reg,uint32_t value)
     CHECK(cookie==&peer && reg<peer.regs.size());
     if(peer.writes.size()+1==peer.fail_write)return 1;
     peer.regs[reg]=value;peer.writes.emplace_back(reg,value);
+    if(reg==0x3c45)peer.halt_polls=0;
     if(peer.log_order)peer.order.push_back("write");
     return 0;
 }
@@ -28,6 +30,13 @@ static int read32(void *cookie,uint32_t reg,uint32_t *value)
 {
     CHECK(cookie==&peer && value && reg<peer.regs.size());++peer.read_calls;
     if(peer.read_calls==peer.fail_read)return 1;
+    if(reg==0x3c46 && peer.regs[0x3c45]) {
+        const unsigned polls=++peer.halt_polls;
+        const uint32_t request=peer.regs[0x3c45];
+        *value=((request&1) && peer.client_ack_after && polls>=peer.client_ack_after?1u:0u) |
+            ((request&2) && peer.arb_ack_after && polls>=peer.arb_ack_after?2u:0u);
+        return 0;
+    }
     *value=peer.regs[reg];return 0;
 }
 static int barrier(void *cookie){CHECK(cookie==&peer);++peer.barriers;
@@ -110,8 +119,45 @@ static void testPublishedTail()
     CHECK(tail.barrier_status!=0 && !tail.count && !(tail.valid_mask&4) && !r.poisoned());
     std::puts("PASS actual hardware WPTR tail, wrap, no unpublished words, read/barrier failure and no state mutation");
 }
+static void testDrainBus()
+{
+    const uint32_t halt=0x3c45;
+    struct DrainCase {
+        unsigned client_ack,arb_ack,fail_read_offset,fail_write_offset;
+        IOReturn result;
+        uint32_t client_status,arb_status;
+        bool requested_arb,cleared;
+    };
+    const DrainCase cases[]={
+        {1,1,0,0,kIOReturnSuccess,1,3,true,true},
+        {20000,20000,0,0,kIOReturnSuccess,1,3,true,true},
+        {20001,1,0,0,kIOReturnTimeout,0,0,false,true},
+        {1,20001,0,0,kIOReturnTimeout,1,1,true,true},
+        {1,1,1,0,kIOReturnIOError,0,0,false,true},
+        {1,1,2,0,kIOReturnIOError,1,0,true,true},
+        {1,1,0,3,kIOReturnIOError,1,3,true,false}
+    };
+    for(const auto &test:cases) {
+        reset();NativeAdrenoRing r;CHECK(attach(r)==kIOReturnSuccess);
+        const size_t start=peer.writes.size();
+        peer.client_ack_after=test.client_ack;
+        peer.arb_ack_after=test.arb_ack;
+        if(test.fail_read_offset)peer.fail_read=peer.read_calls+test.fail_read_offset;
+        if(test.fail_write_offset)peer.fail_write=static_cast<unsigned>(start)+test.fail_write_offset;
+        uint32_t ack[2]={~0u,~0u};
+        CHECK(r.drainBus(ack)==test.result);
+        CHECK(ack[0]==test.client_status && ack[1]==test.arb_status);
+        std::vector<std::pair<uint32_t,uint32_t>> expected{{halt,1}};
+        if(test.requested_arb)expected.emplace_back(halt,3);
+        if(test.cleared)expected.emplace_back(halt,0);
+        const std::vector<std::pair<uint32_t,uint32_t>> writes(peer.writes.begin()+start,peer.writes.end());
+        CHECK(writes==expected && r.poisoned()==!test.cleared);
+    }
+    std::puts("PASS GBIF drain requires both acknowledgements, honours polling boundaries and clears temporary halt");
+}
 int main()
 {
+    testDrainBus();
     testPublishedTail();
     /* Exact register programming and one complete submission. */
     {

@@ -12,6 +12,9 @@
 static bool gpu_trace_enabled;
 extern "C" int native_gpu_trace_enabled() {return gpu_trace_enabled;}
 extern "C" volatile uint64_t native_adreno_wptr_handoff[3][11];
+extern "C" volatile uint32_t native_adreno_unstick[15];
+extern "C" volatile uint64_t native_adreno_stall_log[32][8];
+extern "C" volatile uint32_t native_adreno_stall_log_count;
 
 IOReturn NativeAdrenoQueryCpu4K(NativeAdrenoCpuState *out)
 {CHECK(out);*out={};return kIOReturnSuccess;}
@@ -907,8 +910,51 @@ static void testWptrHandoffTriggerFailure()
     std::puts("PASS failed handoff trigger: pending fence is explicitly aborted by recovery, later work completes");
 }
 
+static void testStallDrainStatus()
+{
+    Path p;
+    CHECK(exposed(p)==kIOReturnSuccess);
+    const NativeAdrenoSubmitBuffer buffer{p.handle,0x800000,4096};
+    struct DrainCase {uint32_t ack;bool read_error;IOReturn result;};
+    const DrainCase cases[]={
+        {0,false,kIOReturnTimeout},
+        {1,false,kIOReturnTimeout},
+        {3,true,kIOReturnIOError},
+        {3,false,kIOReturnSuccess}
+    };
+    const uint32_t drained=native_adreno_unstick[11];
+    for(const auto &test:cases) {
+        uint32_t fence=0;
+        CHECK(p.submit.submit(&p.vm,&buffer,1,7,&fence,&ringclock)==kIOReturnSuccess);
+        clock_us+=1;
+        CHECK(p.submit.wait(fence,&ringclock,0)==kIOReturnTimeout);
+        clock_us+=50000;
+        CHECK(p.submit.wait(fence,&ringclock,0)==kIOReturnTimeout);
+        const uint32_t attempts=native_adreno_unstick[4];
+        cp.regs[0x3c46]=test.ack;
+        cp.fail_read_reg=test.read_error?0x3c46:~0u;
+        clock_us+=150000;
+        const IOReturn status=p.submit.wait(fence,&ringclock,0);
+        CHECK((native_adreno_stall_log[(native_adreno_stall_log_count-1)&31][2]&0xff)==(test.result?5u:3u));
+        CHECK(native_adreno_unstick[14]==static_cast<uint32_t>(test.result));
+        CHECK(status==(test.result==kIOReturnIOError?kIOReturnIOError:kIOReturnTimeout));
+        CHECK(native_adreno_unstick[11]==drained);
+        CHECK(p.submit.fencePending(fence) && p.object.deviceReferences()==2);
+        CHECK(native_adreno_unstick[4]==attempts+1 && cp.regs[0x3c45]==0);
+        clock_us+=1000;
+        CHECK(p.submit.wait(fence,&ringclock,0)==kIOReturnTimeout);
+        CHECK(native_adreno_unstick[4]==attempts+1);
+        fencemem[1]=fence;
+        CHECK(p.submit.wait(fence,&ringclock,0)==kIOReturnSuccess && p.object.deviceReferences()==1);
+    }
+    std::puts("PASS stall handler preserves pending buffers and records drain failure instead of success");
+}
+
 int main(int argc,char **argv)
 {
+    if(argc==2 && !std::strcmp(argv[1],"--stall-drain")) {
+        testStallDrainStatus();return 0;
+    }
     if(argc==2 && !std::strcmp(argv[1],"--wptr-handoff")) {
         testWptrHandoffWithoutAppend();
         testWptrHandoffWithAppend();
