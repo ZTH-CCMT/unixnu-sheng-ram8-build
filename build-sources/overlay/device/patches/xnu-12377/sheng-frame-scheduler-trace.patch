@@ -1,7 +1,7 @@
 diff --git a/osfmk/kern/sched_prim.c b/osfmk/kern/sched_prim.c
 --- a/osfmk/kern/sched_prim.c
 +++ b/osfmk/kern/sched_prim.c
-@@ -841,9 +841,25 @@
+@@ -841,6 +841,32 @@
  	thread_unlock(thread);
  }
  
@@ -21,19 +21,28 @@ diff --git a/osfmk/kern/sched_prim.c b/osfmk/kern/sched_prim.c
 +	       __atomic_load_n(&sheng_frame_sched_hook, __ATOMIC_ACQUIRE) : NULL;
 +}
 +
++static inline void
++sheng_trace_running(thread_t thread, thread_t previous)
++{
++	uint64_t tid = thread->thread_id;
++	if (tid == __atomic_load_n(&sheng_frame_display_tid, __ATOMIC_RELAXED)) {
++		KDBG_RELEASE(0x21f60024, tid, previous ? previous->thread_id : 0,
++		    thread->sched_pri, thread->state);
++	}
++}
++
  /*
   *	thread_unblock:
   *
-  *	Unblock thread on wake up.
-  *
-  *	Returns TRUE if the thread should now be placed on the runqueue.
-@@ -887,7 +903,15 @@
+@@ -887,6 +913,16 @@
  	old_thread_state = thread->state;
  	thread->state = (old_thread_state | TH_RUN) &
  	    ~(TH_WAIT | TH_UNINT | TH_WAIT_REPORT | TH_WAKING);
 +	if (old_thread_state & TH_WAIT) {
 +		sheng_frame_sched_hook_t hook = sheng_frame_sched_handler(thread);
 +		if (hook) {
++			KDBG_RELEASE(0x21f60020, thread->thread_id, cthread->thread_id,
++			    (uint32_t)wresult, (old_thread_state & TH_RUN) == 0);
 +			hook(2, thread->thread_id, 0, (uint32_t)wresult,
 +			    (uint32_t)thread->state, cthread->thread_id,
 +			    (uint64_t)(uintptr_t)__builtin_return_address(0));
@@ -42,14 +51,31 @@ diff --git a/osfmk/kern/sched_prim.c b/osfmk/kern/sched_prim.c
  
  	if ((old_thread_state & TH_RUN) == 0) {
  		uint64_t ctime = mach_approximate_time();
+@@ -3144,6 +3180,7 @@
  
-@@ -3910,7 +3934,16 @@
+ 			/* 'self' is now off core */
+ 			assert(thread == current_thread_volatile());
++			sheng_trace_running(thread, self);
+ 
+ 			DTRACE_SCHED(on__cpu);
+ 
+@@ -3308,6 +3345,7 @@
+ 	assert(continuation == self->continuation);
+ 	thread = machine_switch_context(self, continuation, thread);
+ 	assert(self == current_thread_volatile());
++	sheng_trace_running(self, thread);
+ 	TLOG(1, "thread_invoke: returning machine_switch_context: self %p continuation %p thread %p\n", self, continuation, thread);
+ 
+ 	assert(continuation == NULL && self->continuation == NULL);
+@@ -3910,6 +3948,17 @@
  	self->continuation = continuation;
  	self->parameter = parameter;
  
 +	if (self->state & TH_WAIT) {
 +		sheng_frame_sched_hook_t hook = sheng_frame_sched_handler(self);
 +		if (hook) {
++			KDBG_RELEASE(0x21f60028, self->thread_id, self->block_hint,
++			    self->state, 0);
 +			hook(1, self->thread_id, (uint64_t)self->wait_event,
 +			    (uint32_t)self->block_hint, (uint32_t)self->state, 0,
 +			    (uint64_t)(uintptr_t)__builtin_return_address(0));
@@ -59,4 +85,11 @@ diff --git a/osfmk/kern/sched_prim.c b/osfmk/kern/sched_prim.c
  	if (self->state & ~(TH_RUN | TH_IDLE)) {
  		KERNEL_DEBUG_CONSTANT_IST(KDEBUG_TRACE,
  		    MACHDBG_CODE(DBG_MACH_SCHED, MACH_BLOCK),
- 		    reason, VM_KERNEL_UNSLIDE(continuation), 0, 0, 0);
+@@ -4007,6 +4056,7 @@
+ 	thread_continue_t       continuation;
+ 	void                    *parameter;
+ 
++	sheng_trace_running(self, thread);
+ 	DTRACE_SCHED(on__cpu);
+ 
+ 	continuation = self->continuation;

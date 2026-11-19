@@ -1,9 +1,9 @@
-name: UniXNU sheng iPadOS 27 RAM 8 GiB V6.3 Touch
+name: UniXNU sheng iPadOS 27 RAM 8 GiB V6.3 Transition Trace
 
 on:
   workflow_dispatch:
   push:
-    branches: [ram8-v6.3-touch-release]
+    branches: [ram8-v6.3-transition-trace]
 
 permissions:
   contents: read
@@ -129,7 +129,7 @@ jobs:
       - name: Upload verified generic boot handoff
         uses: actions/upload-artifact@v4
         with:
-          name: os27-ram8-v6.3-touch-handoff-${{ github.run_id }}-${{ github.run_attempt }}
+          name: os27-ram8-v6.3-transition-trace-handoff-${{ github.run_id }}-${{ github.run_attempt }}
           path: os27-ram8-handoff/
           include-hidden-files: true
           if-no-files-found: error

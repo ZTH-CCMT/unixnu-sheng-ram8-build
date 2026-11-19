@@ -1,0 +1,117 @@
+diff --git a/osfmk/kern/mk_timer.c b/osfmk/kern/mk_timer.c
+--- a/osfmk/kern/mk_timer.c
++++ b/osfmk/kern/mk_timer.c
+@@ -43,9 +43,22 @@
+ #include <ipc/port.h>
+ #include <ipc/ipc_space.h>
+ #include <ipc/ipc_policy.h>
++#include <ipc/sheng_frame_ipc.h>
+ 
+ #include <kern/lock_group.h>
+ #include <kern/thread_call.h>
++
++#include <sys/kdebug.h>
++#include <sys/proc.h>
++
++enum {
++	SHENG_TIMER_ARM = 0x21f60004,
++	SHENG_TIMER_CANCEL = 0x21f60008,
++	SHENG_TIMER_EXPIRE = 0x21f6000c,
++	SHENG_TIMER_SEND = 0x21f60010,
++	SHENG_TIMER_SEND_RETURN = 0x21f60014,
++	SHENG_TIMER_ARM_OPTIONS = 0x21f60018,
++};
+ 
+ struct mk_timer {
+ 	decl_simple_lock_data(, lock);
+@@ -53,6 +66,10 @@
+ 	bool                    is_dead;
+ 	bool                    is_armed;
+ 	int                     active;
++	uint32_t                trace_pid;
++	mach_port_name_t        trace_port;
++	uint32_t                trace_sequence;
++	uint64_t                trace_deadline;
+ 	ipc_port_t XNU_PTRAUTH_SIGNED_PTR("mk_timer.port") port;
+ 	ipc_kmsg_t XNU_PTRAUTH_SIGNED_PTR("mk_timer.prealloc") prealloc;
+ };
+@@ -80,6 +97,12 @@
+ 	simple_lock_init(&timer->lock, 0);
+ 	thread_call_setup(&timer->mkt_thread_call, mk_timer_expire, timer);
+ 
++	char process_name[32];
++	proc_selfname(process_name, sizeof(process_name));
++	if (strcmp(process_name, "backboardd") == 0) {
++		timer->trace_pid = (uint32_t)proc_selfpid();
++	}
++
+ 	/* Pre-allocate a kmsg for the timer messages */
+ 	kmsg = ipc_kmsg_alloc(sizeof(mk_timer_expire_msg_t), 0, 0,
+ 	    IPC_KMSG_ALLOC_KERNEL | IPC_KMSG_ALLOC_ZERO |
+@@ -98,6 +121,7 @@
+ 
+ 	/* make a (naked) send right for the timer to keep */
+ 	timer->port = ipc_port_make_send_any_locked(port);
++	timer->trace_port = name;
+ 
+ 	ip_mq_unlock(port);
+ 
+@@ -154,6 +178,14 @@
+ 	assert(timer->active > 0);
+ 
+ 	while (timer->is_armed && timer->active == 1) {
++		uint32_t trace_pid = timer->trace_pid;
++		mach_port_name_t trace_port = timer->trace_port;
++		uint32_t trace_sequence = timer->trace_sequence;
++		uint64_t trace_deadline = timer->trace_deadline;
++		if (trace_pid) {
++			KDBG_RELEASE(SHENG_TIMER_EXPIRE, trace_pid, trace_port,
++			    trace_sequence, trace_deadline);
++		}
+ 		timer->is_armed = false;
+ 		simple_unlock(&timer->lock);
+ 
+@@ -168,7 +200,17 @@
+ 			msg->header.msgh_size = sizeof(mk_timer_expire_msg_t);
+ 			msg->header.msgh_remote_port = port;
+ 
++			if (trace_pid) {
++				vm_offset_t cookie = 0;
++				vm_kernel_addrperm_external((vm_offset_t)kmsg, &cookie);
++				KDBG_RELEASE(SHENG_TIMER_SEND, trace_pid, trace_port,
++				    trace_sequence, cookie);
++			}
+ 			kernel_mach_msg_send_kmsg(kmsg);
++			if (trace_pid) {
++				KDBG_RELEASE(SHENG_TIMER_SEND_RETURN, trace_pid, trace_port,
++				    trace_sequence, trace_deadline);
++			}
+ 		}
+ 
+ 		simple_lock(&timer->lock, LCK_GRP_NULL);
+@@ -272,6 +314,14 @@
+ 		ip_mq_unlock(port);
+ 
+ 		if (!timer->is_dead) {
++			if (timer->trace_pid) {
++				timer->trace_deadline = expire_time;
++				timer->trace_sequence++;
++				KDBG_RELEASE(SHENG_TIMER_ARM, timer->trace_pid,
++				    timer->trace_port, timer->trace_sequence, expire_time);
++				KDBG_RELEASE(SHENG_TIMER_ARM_OPTIONS, timer->trace_pid,
++				    timer->trace_port, mk_timer_flags, mk_leeway);
++			}
+ 			timer->is_armed = true;
+ 
+ 			uint64_t now;
+@@ -375,6 +425,10 @@
+ 
+ 		if (timer->is_armed) {
+ 			armed_time = thread_call_get_armed_deadline(&timer->mkt_thread_call);
++			if (timer->trace_pid) {
++				KDBG_RELEASE(SHENG_TIMER_CANCEL, timer->trace_pid,
++				    timer->trace_port, timer->trace_sequence, armed_time);
++			}
+ 			if (thread_call_cancel(&timer->mkt_thread_call)) {
+ 				timer->active--;
+ 			}

@@ -86,7 +86,7 @@ index afaaf38..b6cb83b 100644
  	/*
  	 * restore the recv_bufs values that are used by
  	 * ipc_kmsg_copyout_guarded_port_descriptor()
-@@ -374,6 +385,11 @@ mach_msg_receive_results(
+@@ -374,6 +385,17 @@ mach_msg_receive_results(
  		msgr.msgr_qos_ovrd = kmsg->ikm_qos_override;
  		mr = ipc_kmsg_put_to_user(kmsg, &recv_bufs, &msgr,
  		    options, map, mr);
@@ -94,6 +94,12 @@ index afaaf38..b6cb83b 100644
 +			frame_hook(SHENG_FRAME_IPC_RECEIVE, (uint32_t)frame_slot,
 +			    thread_tid(self), frame_message.cookie, frame_message.sender_pid,
 +			    frame_message.msgid, mr);
++			/* A timer message carries the same permuted kmsg cookie as its sender. */
++			if (frame_slot == 1 && frame_message.sender_pid == 0 &&
++			    frame_message.msgid == 0) {
++				KDBG_RELEASE(0x21f6002c, frame_message.cookie,
++				    thread_tid(self), (uint32_t)frame_message.msgid, 0);
++			}
 +		}
  	}
  	/* kmsg freed */

@@ -347,6 +347,8 @@ static id deviceForPort(unsigned port) {
         // submission ring, the runtime's stage ring, and in the render server the status and telemetry lines. Without it none of them runs.
         if (bootArgSet("metal-chain=1")) setenv("SHENG_METAL_CHAIN", "1", 1);
         else unsetenv("SHENG_METAL_CHAIN");
+        if (bootArgSet("transition-trace=1")) setenv("SHENG_TRANSITION_TRACE", "1", 1);
+        else unsetenv("SHENG_TRANSITION_TRACE");
         if (bootArgSet("diag=1") || bootArgSet("gpu-trace=1") || bootArgSet("metal-chain=1")) setenv("SHENG_DIAG", "1", 1);
         else unsetenv("SHENG_DIAG");
         if (bootArgSet("gpu-trace=1")) setenv("SHENG_GPU_TRACE", "1", 1);

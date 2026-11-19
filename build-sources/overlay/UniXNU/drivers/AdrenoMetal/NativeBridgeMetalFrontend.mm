@@ -246,10 +246,29 @@ static uint32_t threadCpuUs() {
 }
 static uint32_t threadIdLow() {uint64_t id=0;pthread_threadid_np(NULL,&id);return (uint32_t)id;}
 static bool traceWanted() {static const bool on=diagOn() && nativeIsRenderServer();return on;}
+static bool transitionTraceKeep(const TraceRec &rec) {
+ static const bool enabled = getenv("SHENG_TRANSITION_TRACE") != nullptr;
+ if (!enabled) return true;
+ switch (rec.type) {
+ case 0: // Clock anchor.
+ case 4: // Thread name.
+  return true;
+ case 1: // Command lifetime.
+ case 2: // Completion wait.
+ case 3: // Scheduling wait.
+ case 8: // Submit and fence.
+ case 45: // Command preparation.
+ case 52: // Command creation boundaries.
+  // Freeze the rolling records after the desktop test window, before diagnostic export.
+  return rec.t0 >= 115'000'000 && rec.t0 < 220'000'000;
+ default:
+  return false;
+ }
+}
 static void tracePush(const TraceRec &rec) {
  if(!traceWanted())return;
  if(metalChainOn()){
-  if(gChainSealed.load(std::memory_order_relaxed))return;
+  if(gChainSealed.load(std::memory_order_relaxed) || !transitionTraceKeep(rec))return;
   gChainTrace.push(rec);return;
  }
  if(rec.type==12 && (rec.a>=40 || !native_gpu_latency_stage(rec.a)))return;

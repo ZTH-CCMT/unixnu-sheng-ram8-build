@@ -130,7 +130,7 @@
       "repository": "device",
       "path": "board.toml",
       "before_sha256": "88b824800753cc7e79ae9dcd4ea4c92f351228126a3147dfc0ee81de0382e8b2",
-      "sha256": "1e3729c73a6b15d582224afdfc87b35750593c9aebb091bb731e1a2c14a18e92"
+      "sha256": "cf77400ae18013bb27e44287bee9a606bc20323aa82ea87c4908331dcca84cc2"
     },
     "device/drivers/ShengHidInput/NativeHidInput.cpp": {
       "repository": "device/drivers/ShengHidInput",
@@ -388,13 +388,13 @@
       "repository": "UniXNU/drivers/AdrenoMetal",
       "path": "NativeAdrenoMetalPlugin.mm",
       "before_sha256": "ade7f1657e5979699609d858fd2201df675f4d9fefe40cdf54f312ee1d8f6a0e",
-      "sha256": "8cb350e7e33b92483fc2a7ecd2cbf608aadcda6892d9262f6ed7d4ad8b2bac3a"
+      "sha256": "763d9b8e66d77e9fb78573c3a3ffd3a62857ca4fd4de80eb808c0ccd4abc1073"
     },
     "UniXNU/drivers/AdrenoMetal/NativeBridgeMetalFrontend.mm": {
       "repository": "UniXNU/drivers/AdrenoMetal",
       "path": "NativeBridgeMetalFrontend.mm",
       "before_sha256": "39cb6dd476349dc98423a4c7b9339f6c8a2492fd2d5817e729ae55be0bd65236",
-      "sha256": "8fa5382e98c5cc76daff6a565323f63d6ab89e4db36669005044789fb7bb795a"
+      "sha256": "b6009c11f67dc26bd50888f31a93d674e6d939bfeff2842d7f855e14c632bbfe"
     },
     "UniXNU/drivers/AdrenoMetal/PrimeShaders.h": {
       "repository": "UniXNU/drivers/AdrenoMetal",
@@ -484,19 +484,25 @@
       "repository": "device",
       "path": "patches/xnu-12377/series",
       "before_sha256": "15d08ffeafa1d29ece607e4f2913c80cb1f403442b0a0cbf9625f8d60a2d2953",
-      "sha256": "90d8f78cf2ee940477fb8ede2d2ec7b96e2d4cefa2c643a0d38aa212607c59cb"
+      "sha256": "bb34c718a2dd596bc02a9bd602f0d6e455b05bba8a3e538e64b9ba5afe938c24"
     },
     "device/patches/xnu-12377/sheng-frame-ipc-trace.patch": {
       "repository": "device",
       "path": "patches/xnu-12377/sheng-frame-ipc-trace.patch",
       "before_sha256": null,
-      "sha256": "9a102f2f36368fd58e3dbe0ea10bb261705c0c98c3774ffb2241c1719bd1a569"
+      "sha256": "3d838ed2e2fbb589d175c5caae665e43cab9e0447635af305794f12dfae7f4d0"
+    },
+    "device/patches/xnu-12377/sheng-transition-timer-trace.patch": {
+      "repository": "device",
+      "path": "patches/xnu-12377/sheng-transition-timer-trace.patch",
+      "before_sha256": null,
+      "sha256": "343292223ff9b0e51be819b2b03bfbacdf01b5a3987feac388a1c5618c188e39"
     },
     "device/patches/xnu-12377/sheng-frame-scheduler-trace.patch": {
       "repository": "device",
       "path": "patches/xnu-12377/sheng-frame-scheduler-trace.patch",
       "before_sha256": null,
-      "sha256": "1cba7d5f4f0dd2966a66dec27dd0dea9346af4d3b85b68f5fef6b8e298f656c0"
+      "sha256": "74fb47977ec07e1a759bbf5c914f005b17dba5398a41a5bedfc66bebef53ba2e"
     },
     "device/scripts/decode-gpu-trace.py": {
       "repository": "device",

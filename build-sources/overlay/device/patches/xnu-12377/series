@@ -19,5 +19,6 @@ sheng-appsync-runtime.patch
 sheng-appsync-user-trust.patch
 zzzzzzzzzzz-sheng-edge-matrix.patch
 sheng-frame-ipc-trace.patch
+sheng-transition-timer-trace.patch
 sheng-frame-scheduler-trace.patch
 sheng-layout-direct-trace.patch
