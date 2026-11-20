@@ -413,8 +413,11 @@ class AGXDeviceUserClient : public IOUserClient {
     View *viewSlot(uint32_t token) {return views_ && token && token<=view_capacity_?&views_[token-1]:nullptr;}
     View *views_=nullptr;   /* on the heap, grown to the highest token (growViews) */
     size_t view_capacity_=0;
+    uint32_t retiring_view_token_=0;  /* g.lock, kept set until IOKit has removed the last view's maps */
     bool growViews(uint32_t token);
-    void dropViews(uint32_t token);
+    View takeView(View &slot);
+    void removeView(const View &view);
+    void dropViews();
     static IOReturn action(OSObject *target,void *reference,IOExternalMethodArguments *arguments);
     IOReturn run(uint32_t method,const void *input,size_t input_size,void *output,size_t output_size);
     IOReturn runTimed(uint32_t method,const void *input,size_t input_size,void *output,size_t output_size,uint64_t *lockWait);
@@ -434,37 +437,50 @@ OSDefineMetaClassAndStructors(AGXDeviceUserClient,IOUserClient)
 void nativeAdrenoMailboxPoller(void *,wait_result_t)
 {
     thread_set_thread_name(current_thread(),"gpu-mailbox");
-    uint32_t last=0;
     for(;;) {
         /* A request is a store into the shared page, so nothing can signal it; the page being mapped can. */
-        if(!gMailboxMapped) {
-            IOLockLock(g.lock);
-            while(!gMailboxMapped)IOLockSleep(g.lock,&gMailboxMapped,THREAD_UNINT);
-            IOLockUnlock(g.lock);
-        }
+        IOLockLock(g.lock);
+        while(!gMailboxMapped)IOLockSleep(g.lock,&gMailboxMapped,THREAD_UNINT);
+        IOLockUnlock(g.lock);
         IOSleep(1);
-        if(!gMailboxOwner || !gMailboxWords)continue;
-        const uint32_t request=gMailboxWords[1];
-        if(request==last || request==gMailboxWords[2])continue;
-        last=request;
-        const uint32_t method=gMailboxWords[3],in_size=gMailboxWords[5],out_size=gMailboxWords[6];
-        IOReturn status=kIOReturnBadArgument;
-        if(in_size<=0x700 && out_size<=0x700) {
-            uint8_t input[0x700],output[0x700];
-            memcpy(input,const_cast<uint32_t *>(gMailboxWords)+0x10,in_size);
-            IOLockLock(g.lock);
-            AGXDeviceUserClient *owner=gMailboxOwner;
-            if(owner)owner->retain();
+
+        uint8_t input[0x700],output[0x700];
+        IOLockLock(g.lock);
+        AGXDeviceUserClient *const owner=gMailboxOwner;
+        IOBufferMemoryDescriptor *const mailbox=gMailbox;
+        volatile uint32_t *const words=gMailboxWords;
+        if(!gMailboxMapped || !owner || !owner->active() || !mailbox || !words) {
             IOLockUnlock(g.lock);
-            status=owner?runCore(owner,method,input,in_size,output,out_size,nullptr):kIOReturnNotReady;
-            if(owner)owner->release();
-            if(!status)memcpy(const_cast<uint32_t *>(gMailboxWords)+0x200,output,out_size);
+            continue;
         }
-        native_adreno_metal_diag.mb_calls=native_adreno_metal_diag.mb_calls+1;
-        gMailboxWords[4]=uint32_t(status);
-        __asm__ volatile("dmb sy" ::: "memory");
-        gMailboxWords[2]=request;
-        __asm__ volatile("dmb sy" ::: "memory");
+        const uint32_t request=__atomic_load_n(words+1,__ATOMIC_ACQUIRE);
+        if(request==words[2]) {
+            IOLockUnlock(g.lock);
+            continue;
+        }
+        const uint32_t method=words[3],in_size=words[5],out_size=words[6];
+        const bool valid=in_size<=sizeof(input) && out_size<=sizeof(output);
+        if(valid)memcpy(input,const_cast<uint32_t *>(words)+0x10,in_size);
+        owner->retain();mailbox->retain();
+        IOLockUnlock(g.lock);
+
+        IOReturn status=kIOReturnBadArgument;
+        if(valid) {
+            memset(output,0,out_size);
+            status=runCore(owner,method,input,in_size,output,out_size,nullptr);
+        }
+
+        IOLockLock(g.lock);
+        /* A request queued for a closed owner must never write into a replacement owner's mailbox. */
+        if(gMailboxOwner==owner && gMailbox==mailbox && gMailboxMapped &&
+            request==__atomic_load_n(words+1,__ATOMIC_ACQUIRE)) {
+            if(!status)memcpy(const_cast<uint32_t *>(words)+0x200,output,out_size);
+            native_adreno_metal_diag.mb_calls=native_adreno_metal_diag.mb_calls+1;
+            words[4]=uint32_t(status);
+            __atomic_store_n(words+2,request,__ATOMIC_RELEASE);
+        }
+        IOLockUnlock(g.lock);
+        mailbox->release();owner->release();
     }
 }
 
@@ -524,49 +540,59 @@ bool AGXDeviceUserClient::mount(bool kernel)
     }
     /* Not used by any core (a failed open or scope): nothing of it reached the GPU. */
     if(space && g.context->destroyVm(space)) {}
-    /* The mailbox page and its poller serve the render server's connection only. */
+    /* A new owner gets new pages. A mapping retained by the previous owner cannot reach the new mailbox. */
+    IOBufferMemoryDescriptor *oldMailbox=nullptr,*discardMailbox=nullptr;
+    AGXDeviceUserClient *oldOwner=nullptr;
     if(ok && server && row_==0) {
-        if(!gMailbox) {
-            gMailbox=IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,kIODirectionInOut,4096,4096);
-            if(gMailbox) {gMailboxWords=static_cast<volatile uint32_t *>(gMailbox->getBytesNoCopy());memset(const_cast<uint32_t *>(gMailboxWords),0,4096);}
-        }
-        if(gMailboxWords) {
-            memset(const_cast<uint32_t *>(gMailboxWords),0,4096);
-            gMailboxWords[0]=NativeAdrenoMailboxMagic;
-            if(!gPollerStarted) {
-                thread_t thread=nullptr;
-                if(kernel_thread_start(nativeAdrenoMailboxPoller,nullptr,&thread)==KERN_SUCCESS) {thread_deallocate(thread);gPollerStarted=true;}
+        IOBufferMemoryDescriptor *mailbox=IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,kIODirectionInOut,4096,4096);
+        auto *words=mailbox?static_cast<volatile uint32_t *>(mailbox->getBytesNoCopy()):nullptr;
+        if(words && !gPollerStarted) {
+            thread_t thread=nullptr;
+            if(kernel_thread_start(nativeAdrenoMailboxPoller,nullptr,&thread)==KERN_SUCCESS) {
+                thread_deallocate(thread);
+                gPollerStarted=true;
             }
         }
-        if(gMailboxOwner)gMailboxOwner->release();
-        retain();gMailboxOwner=this;gMailboxMapped=false;
+        if(words && gPollerStarted) {
+            memset(const_cast<uint32_t *>(words),0,4096);
+            words[0]=NativeAdrenoMailboxMagic;
+            oldOwner=gMailboxOwner;oldMailbox=gMailbox;
+            retain();gMailboxOwner=this;gMailbox=mailbox;gMailboxWords=words;gMailboxMapped=false;
+        } else discardMailbox=mailbox;
     }
     IOLockUnlock(g.lock);
+    if(oldOwner)oldOwner->release();
+    if(oldMailbox)oldMailbox->release();
+    if(discardMailbox)discardMailbox->release();
     if(core)delete core;
     return ok;
 }
-/* Removes the cached view(s) of token (0 = all) and tears down every user mapping of them, so the BO's pages are never freed while a user
- * PTE still points at them, whether or not the client unmapped. */
-void AGXDeviceUserClient::dropViews(uint32_t token)
+/* Transfer the cache reference under the same lock that protects the core's leases. */
+AGXDeviceUserClient::View AGXDeviceUserClient::takeView(View &slot)
 {
-    for(;;) {
-        IOMemoryDescriptor *view=nullptr;
+    const View view=slot;
+    slot={};
+    if(view.descriptor)NativeAdrenoNoteHolder(native_adreno_view_owners,pid_,-int64_t(view.bytes));
+    return view;
+}
+void AGXDeviceUserClient::removeView(const View &view)
+{
+    if(!view.descriptor)return;
+    /* IOKit retains each map it returns after removing it from the client's set. Drop that reference for every descriptor. */
+    while(IOMemoryMap *map=removeMappingForDescriptor(view.descriptor)) {
+        __atomic_fetch_add(&native_adreno_metal_diag.forced_unmaps,1,__ATOMIC_RELAXED);
+        map->release();
+    }
+    view.descriptor->release();
+}
+void AGXDeviceUserClient::dropViews()
+{
+    /* Closing blocks new views and waits for any in-progress single-view cleanup before reaching this loop. */
+    for(size_t i=0;i<view_capacity_;++i) {
         IOLockLock(g.lock);
-        uint64_t bytes=0;
-        if(token) {View *v=viewSlot(token);if(v && v->descriptor && v->token==token) {view=v->descriptor;bytes=v->bytes;v->descriptor=nullptr;v->token=0;v->bytes=0;}}
-        else if(views_)for(size_t i=0;i<view_capacity_;++i) {View &v=views_[i];if(v.descriptor) {view=v.descriptor;bytes=v.bytes;v.descriptor=nullptr;v.token=0;v.bytes=0;break;}}
-        if(view)NativeAdrenoNoteHolder(native_adreno_view_owners,pid_,-int64_t(bytes));
+        const View view=takeView(views_[i]);
         IOLockUnlock(g.lock);
-        if(!view)return;
-        /* The returned reference is the last one outside the descriptor's own list: dropping it frees the map, which unmaps the user range. */
-        /* A pool view's mappings are dropped here for certain: a mapping left behind would keep the view, and with it the grant's
-         * pages, out of the pool for as long as the connection lives. */
-        const bool pool=OSDynamicCast(NativeAdrenoPoolView,view)!=nullptr;
-        while(IOMemoryMap *map=removeMappingForDescriptor(view)) {
-            native_adreno_metal_diag.forced_unmaps=native_adreno_metal_diag.forced_unmaps+1;
-            if(pool)map->release();
-        }
-        view->release();
+        removeView(view);
     }
 }
 /* Room for token's view slot (tokens are entry indices plus one, so they stay below the client's object count). */
@@ -588,12 +614,20 @@ IOReturn AGXDeviceUserClient::clientClose()
     IOLockLock(g.lock);
     if(closing_){IOLockUnlock(g.lock);return kIOReturnBusy;}
     __atomic_store_n(&closing_,true,__ATOMIC_RELEASE);
+    AGXDeviceUserClient *mailboxOwner=nullptr;
+    IOBufferMemoryDescriptor *mailbox=nullptr;
+    if(gMailboxOwner==this) {
+        mailboxOwner=gMailboxOwner;mailbox=gMailbox;
+        gMailboxOwner=nullptr;gMailbox=nullptr;gMailboxWords=nullptr;gMailboxMapped=false;
+    }
+    while(retiring_view_token_)IOLockSleep(g.lock,&retiring_view_token_,THREAD_UNINT);
     IOLockUnlock(g.lock);
-    dropViews(0);
+
+    if(mailboxOwner)mailboxOwner->release();
+    if(mailbox)mailbox->release();
+    dropViews();
     IOLockLock(g.lock);
     IOReturn status=kIOReturnSuccess;
-    AGXDeviceUserClient *mailbox=nullptr;
-    if(gMailboxOwner==this) {mailbox=gMailboxOwner;gMailboxOwner=nullptr;gMailboxMapped=false;}
     if(live_) {
         const uint64_t peak=core_->windowPeak();
         status=core_->releaseAll(&g.clock,2000000);
@@ -615,13 +649,12 @@ IOReturn AGXDeviceUserClient::clientClose()
     }
     if(status)__atomic_store_n(&closing_,false,__ATOMIC_RELEASE);
     IOLockUnlock(g.lock);
-    if(mailbox)mailbox->release();
     if(!status)terminate();
     return status;
 }
 void AGXDeviceUserClient::free()
 {
-    dropViews(0);
+    dropViews();
     if(views_) {IODelete(views_,View,view_capacity_);views_=nullptr;view_capacity_=0;}
     /* Still live only when a teardown failed: its objects stay referenced by the VM and the ring, so the core is kept, not freed. */
     if(core_ && !live_) {delete core_;core_=nullptr;}
@@ -659,6 +692,7 @@ IOReturn AGXDeviceUserClient::clientMemoryForType(UInt32 type,IOOptionBits *opti
     struct Inside {Inside() {__atomic_fetch_add(&native_adreno_view_diag[5],1,__ATOMIC_RELAXED);} ~Inside() {__atomic_fetch_sub(&native_adreno_view_diag[5],1,__ATOMIC_RELAXED);}} inside;
     IOLockLock(g.lock);
     if(!active()){IOLockUnlock(g.lock);return kIOReturnNotReady;}
+    if(type==retiring_view_token_ && type){IOLockUnlock(g.lock);return kIOReturnBusy;}
     View *v=viewSlot(type);
     if(v && v->descriptor && v->token==type) {
         v->descriptor->retain();*memory=v->descriptor;
@@ -888,7 +922,21 @@ static IOReturn runCore(AGXDeviceUserClient *connection,uint32_t method,const vo
         /* i e38a0b1eb: a BoFree held the lock up to 38 ms, unwiring and freeing a large BO's pages; they now go after the lock. */
         NativeAdrenoSystemPages freed{};
         const bool freeing=method==NativeAdrenoMethodBoFree;
+        const bool unmapping=method==NativeAdrenoMethodBoCpuUnmap;
+        const bool changesLease=freeing || unmapping || method==NativeAdrenoMethodBoCpuMap;
+        AGXDeviceUserClient::View retired{};
         lockTimed(lockWait);
+        if(changesLease && connection->retiring_view_token_ && connection->active()) {
+            const uint64_t waitStart=lockWait?mach_absolute_time():0;
+            if(lockWait)lockWait[LockHeld]+=waitStart-lockWait[LockSince];
+            while(connection->retiring_view_token_ && connection->active())
+                IOLockSleep(g.lock,&connection->retiring_view_token_,THREAD_UNINT);
+            if(lockWait) {
+                const uint64_t resumed=mach_absolute_time();
+                lockWait[LockWaited]+=resumed-waitStart;
+                lockWait[LockSince]=resumed;
+            }
+        }
         locked=mach_absolute_time();
         spans=native_adreno_bo_memory[1];
         /* Offered for every BoAlloc, held or not: allocateSystem then knows it runs under the lock and leaves the pool alone. */
@@ -897,12 +945,29 @@ static IOReturn runCore(AGXDeviceUserClient *connection,uint32_t method,const vo
         status=connection->active()?connection->core_->dispatch(method,input,input_size,output,output_size,&g.clock):kIOReturnNotReady;
         if(connection->active())connection->core_->offerSystemPages(nullptr);
         if(connection->active() && freeing)connection->core_->collectFreedPages(nullptr);
+        if(unmapping && !status) {
+            NativeAdrenoAbiBoCpuUnmap request{};
+            memcpy(&request,input,sizeof(request));  /* dispatch checked the size, handle, token and reservation. */
+            if(connection->core_->mappingLeases(request.token)) {
+                __atomic_fetch_add(&native_adreno_view_kept,1,__ATOMIC_RELAXED);
+            } else if(auto *view=connection->viewSlot(request.token); view && view->descriptor) {
+                retired=connection->takeView(*view);
+                connection->retiring_view_token_=request.token;
+            }
+        }
         if(method==NativeAdrenoMethodBoMap && !status && connection->active() && !connection->kernel_)
             if(NativeAdrenoClientRecord *record=clientRecord(connection->name_))
                 if(connection->core_->windowPeak()>>20>record->peak_mib)record->peak_mib=uint32_t(connection->core_->windowPeak()>>20);
         spans=native_adreno_bo_memory[1]-spans;
         dispatched=mach_absolute_time();
         unlockTimed(lockWait);
+        if(retired.descriptor) {
+            connection->removeView(retired);
+            IOLockLock(g.lock);
+            connection->retiring_view_token_=0;
+            IOLockWakeup(g.lock,&connection->retiring_view_token_,false);
+            IOLockUnlock(g.lock);
+        }
         const bool taken=offered && !pages.held();
         NativeAdrenoMemory::discardSystem(&pages);
         if(freed.held()) {native_adreno_freed_outside=native_adreno_freed_outside+1;NativeAdrenoMemory::discardSystem(&freed);}
@@ -987,18 +1052,6 @@ IOReturn AGXDeviceUserClient::runTimed(uint32_t method,const void *input,size_t 
         native_adreno_export_stats[0]=native_adreno_export_stats[0]+1;
         native_adreno_export_stats[2]=piece.generation;native_adreno_export_stats[3]=piece.total;
         return kIOReturnSuccess;
-    }
-    if(method==NativeAdrenoMethodBoCpuUnmap && input && input_size==sizeof(NativeAdrenoAbiBoCpuUnmap)) {
-        /* The view is shared by every CPU mapping of the BO, and dropViews removes all of them. A BO mapped twice (the view cache served 207
-         * second requests in int-177) lost both mappings at the first unmap, and the other holder's next store hit an unmapped page: the
-         * render server's crash in the command stream writes of vkCmdCopyBuffer. Only the last lease takes the view down; the earlier
-         * ones leave their mapping until it, or the client unmaps it itself (IOConnectUnmapMemory64 works on the cached view). */
-        const uint32_t token=static_cast<const NativeAdrenoAbiBoCpuUnmap *>(input)->token;
-        IOLockLock(g.lock);
-        const uint32_t leases=active()?core_->mappingLeases(token):0;
-        IOLockUnlock(g.lock);
-        if(leases>1)native_adreno_view_kept=native_adreno_view_kept+1;
-        else dropViews(token);
     }
     if(method==NativeAdrenoMethodNote) {
         /* Rows for the board's export (BootDiagExport.c, rows G and L): kind, the caller's pid and the record's words. A slot is claimed with
@@ -1417,10 +1470,12 @@ extern "C" IOReturn native_adreno_publish(NativeAdrenoVm *vm,NativeAdrenoSubmit 
     uint32_t input_bits,uint32_t output_bits)
 {
     if(g.published || !vm || !submit || !ring || !clock || !clock->now_us)return kIOReturnBadArgument;
+    IOService *const platform=IOService::getPlatform();
+    if(!platform)return kIOReturnNotReady;
     gpuTraceInit();
     g.lock=IOLockAlloc();
     NativeAdrenoGpuPublished *service=new NativeAdrenoGpuPublished;
-    if(!g.lock || !service || !service->init() || !service->attach(IOService::getPlatform())) {
+    if(!g.lock || !service || !service->init() || !service->attach(platform)) {
         if(service)service->release();
         if(g.lock){IOLockFree(g.lock);g.lock=nullptr;}
         return kIOReturnNoMemory;

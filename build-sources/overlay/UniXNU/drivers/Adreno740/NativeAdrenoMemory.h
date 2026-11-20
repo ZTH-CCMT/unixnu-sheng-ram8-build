@@ -162,8 +162,10 @@ public:
     IOReturn holdForDevice();
     IOReturn retireAfterQuiescence();
     void quarantine() {quarantined_=true;}
-    /* Requires real CPU/device exclusion and retained ownership. Before GPU
-     * writes, clean+invalidate; after genuine completion, invalidate only.
+    /* Requires real CPU/device exclusion and retained ownership. Both operations
+     * require offset and a nonzero byte count to be 4 KiB multiples, and the
+     * entire range [offset, offset + bytes) must lie within the object.
+     * Before GPU writes, clean+invalidate; after genuine completion, invalidate only.
      * CPU must not dirty these pages while the device owns access. */
     /* A write-combined object is skipped unless include_write_combined: then its pages are maintained through the physical aperture,
      * for a client whose view turned out to be cacheable after all (NativeAdrenoVm::distrustWriteCombined). */

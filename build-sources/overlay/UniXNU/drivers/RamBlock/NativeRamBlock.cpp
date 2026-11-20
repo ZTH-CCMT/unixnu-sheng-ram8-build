@@ -119,9 +119,12 @@ class NativeRamBlock : public IOBlockStorageDevice {
     if (!writeBack || !overlay.active) return true;
     IOLockLock(flushMutex);
     IORWLockWrite(flushRw);   // waits for the writes in progress; their bits are set when they release it
+    IOLockLock(bitLock);
+    const bool needsFlush = unflushed;
+    IOLockUnlock(bitLock);
     bool ok = true;
     if (__atomic_load_n(&directFailed, __ATOMIC_ACQUIRE)) ok = false;
-    else if (unflushed) {
+    else if (needsFlush) {
       const uint64_t t0 = mach_absolute_time();
       StoreOps store; store.cached = true;
       uint64_t blocks = 0;
@@ -149,11 +152,12 @@ class NativeRamBlock : public IOBlockStorageDevice {
     disk->flushArmed = false;
     const bool due = disk->unflushed;
     IOLockUnlock(disk->bitLock);
-    if (disk->online && due) disk->flushStore(true);
+    if (due && __atomic_load_n(&disk->online, __ATOMIC_ACQUIRE)) disk->flushStore(true);
   }
   // bitLock held: start the idle timer once there is a write since the last flush and the timer is not already running.
   void armFlush() {
-    if (!writeBack || !flushCall || flushArmed || !unflushed) return;
+    if (!writeBack || !flushCall || flushArmed || !unflushed ||
+        !__atomic_load_n(&online, __ATOMIC_ACQUIRE)) return;
     uint64_t deadline = 0;
     clock_interval_to_deadline(kFlushSeconds, kSecondScale, &deadline);
     flushArmed = true;
@@ -216,7 +220,7 @@ public:
   void attachStore() {
     if (!gate) return;
     IOLockLock(gate);
-    if (storeAttached) { IOLockUnlock(gate); return; }
+    if (!online || storeAttached) { IOLockUnlock(gate); return; }
     storeAttached = true;
     unsigned mode = &native_ufs_store_mode ? native_ufs_store_mode() : 0;
     if (mode && (sparse.pages || isBig) && &native_ufs_store_open && &native_ufs_store_read && &native_ufs_store_write &&
@@ -250,10 +254,10 @@ public:
         } else if (result == persist::Open::Fresh) {
           native_data_persist_state = 3;
           direct = mode == 2;
-        } else if (mode == 2) {
-          // Resumed read-write: nothing is copied into RAM. The window answers for every page whose bit is set.
+        } else if (mode == 2 || isBig) {
+          // A large seed has no sparse array for replay. The overlay can also serve read-only pages on demand.
           direct = true;
-          native_data_persist_state = 2;
+          native_data_persist_state = overlay.readOnly ? 6 : 2;
         } else {
           struct Loader {
             NativeRamBlock *self;
@@ -313,7 +317,7 @@ public:
     IOLockUnlock(gate);
   }
 
-  bool available() const { return online && (memory || sparse.pages || isBig) && capacity; }
+  bool available() const { return __atomic_load_n(&online, __ATOMIC_ACQUIRE) && (memory || sparse.pages || isBig) && capacity; }
   bool seedInfo(uint64_t *base,uint64_t *bytes,uint8_t hash[32]) {
     if(!gate || !base || !bytes || !hash)return false;
     IOLockLock(gate);bool ready=available();
@@ -339,21 +343,31 @@ public:
     return kIOReturnSuccess;
   }
   IOReturn reportMediaState(bool *present, bool *changed) override {
-    *present = online; if (changed) *changed = false; return kIOReturnSuccess;
+    *present = __atomic_load_n(&online, __ATOMIC_ACQUIRE); if (changed) *changed = false; return kIOReturnSuccess;
   }
   IOReturn reportRemovability(bool *value) override { *value = false; return kIOReturnSuccess; }
   IOReturn reportWriteProtection(bool *value) override { *value = false; return kIOReturnSuccess; }
   IOReturn doSynchronizeCache() override {
-    if (!online) return kIOReturnNotReady;
-    // Write through: every changed page is on the medium, with its bitmap bit, before its write completed (PersistOverlay.h).
-    if (!writeBack) return kIOReturnSuccess;
-    // Write back: the pages written so far, then their bitmap blocks. Barrier and full requests are both served as a full flush.
-    return flushStore(false) ? kIOReturnSuccess : kIOReturnIOError;
+    if (!gate) return kIOReturnNotReady;
+    IOLockLock(gate);
+    if (!online) { IOLockUnlock(gate); return kIOReturnNotReady; }
+    if (!writeBack) { IOLockUnlock(gate); return kIOReturnSuccess; }
+    ++inflight;
+    IOLockUnlock(gate);
+    // Barrier and full requests flush the written pages, then their bitmap blocks.
+    const bool ok = flushStore(false);
+    finishIo();
+    return ok ? kIOReturnSuccess : kIOReturnIOError;
   }
   IOReturn doSynchronize(UInt64, UInt64, IOOptionBits) override { return doSynchronizeCache(); }
   IOReturn getWriteCacheState(bool *value) override { *value = writeBack; return kIOReturnSuccess; }
   IOReturn setWriteCacheState(bool) override { return kIOReturnUnsupported; }
   IOReturn doAsyncReadWrite(IOMemoryDescriptor *, UInt64, UInt64, IOStorageAttributes *, IOStorageCompletion *) override;
+  void finishIo() {
+    IOLockLock(gate);
+    if (!--inflight && !online) IOLockWakeup(gate, &inflight, false);
+    IOLockUnlock(gate);
+  }
 };
 OSDefineMetaClassAndStructors(NativeRamBlock, IOBlockStorageDevice)
 
@@ -437,7 +451,7 @@ bool NativeRamBlock::start(IOService *provider)
   }
   OSSafeReleaseNULL(medium);
   OSSafeReleaseNULL(characteristics);
-  online = true;
+  __atomic_store_n(&online, true, __ATOMIC_RELEASE);
   native_ram_block_ready = 1;
   registerService();
   return true;
@@ -470,9 +484,7 @@ IOReturn NativeRamBlock::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 blo
     for (uint64_t seen = __atomic_load_n(&native_data_io_max_ticks, __ATOMIC_RELAXED); spent > seen &&
          !__atomic_compare_exchange_n(&native_data_io_max_ticks, &seen, spent, true, __ATOMIC_RELAXED, __ATOMIC_RELAXED);) {}
     if (result) __atomic_fetch_add(&native_ram_block_failures, 1, __ATOMIC_RELAXED);
-    IOLockLock(gate);
-    if (!--inflight && !online) IOLockWakeup(gate, &inflight, false);
-    IOLockUnlock(gate);
+    finishIo();
     completion->action(completion->target, completion->parameter, result, done);
     return kIOReturnSuccess;
   }
@@ -598,13 +610,13 @@ IOReturn NativeRamBlock::directReadWrite(IOMemoryDescriptor *buffer, uint64_t of
 
 void NativeRamBlock::stop(IOService *provider)
 {
-  if (flushCall) thread_call_cancel_wait(flushCall);
-  // No new request starts; the direct requests still running finish first. Then what is still unflushed reaches the medium.
   if (gate) {
     IOLockLock(gate);
-    online = false;
+    __atomic_store_n(&online, false, __ATOMIC_RELEASE);
     while (inflight) IOLockSleep(gate, &inflight, THREAD_UNINT);
     IOLockUnlock(gate);
+    // No request can queue another flush once the in-flight writes have returned.
+    if (flushCall) thread_call_cancel_wait(flushCall);
     if (bitLock && flushMutex && flushRw) flushStore(false);
   }
   IOBlockStorageDevice::stop(provider);

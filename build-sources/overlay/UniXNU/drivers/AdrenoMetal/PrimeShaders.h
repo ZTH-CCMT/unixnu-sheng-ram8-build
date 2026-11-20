@@ -22,12 +22,14 @@
 #include <mach-o/loader.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <errno.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 extern "C" unsigned native_bridge_metal_recent_commits(uint64_t windowUs);
@@ -39,11 +41,11 @@ extern "C" unsigned native_bridge_metal_recent_commits(uint64_t windowUs);
 // Priming's progress for the telemetry table (the PR row): what the thread does (1 a pipeline compiles, 2 it waits for the desktop to
 // settle, 3 it opens a library and its functions), libraries done of the list, pipelines made, and the most command buffers the last wait
 // saw in 250 ms.
-extern "C" {volatile uint32_t native_prime_compiling, native_prime_libraries_done, native_prime_libraries_total, native_prime_made, native_prime_rate,
-               native_prime_functions_resumed;
-// For the PRb row: the libraries this process's passes compiled, those a pass leaves out, and the pass's scope (1 the bundles loaded
-// in this process, 2 the whole system).
-volatile uint32_t native_prime_libraries_primed, native_prime_libraries_skipped, native_prime_scope;}
+extern "C" {
+extern volatile uint32_t native_prime_compiling, native_prime_libraries_done, native_prime_libraries_total,
+    native_prime_made, native_prime_rate, native_prime_functions_resumed;
+extern volatile uint32_t native_prime_libraries_primed, native_prime_libraries_skipped, native_prime_scope;
+}
 
 extern "C" void native_bridge_metal_quiet_problems(bool);
 namespace prime {
@@ -54,14 +56,23 @@ static const char *const kRoots[] = {"/System/Library", "/System/Applications", 
 static const char *const kRoots[] = {"/System/Library", "/Applications", "/System/Cryptexes/OS/System/Library"};
 #endif
 
-static std::set<std::string> readLines(const std::string &path) {
+static bool endsWith(const std::string &line, const std::string &suffix) {
+    return line.size() >= suffix.size() &&
+           line.compare(line.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+static std::set<std::string> readLines(const std::string &path, const std::string &suffix = {},
+                                       bool *discarded = nullptr) {
     std::set<std::string> lines;
     if (FILE *f = fopen(path.c_str(), "r")) {
         char *line = nullptr;
         size_t capacity = 0;
         for (ssize_t length; (length = getline(&line, &capacity, f)) >= 0;) {
             if (length && line[length-1] == '\n') --length;
-            if (length) lines.emplace(line, static_cast<size_t>(length));
+            if (!length) continue;
+            std::string record(line, static_cast<size_t>(length));
+            if (endsWith(record, suffix)) lines.emplace(std::move(record));
+            else if (discarded) *discarded = true;
         }
         free(line);
         fclose(f);
@@ -89,6 +100,24 @@ static std::set<std::string> embeddedLines() {
 static void appendLine(const std::string &path, const std::string &line) {
     if (FILE *f = fopen(path.c_str(), "a")) {fprintf(f, "%s\n", line.c_str()); fclose(f);}
 }
+static void replaceLines(const std::string &path, const std::set<std::string> &lines) {
+    std::string temporary = path + ".tmp-XXXXXX";
+    const int fd = mkstemp(temporary.data());
+    if (fd < 0) return;
+    FILE *file = fdopen(fd, "w");
+    if (!file) {
+        close(fd);
+        unlink(temporary.c_str());
+        return;
+    }
+    bool ok = true;
+    for (const auto &line : lines) {
+        if (fprintf(file, "%s\n", line.c_str()) < 0) {ok = false; break;}
+    }
+    if (fclose(file) == 0 && ok && rename(temporary.c_str(), path.c_str()) == 0) return;
+    unlink(temporary.c_str());
+}
+
 static void writeCurrent(const std::string &path, const std::string &line) {
     if (FILE *f = fopen(path.c_str(), "w")) {fprintf(f, "%s\n", line.c_str()); fflush(f); fsync(fileno(f)); fclose(f);}
 }
@@ -237,7 +266,7 @@ static std::string imageUuid(const char *suffix) {
 // again; a plugin rebuild alone keeps what was finished.
 static std::string buildId() {
     const char *runtime=nmb_runtime_build();
-    return std::string("v2-") + (runtime?runtime:"unknown") + "-" + imageUuid("/libvulkan_freedreno.dylib");
+    return std::string("v3-") + (runtime?runtime:"unknown") + "-" + imageUuid("/libvulkan_freedreno.dylib");
 }
 
 // A kernel that calls visible functions it does not define (`NeedsInput(LinkedFunction { symbol: "..." })`): link the library's function of
@@ -271,7 +300,8 @@ static bool linkedKernel(id<MTLDevice> device, id<MTLLibrary> lib, id<MTLFunctio
 
 // One library: every function it names, in its order; returns the log line.
 static std::string library(id<MTLDevice> device, const std::string &path, const std::string &current, const std::set<std::string> &bad,
-                           const std::string &functionsPath, const std::set<std::string> &functionsDone, const std::string &build, bool &opened) {
+                           const std::string &functionsPath, const std::set<std::string> &functionsDone, const std::string &libraryId,
+                           const std::string &buildSuffix, bool &opened, bool &finished) {
     unsigned kernels = 0, renders = 0, made = 0, refused = 0, skipped = 0, zeroed = 0, linkedMade = 0, halfMade = 0;
     uint64_t waited = 0;
     std::string firstRefusal;   // the first refused function and why, so the log tells translator gaps from unspecialized constants
@@ -292,7 +322,7 @@ static std::string library(id<MTLDevice> device, const std::string &path, const 
         for (NSString *name in names) {
             @autoreleasepool {
                 const std::string key = path + "\t" + name.UTF8String;
-                const std::string doneKey = key + "\t" + build;
+                const std::string doneKey = libraryId + "\t" + name.UTF8String + buildSuffix;
                 native_prime_compiling = 3;
                 if (bad.count(key)) {++skipped; continue;}
                 if (functionsDone.count(doneKey)) {native_prime_functions_resumed = native_prime_functions_resumed + 1; continue;}
@@ -369,6 +399,7 @@ static std::string library(id<MTLDevice> device, const std::string &path, const 
         }
     }
     unlink(current.c_str());
+    finished = refused == 0;
     char line[200];
     snprintf(line, sizeof line, " kernels=%u renders=%u made=%u half=%u zeroed=%u linked=%u refused=%u skipped=%u ms=%llu waited=%llu", kernels, renders,
              made, halfMade, zeroed, linkedMade, refused, skipped, (unsigned long long)(nowMs() - began), (unsigned long long)waited);
@@ -391,14 +422,18 @@ static void run(id<MTLDevice> device, std::string root, unsigned delaySeconds, c
     unlink(current.c_str());
     sleep(delaySeconds);
     const std::set<std::string> bad = readLines(badPath);
-    std::set<std::string> done = readLines(donePath);
+    const std::string build = buildId();
+    const std::string buildSuffix = "\t" + build;
+    bool obsoleteLibraries = false, obsoleteFunctions = false;
+    const std::set<std::string> done = readLines(donePath, buildSuffix, &obsoleteLibraries);
     const std::string functionsPath = root + "/prime-fn";
-    const std::set<std::string> functionsDone = readLines(functionsPath);
+    const std::set<std::string> functionsDone = readLines(functionsPath, buildSuffix, &obsoleteFunctions);
+    if (obsoleteLibraries) replaceLines(donePath, done);
+    if (obsoleteFunctions) replaceLines(functionsPath, functionsDone);
     const uint64_t began = nowMs();
     unsigned libs = 0, finished = 0, foreign = 0;
     std::string note;
     const std::vector<std::string> paths = libraries(listPath, note);
-    const std::string build = buildId();
     appendLine(logPath, note + " build=" + build);
     native_prime_libraries_total = (uint32_t)paths.size();
 #if TARGET_OS_OSX
@@ -422,13 +457,15 @@ static void run(id<MTLDevice> device, std::string root, unsigned delaySeconds, c
             continue;
         }
 #endif
-        bool opened=false;
-        appendLine(logPath, library(device, path, current, bad, functionsPath, functionsDone, build, opened));
-        if(!opened)continue;
+        bool opened = false, complete = false;
+        appendLine(logPath, library(device, path, current, bad, functionsPath, functionsDone,
+                                    id, buildSuffix, opened, complete));
+        if (!opened) continue;
         native_prime_libraries_primed = native_prime_libraries_primed + 1;
-        appendLine(donePath, id);
-        done.insert(id);
-        ++finished;
+        if (complete) {
+            appendLine(donePath, id);
+            ++finished;
+        }
     }
     native_prime_libraries_done = finished;
     native_prime_compiling = 0;

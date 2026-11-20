@@ -16,7 +16,7 @@
  *   GMU_PWR_COL_PREEMPT_KEEPALIVE: a6xx_gmu.xml dword offset 0x1f8c4 in the GMU's own register window
  *   RBBM_INT_0_MASK bit 8 CP_SW: the switch finished
  * A record is 4192 KiB (the CP stores its state there) and the SMMU info page 4 KiB; a6xx_preempt.c allocates exactly these
- * per ring. A record's CPU-aware fields are the first 56 bytes (a6xx_preempt_record in a6xx_gpu.h).
+ * per ring. The CPU uses the first 64 bytes. The common fields occupy bytes 0–55, and A7xx stores the BV RPTR address at bytes 56–63.
  *
  * This object writes the trigger registers and judges the completion; the caller owns the memory (records, SMMU info pages,
  * ring and fence pages), fills a record through writeRecord() and an SMMU info page through writeSmmuInfo(), and gives the
@@ -96,7 +96,7 @@ public:
     IOReturn attach(const NativeAdrenoPreemptIo *,const NativeAdrenoPreemptRings &,uint32_t loaded,uint64_t (*now)(void *),void *clock);
     IOReturn detach();
     bool attached() const {return attached_;}
-    /* The CPU-aware fields of a record (a6xx_preempt_record, first 56 bytes): the magic the CP checks, the ring's address, its
+    /* The CPU-aware fields of a record (64 bytes including A7xx BV RPTR): the magic the CP checks, the ring's address, its
      * read-pointer shadow and BV read-pointer shadow, its CP_RB_CNTL value and the write pointer the CP resumes at. */
     static bool writeRecord(uint8_t *record,uint64_t rbase,uint64_t rptr_addr,uint64_t bv_rptr_addr,uint32_t cntl,uint32_t wptr);
     /* An a7xx_cp_smmu_info page: its magic, the page table the ring's CP runs, the address-space id and context idr. */

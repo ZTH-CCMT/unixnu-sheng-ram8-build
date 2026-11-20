@@ -771,6 +771,7 @@ static void testTimeoutEvidenceReadFailure()
     NativeAdrenoSwitchEvidence evidence{};std::memcpy(&evidence,raw,sizeof evidence);
     CHECK(evidence.sqe_status==-55 && !evidence.sqe.valid_mask[0][0] && evidence.sqe.words[0][0]==UINT32_MAX);
     CHECK(evidence.sqe.selector_read_status[0]==-1 && !p.restart_count);
+    CHECK(!p.ring.poisoned() && !p.low.poisoned());
     std::puts("PASS failed/busy SQE callback is not valid zero and does not suppress timeout handling");
     std::puts("PASS failed progress/stall reads remain explicitly invalid in the captured event");
 }
@@ -929,13 +930,27 @@ static void testStallDrainStatus()
         {3,false,kIOReturnSuccess}
     };
     const uint32_t drained=native_adreno_unstick[11];
+    // A failed first CP sample must not masquerade as forward motion.
+    uint32_t sampled_fence=0;
+    CHECK(p.submit.submit(&p.vm,&buffer,1,7,&sampled_fence,&ringclock)==kIOReturnSuccess);
+    cp.fail_read_reg=0x0928;
+    clock_us+=1;
+    CHECK(p.submit.wait(sampled_fence,&ringclock,0)==kIOReturnTimeout && !p.ring.poisoned());
+    cp.fail_read_reg=UINT32_MAX;
+    clock_us+=50000;
+    CHECK(p.submit.wait(sampled_fence,&ringclock,0)==kIOReturnTimeout);
+    CHECK(native_adreno_stall_kick[20]==(1u<<8));
+    fencemem[1]=sampled_fence;
+    CHECK(p.submit.wait(sampled_fence,&ringclock,0)==kIOReturnSuccess);
     for(const auto &test:cases) {
         uint32_t fence=0;
         CHECK(p.submit.submit(&p.vm,&buffer,1,7,&fence,&ringclock)==kIOReturnSuccess);
         clock_us+=1;
         CHECK(p.submit.wait(fence,&ringclock,0)==kIOReturnTimeout);
+        ++cp.regs[0x0928];
         clock_us+=50000;
         CHECK(p.submit.wait(fence,&ringclock,0)==kIOReturnTimeout);
+        CHECK(native_adreno_stall_kick[20]==1);
         const uint32_t attempts=native_adreno_unstick[4];
         cp.regs[0x3c46]=test.ack;
         cp.fail_read_reg=test.read_error?0x3c46:~0u;

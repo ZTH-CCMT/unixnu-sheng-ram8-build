@@ -2038,7 +2038,8 @@ static void notified(void *context,uint64_t value) {
 // ---- command buffers and encoders ----
 @interface NBQueue : NBObject {NBQueuePriorities::Request _priority;}
 @property(nonatomic) NmbQueue *handle;
-@property(atomic,strong) dispatch_queue_t completionQueue;   // SPI: where command buffers' handlers run (nil: the runtime's thread)
+@property(nonatomic,strong) dispatch_queue_t handlerQueue;
+@property(atomic,strong) dispatch_queue_t completionQueue;   // SPI: override the queue for completed handlers
 @end
 // Diagnostic, render server only, while /private/var/ngpu/debug/source-race exists when it starts: each small source a command buffer
 // samples (a texture over an IOSurface or over a no-copy buffer, at most 1 MiB of rows) is hashed at commit and again at completion.
@@ -2136,9 +2137,9 @@ static void dumpSurfacesOnce(NSSet *textures,NSSet *owners) {
 // The sampled sources watched for a rewrite while the GPU could read them (gWatchSources), kept alive until completion.
 @property(nonatomic,strong) NSMutableSet *sampled;
 - (void)watchTexture:(NBTexture *)texture;
-@property(nonatomic,strong) dispatch_group_t handlers;
-@property(nonatomic,strong) dispatch_group_t schedulingHandlers;
-@property(nonatomic) BOOL schedulingDelivered;
+@property(nonatomic,strong) dispatch_group_t handlers,schedulingHandlers;
+@property(nonatomic,strong) dispatch_group_t gpuCompletion,gpuScheduling,runtimeCommit;
+@property(atomic) BOOL schedulingDelivered;
 // NATIVE_METAL_DUMP_CB: the textures this command buffer wrote, met while it was encoded (dumpTargets), the render pass's attachments
 // waiting for their encoder (dumpPending), how many passes and kernels it encoded so far, and whether it is the plugin's own readback.
 @property(nonatomic,strong) NSMutableArray *dumpTargets,*dumpPending;
@@ -2162,6 +2163,33 @@ static bool freezeWallpaperOn() {
 static std::recursive_mutex gWallpaperLock;
 static uint64_t gWallpaperFrozenCommand,gWallpaperFrozenAt,gWallpaperAllowed,gWallpaperParked;
 static NBTexture *gWallpaperFrozenOutput;
+// A client callback can wait on GPU progress without waiting for callbacks that
+// may depend on its return. Only the scheduled callback sees the scheduling phase.
+static thread_local bool tInCommandHandler;
+static thread_local const void *tScheduledCommand;
+struct CommandHandlerScope {
+ const bool previousInHandler=tInCommandHandler;
+ const void *const previousScheduled=tScheduledCommand;
+ explicit CommandHandlerScope(const void *scheduled=nullptr) {
+  tInCommandHandler=true;tScheduledCommand=scheduled;
+ }
+ ~CommandHandlerScope() {
+  tScheduledCommand=previousScheduled;tInCommandHandler=previousInHandler;
+ }
+};
+
+static uint64_t resolveMipExtent(uint64_t extent,uint64_t level) {
+ return std::max<uint64_t>(1,extent>>level);
+}
+
+static bool resolveCopySubresource(uint64_t level,uint64_t levels,uint64_t firstSlice,uint64_t slices,
+                                   uint64_t firstPlane,uint64_t baseDepth,uint64_t layers,bool volume) {
+ if(level>=levels || level>=64 || firstSlice>=slices || !layers)return false;
+ if(!volume)return layers<=slices-firstSlice;
+ const uint64_t depth=resolveMipExtent(baseDepth,level);
+ return firstPlane<depth && layers<=depth-firstPlane;
+}
+
 struct SingleSampleCopy {
  NmbTexture *source,*destination;
  uint64_t sourceLevel,sourceSlice,destinationLevel,destinationSlice;
@@ -3163,7 +3191,12 @@ static char kUserDictionaryKey;
 // iPadOS 27: QuartzCore names the tasks a command buffer works for (GPU time attribution), on every buffer; there is no such accounting here.
 - (void)setResponsibleTaskIDs:(const void *)ids count:(NSUInteger)count {(void)ids;(void)count;}
 - (instancetype)init {
- if((self=[super init])){_scheduledHandlers=[NSMutableArray array];_completedHandlers=[NSMutableArray array];_surfaces=[NSMutableSet set];_resourceOwners=[NSMutableSet set];_handlers=dispatch_group_create();_schedulingHandlers=dispatch_group_create();}
+ if((self=[super init])){
+  _scheduledHandlers=[NSMutableArray array];_completedHandlers=[NSMutableArray array];
+  _surfaces=[NSMutableSet set];_resourceOwners=[NSMutableSet set];
+  _handlers=dispatch_group_create();_schedulingHandlers=dispatch_group_create();
+  _gpuCompletion=dispatch_group_create();_gpuScheduling=dispatch_group_create();_runtimeCommit=dispatch_group_create();
+ }
  if(self){traceNumber=++gFrameNumber;createdUs=nowUs();createCpu=threadCpuUs();createTid=threadIdLow();earlyEligible=onRenderServerThread();if(earlyEligible){pthread_t none=nullptr;gEncodeReference.compare_exchange_strong(none,pthread_self());traceThread(1);}frontStage(traceNumber,0,1);}
  return self;
 }
@@ -3199,10 +3232,9 @@ static char kUserDictionaryKey;
 }
 - (MTLCommandBufferStatus)status {
  if(self.failedLocally)return MTLCommandBufferStatusError;
- // The runtime submits on the committing thread: a commit that submits its own last batch runs the scheduled handlers before
- // nmb_command_buffer_commit returns, and Metal's status reads Scheduled inside them (as its wait returns after them); the frontend's
- // own `submitted` is only set after the call, so the runtime's status answers once scheduling has been delivered.
- if(self.committed && !self.submitted && !_schedulingDelivered)return MTLCommandBufferStatusCommitted;
+ // A deferred scheduling callback still observes the phase it was registered for.
+ if(tScheduledCommand==(__bridge const void *)self)return MTLCommandBufferStatusScheduled;
+ if(self.committed && !self.submitted && !self.schedulingDelivered)return MTLCommandBufferStatusCommitted;
  std::lock_guard<std::mutex> guard(gRuntimeHandleLock);
  if(!_handle)return MTLCommandBufferStatusError;
  return (MTLCommandBufferStatus)nmb_command_buffer_status(_handle);
@@ -3327,16 +3359,30 @@ static char kUserDictionaryKey;
    const bool resolves=a.storeAction==MTLStoreActionMultisampleResolve || a.storeAction==MTLStoreActionStoreAndMultisampleResolve;
    if(singleSample()) {
     if(resolves) {
-     if(a.loadAction!=MTLLoadActionLoad && a.storeAction==MTLStoreActionMultisampleResolve) {
-      // The source is discarded, so draw into the final attachment directly.
-      out.texture=resolve.handle;out.level=a.resolveLevel;out.slice=a.resolveSlice;out.depth_plane=a.resolveDepthPlane;
+     const bool sourceVolume=texture.textureType==MTLTextureType3D,resolveVolume=resolve.textureType==MTLTextureType3D;
+     const uint64_t layers=std::max<uint64_t>(1,d.renderTargetArrayLength);
+     if(!resolveCopySubresource(a.level,texture.mipmapLevelCount,a.slice,textureSliceCount((id<MTLTexture>)texture),
+                                a.depthPlane,texture.depth,layers,sourceVolume) ||
+        !resolveCopySubresource(a.resolveLevel,resolve.mipmapLevelCount,a.resolveSlice,textureSliceCount((id<MTLTexture>)resolve),
+                                a.resolveDepthPlane,resolve.depth,layers,resolveVolume))return false;
+     const uint64_t sourceWidth=resolveMipExtent(texture.width,a.level),sourceHeight=resolveMipExtent(texture.height,a.level);
+     const uint64_t resolveWidth=resolveMipExtent(resolve.width,a.resolveLevel),resolveHeight=resolveMipExtent(resolve.height,a.resolveLevel);
+     const uint64_t width=d.renderTargetWidth?d.renderTargetWidth:sourceWidth;
+     const uint64_t height=d.renderTargetHeight?d.renderTargetHeight:sourceHeight;
+     if(width>sourceWidth || height>sourceHeight || width>resolveWidth || height>resolveHeight)return false;
+     const bool sameRenderArea=(d.renderTargetWidth || width==resolveWidth) &&
+                               (d.renderTargetHeight || height==resolveHeight);
+     const uint64_t sourcePlane=sourceVolume?a.depthPlane:0,resolvePlane=resolveVolume?a.resolveDepthPlane:0;
+     out.depth_plane=sourcePlane;
+     if(a.loadAction!=MTLLoadActionLoad && a.storeAction==MTLStoreActionMultisampleResolve && sameRenderArea) {
+      // The source is discarded, so draw directly when the pass area won't change.
+      out.texture=resolve.handle;out.level=a.resolveLevel;out.slice=a.resolveSlice;out.depth_plane=resolvePlane;
      } else {
       // Load and StoreAndResolve retain the source's contents across passes.
-      const uint64_t width=std::max<uint64_t>(1,texture.width>>a.level),height=std::max<uint64_t>(1,texture.height>>a.level);
-      const uint64_t layers=d.renderTargetArrayLength?d.renderTargetArrayLength:1;
       for(uint64_t layer=0;layer<layers;layer++)
-       resolveCopies.push_back({texture.handle,resolve.handle,a.level,a.slice+layer,a.resolveLevel,a.resolveSlice+layer,
-          {0,0,a.depthPlane},{0,0,a.resolveDepthPlane},{width,height,1}});
+       resolveCopies.push_back({texture.handle,resolve.handle,a.level,a.slice+(sourceVolume?0:layer),
+          a.resolveLevel,a.resolveSlice+(resolveVolume?0:layer),
+          {0,0,sourcePlane+(sourceVolume?layer:0)},{0,0,resolvePlane+(resolveVolume?layer:0)},{width,height,1}});
      }
      out.store=MTLStoreActionStore;
     }
@@ -3365,10 +3411,10 @@ static char kUserDictionaryKey;
  };
  for(unsigned i=0;i<8;i++) {
   MTLRenderPassColorAttachmentDescriptor *c=d.colorAttachments[i];
-  if(!attachment(c,pass.colors[i])){[self refuse:@"foreign color attachment"];return nil;}
+  if(!attachment(c,pass.colors[i])){[self refuse:@"invalid or foreign color attachment"];return nil;}
   pass.colors[i].clear[0]=c.clearColor.red;pass.colors[i].clear[1]=c.clearColor.green;pass.colors[i].clear[2]=c.clearColor.blue;pass.colors[i].clear[3]=c.clearColor.alpha;
  }
- if(!attachment(d.depthAttachment,pass.depth) || !attachment(d.stencilAttachment,pass.stencil)){[self refuse:@"foreign depth/stencil attachment"];return nil;}
+ if(!attachment(d.depthAttachment,pass.depth) || !attachment(d.stencilAttachment,pass.stencil)){[self refuse:@"invalid or foreign depth/stencil attachment"];return nil;}
  pass.depth.clear[0]=d.depthAttachment.clearDepth;pass.stencil.clear[0]=d.stencilAttachment.clearStencil;
  pass.depth.resolve_filter=d.depthAttachment.depthResolveFilter;pass.stencil.resolve_filter=d.stencilAttachment.stencilResolveFilter;
  pass.width=d.renderTargetWidth;pass.height=d.renderTargetHeight;pass.array_length=d.renderTargetArrayLength;pass.samples=singleSample() && d.defaultRasterSampleCount?1:d.defaultRasterSampleCount;
@@ -3388,8 +3434,12 @@ static char kUserDictionaryKey;
  }
  return made;
 }
-- (void)addScheduledHandler:(MTLCommandBufferHandler)block {if(block)@synchronized(self){[_scheduledHandlers addObject:[block copy]];}}
-- (void)addCompletedHandler:(MTLCommandBufferHandler)block {if(block)@synchronized(self){[_completedHandlers addObject:[block copy]];}}
+- (void)addScheduledHandler:(MTLCommandBufferHandler)block {
+ if(block)@synchronized(self){if(!self.committed)[_scheduledHandlers addObject:[block copy]];}
+}
+- (void)addCompletedHandler:(MTLCommandBufferHandler)block {
+ if(block)@synchronized(self){if(!self.committed)[_completedHandlers addObject:[block copy]];}
+}
 // A drawable (RenderBox's CAMetalLayer path) is presented once the GPU has written it: this runtime's scheduling comes before completion.
 - (void)presentDrawable:(id<MTLDrawable>)drawable {[self addCompletedHandler:^(id<MTLCommandBuffer>){[drawable present];}];}
 - (void)presentDrawable:(id<MTLDrawable>)drawable atTime:(CFTimeInterval)time {[self addCompletedHandler:^(id<MTLCommandBuffer>){[drawable presentAtTime:time];}];}
@@ -3413,15 +3463,21 @@ static char kUserDictionaryKey;
  }
  NSArray *handlers;
  @synchronized(self){
-  _schedulingDelivered=YES;handlers=[_scheduledHandlers copy];[_scheduledHandlers removeAllObjects];
+  if(self.schedulingDelivered)return;
+  self.schedulingDelivered=YES;handlers=[_scheduledHandlers copy];[_scheduledHandlers removeAllObjects];
  }
- void (^run)(void)=^{
-  for(MTLCommandBufferHandler block in handlers)block((id<MTLCommandBuffer>)self);
-  dispatch_group_leave(self->_schedulingHandlers);
- };
- // Run on the runtime's scheduled-handler thread, preserving its ordering and own-wait
- // deadlock checks. The queue's completionQueue routes completed handlers only.
- run();
+ dispatch_group_leave(_gpuScheduling);
+ if(!handlers.count){dispatch_group_leave(_schedulingHandlers);return;}
+ // A scheduled handler can submit or wait for GPU work. Return to the
+ // runtime first so submissions and completions can continue.
+ dispatch_async(_queue.handlerQueue,^{
+  CommandHandlerScope callback((__bridge const void *)self);
+  @try {
+   for(MTLCommandBufferHandler block in handlers)block((id<MTLCommandBuffer>)self);
+  } @finally {
+   dispatch_group_leave(self->_schedulingHandlers);
+  }
+ });
 }
 // After completion (or a refusal): invalidate the CPU's view of imported surfaces, then completed handlers, once.
 - (void)finish {
@@ -3466,7 +3522,10 @@ static char kUserDictionaryKey;
  NSArray *completedHandlers;
  @synchronized(self){
   // A frontend refusal or a failed submission never scheduled. Unblock its waiter without inventing a scheduled event.
-  if(!_schedulingDelivered){_schedulingDelivered=YES;[_scheduledHandlers removeAllObjects];dispatch_group_leave(_schedulingHandlers);}
+  if(!self.schedulingDelivered){
+   self.schedulingDelivered=YES;[_scheduledHandlers removeAllObjects];
+   dispatch_group_leave(_gpuScheduling);dispatch_group_leave(_schedulingHandlers);
+  }
   completedHandlers=[_completedHandlers copy];[_completedHandlers removeAllObjects];
  }
  if(!watched.empty()) {
@@ -3483,22 +3542,40 @@ static char kUserDictionaryKey;
  }
  // The runtime reports Vulkan's DeviceLost as Metal's code 11 (see -error).
  const bool lost=!self.failedLocally && nmb_command_buffer_metal_error_code(_handle)==11;
- void (^run)(void)=^{
-  frontStage(self->traceNumber,self.commitIndex,12);
-  DetailCommandScope commandScope(self->traceNumber);
-  for(MTLCommandBufferHandler block in completedHandlers){DetailSpan timing(3,(uintptr_t)(__bridge void *)block,blockInvoke(block),true);block((id<MTLCommandBuffer>)self);}
-  frontStage(self->traceNumber,self.commitIndex,13);
-  dispatch_group_leave(self->_handlers);
-  if(lost)endRenderServerAfterGpuLoss();
- };
- dispatch_queue_t queue=_queue.completionQueue;
- if(queue)dispatch_async(queue,run);else run();
+ dispatch_group_leave(_gpuCompletion);
+ if(!completedHandlers.count && !lost && !dispatch_group_wait(_schedulingHandlers,DISPATCH_TIME_NOW)) {
+  frontStage(traceNumber,self.commitIndex,12);frontStage(traceNumber,self.commitIndex,13);
+  dispatch_group_leave(_handlers);
+ } else {
+  void (^run)(void)=^{
+   frontStage(self->traceNumber,self.commitIndex,12);
+   DetailCommandScope commandScope(self->traceNumber);
+   CommandHandlerScope callback;
+   @try {
+    for(MTLCommandBufferHandler block in completedHandlers){
+     DetailSpan timing(3,(uintptr_t)(__bridge void *)block,blockInvoke(block),true);
+     block((id<MTLCommandBuffer>)self);
+    }
+   } @finally {
+    frontStage(self->traceNumber,self.commitIndex,13);
+    dispatch_group_leave(self->_handlers);
+   }
+   if(lost)endRenderServerAfterGpuLoss();
+  };
+  dispatch_queue_t queue=_queue.completionQueue;
+  if(queue)dispatch_group_notify(_schedulingHandlers,queue,run);
+  else dispatch_async(_queue.handlerQueue,run);
+ }
  frontStage(traceNumber,self.commitIndex,14);
 }
 - (void)commit {
- if(self.committed){NBLOG(@"native-metal: commit twice");return;}
- self.committed=YES;
- self.committedUs=nowUs();
+ @synchronized(self){
+  if(self.committed){NBLOG(@"native-metal: commit twice");return;}
+  dispatch_group_enter(_handlers);dispatch_group_enter(_schedulingHandlers);
+  dispatch_group_enter(_gpuCompletion);dispatch_group_enter(_gpuScheduling);dispatch_group_enter(_runtimeCommit);
+  self.committedUs=nowUs();
+  self.committed=YES;
+ }
  commitCpu=threadCpuUs();commitTid=threadIdLow();
  {
   std::lock_guard<std::mutex> lock(gCommitLock);
@@ -3507,8 +3584,6 @@ static char kUserDictionaryKey;
   CommitRecord &r=gCommitRing[index%32];
   r={};r.index=index;r.committedUs=self.committedUs;r.ageUs=self.committedUs-createdUs;r.work=encodedWork;
  }
- dispatch_group_enter(_handlers);
- dispatch_group_enter(_schedulingHandlers);
  @synchronized(gInFlight){[gInFlight addObject:self];}
  if(metalChainOn()){
   traceStartWriter();TraceRec r{};r.type=45;r.t0=nowUs();r.t1=traceNumber;
@@ -3550,6 +3625,7 @@ static char kUserDictionaryKey;
    frontStage(traceNumber,self.commitIndex,7);
    const auto range=dumpRange();
    self.submitted=YES;
+   dispatch_group_leave(_runtimeCommit);
    if(appIndex && range.first && appIndex>=range.first && appIndex<(uint64_t)range.first+range.second)dumpReadback(self,appIndex);
    [self fireEarly];return;
   }
@@ -3558,6 +3634,7 @@ static char kUserDictionaryKey;
  }
  self.failedLocally=YES;gCommitFailures++;
  self.submitted=YES;
+ dispatch_group_leave(_runtimeCommit);
  dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT,0),^{[self finish];});
 }
 - (void)fireEarly {
@@ -3570,16 +3647,18 @@ static char kUserDictionaryKey;
 }
 - (void)waitUntilCompleted {
  if(!self.committed)return;
- encodeDrain();
  const uint64_t began=nowUs();
- // As Metal's waitUntilCompleted: until the command buffer completes, with an error when the GPU was restarted under it (the kernel's
- // hangcheck ends a hang and the client whose work hung sees its device lost), never after a fixed time.
+ const uint32_t cpuStart=threadCpuUs();
+ // The runtime wait also submits grouped work. Wait only for this buffer's
+ // frontend commit before calling it. Local refusal can release the handle.
+ if(!self.submitted)dispatch_group_wait(_runtimeCommit,DISPATCH_TIME_FOREVER);
  if(!self.failedLocally && nmb_command_buffer_wait(_handle,0)!=0) {
   gWaitTimeouts++;
-  NBLOG(@"native-metal: completion wait failed (status %llu)",(unsigned long long)nmb_command_buffer_status(_handle));
+  NBLOG(@"native-metal: completion wait failed: %@",lastError());
+  return;
  }
- const uint32_t cpuStart=threadCpuUs();
- dispatch_group_wait(_handlers,DISPATCH_TIME_FOREVER);
+ dispatch_group_wait(tInCommandHandler?_gpuCompletion:_handlers,DISPATCH_TIME_FOREVER);
+ if(tScheduledCommand==(__bridge const void *)self)tScheduledCommand=nullptr;
  {
   TraceRec rec={};rec.type=2;rec.t0=began;rec.t1=nowUs();rec.tid=threadIdLow();rec.a=(uint32_t)(uintptr_t)__builtin_return_address(0);
   rec.cpu0=cpuStart;rec.cpu1=threadCpuUs();traceNote(rec.tid);tracePush(rec);
@@ -3589,13 +3668,13 @@ static char kUserDictionaryKey;
 }
 - (void)waitUntilScheduled {
  if(!self.committed)return;
- encodeDrain();
  const uint64_t began=nowUs();
+ const uint32_t cpuStart=threadCpuUs();
+ if(!self.submitted)dispatch_group_wait(_runtimeCommit,DISPATCH_TIME_FOREVER);
  if(!self.failedLocally && !nmb_command_buffer_wait_scheduled(_handle)){
   NBLOG(@"native-metal: waitUntilScheduled refused: %@",lastError());return;
  }
- const uint32_t cpuStart=threadCpuUs();
- dispatch_group_wait(_schedulingHandlers,DISPATCH_TIME_FOREVER);
+ dispatch_group_wait(tInCommandHandler?_gpuScheduling:_schedulingHandlers,DISPATCH_TIME_FOREVER);
  {
   TraceRec rec={};rec.type=3;rec.t0=began;rec.t1=nowUs();rec.tid=threadIdLow();rec.a=(uint32_t)(uintptr_t)__builtin_return_address(0);
   rec.cpu0=cpuStart;rec.cpu1=threadCpuUs();traceNote(rec.tid);tracePush(rec);
@@ -3674,6 +3753,8 @@ static void completed(void *context) {
 @implementation NBQueue
 - (instancetype)init {
  if((self=[super init])) {
+  const dispatch_queue_attr_t attr=dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL,QOS_CLASS_USER_INTERACTIVE,0);
+  _handlerQueue=dispatch_queue_create("org.unixnu.metal.handlers",attr);
   std::lock_guard<std::mutex> lock(gPriorityLock);
   gQueuePriorities.add(_priority);auto p=gQueuePriorities.aggregate();nbForwardPriority(p.foreground,p.background);
  }

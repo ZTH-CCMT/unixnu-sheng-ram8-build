@@ -139,8 +139,8 @@ IOReturn NativeAdrenoRing::writeWptr(uint32_t value)
 IOReturn NativeAdrenoRing::readRptr(uint32_t *value)
 {
     uint32_t rptr=0;
-    /* A secondary ring has no CP_RB_RPTR of its own: the CP keeps its read pointer in the ring's record, whose rptr shadow the CP
-     * writes to msm_rbmemptrs.rptr (the fence page's first word, the address the record names) whenever it switches away. */
+    /* The board enables APRIV read-pointer writeback to memptrs, also while the ring runs. Inactive rings have no dedicated
+     * CP_RB_RPTR register. Keep reading their own shadows and avoid direct register reads when CP preemption/IFPC may be active. */
     if(secondary_ || preempt_) {
         if(cache_.acquire(cache_.cookie,fence_,fence_bytes_))return poison();
         rptr=fence_[0];
@@ -160,12 +160,14 @@ IOReturn NativeAdrenoRing::ibBefore(uint32_t rptr,uint64_t *iova,uint32_t *dword
 }
 IOReturn NativeAdrenoRing::stallState(uint32_t *out)
 {
-    static const uint32_t regs[NativeAdrenoRingStallWords]={
+    static constexpr uint32_t regs[]={
         0x0210,0x0211,0x0212,0x0213,0x0201,0x0821,0x0825,0x0824,RingRptr,RingWptr,
         0x0928,0x0929,0x092a,0x092b,0x092c,0x092d,0x0a66,0x0a6d,0x0a70,0x0a74,0x0a71,0x0a72};
+    static_assert(sizeof(regs)/sizeof(regs[0])==NativeAdrenoRingStallWords,"stall register output layout");
     if(!out)return kIOReturnBadArgument;
+    if(!attached_)return kIOReturnNotReady;
     for(uint32_t i=0;i<NativeAdrenoRingStallWords;++i)
-        if(io_.read32(io_.cookie,regs[i],&out[i]))return poison();
+        if(io_.read32(io_.cookie,regs[i],&out[i]))return kIOReturnIOError;
     return kIOReturnSuccess;
 }
 void NativeAdrenoRing::capturePublishedTail(NativeAdrenoPublishedTail *out) const
@@ -366,6 +368,7 @@ IOReturn NativeAdrenoRing::attach(const NativeAdrenoRingIo *io,const NativeAdren
     ring_bytes_=ring_bytes;ring_iova_=ring_iova;
     fence_=static_cast<volatile uint32_t *>(fence);fence_bytes_=fence_bytes;fence_iova_=fence_iova;
     for(size_t i=0;i<fence_bytes_/4;++i)fence_[i]=0;
+    if(cache_.publish(cache_.cookie,fence_,fence_bytes_) || io_.barrier(io_.cookie))return poison();
     control_=(uint32_t)(ilog2(ring_bytes_/8)&0x3f)|(ilog2(RingBlockBytes/8)<<8);
     IOReturn status=program();
     if(status)return status;
@@ -387,6 +390,7 @@ IOReturn NativeAdrenoRing::attachSecondary(const NativeAdrenoRingIo *io,const Na
     fence_=static_cast<volatile uint32_t *>(fence);fence_bytes_=fence_bytes;fence_iova_=fence_iova;
     for(size_t i=0;i<ring_bytes_/4;++i)ring_[i]=0;
     for(size_t i=0;i<fence_bytes_/4;++i)fence_[i]=0;
+    if(cache_.publish(cache_.cookie,fence_,fence_bytes_) || io_.barrier(io_.cookie))return poison();
     control_=(uint32_t)(ilog2(ring_bytes_/8)&0x3f)|(ilog2(RingBlockBytes/8)<<8);
     next_=0;rptr_shadow_=0;seqno_=0;completed_=0;submissions_=0;
     secondary_=true;current_=false;attached_=true;
@@ -448,7 +452,7 @@ IOReturn NativeAdrenoRing::writePreemptWptr(uint8_t *record)
 }
 IOReturn NativeAdrenoRing::restoreWptr()
 {
-    if(!attached_ || poisoned_)return kIOReturnNotReady;
+    if(!attached_ || poisoned_ || !current_)return kIOReturnNotReady;
     if(!restore_wptr_)return kIOReturnSuccess;
     if(writeWptr(next_))return kIOReturnIOError;
     restore_wptr_=false;
@@ -458,14 +462,20 @@ IOReturn NativeAdrenoRing::restoreWptr()
 uint32_t NativeAdrenoRing::readHardwarePointers(uint32_t &rptr,uint32_t &wptr) const
 {
     rptr=wptr=UINT32_MAX;
-    uint32_t valid=0;
-    if(!io_.read32(io_.cookie,RingRptr,&rptr))valid|=1u;
-    if(!io_.read32(io_.cookie,RingWptr,&wptr))valid|=2u;
+    if(!attached_)return 0;
+    uint32_t valid=0,value=0;
+    if(!io_.read32(io_.cookie,RingRptr,&value)){rptr=value;valid|=1u;}
+    if(!io_.read32(io_.cookie,RingWptr,&value)){wptr=value;valid|=2u;}
     return valid;
 }
-/* CP_RB_BASE, CP_RB_CNTL, CP_RB_RPTR_ADDR, WPTR 0 and CP_SCRATCH(2), then the read pointer the CP reports. */
+/* Program an empty ring while the CP is halted or reset. */
 IOReturn NativeAdrenoRing::program()
 {
+    uint32_t rptr=0;
+    const IOReturn status=readRptr(&rptr);
+    if(status)return status;
+    // Reject a nonzero RPTR before publishing WPTR zero, which would make an empty ring appear to contain work.
+    if(rptr)return poison();
     const uint32_t control=control_?control_:(uint32_t)(ilog2(ring_bytes_/8)&0x3f)|(ilog2(RingBlockBytes/8)<<8);
     const uint32_t base_lo=(uint32_t)ring_iova_,base_hi=(uint32_t)(ring_iova_>>32);
     const uint32_t rptr_lo=(uint32_t)fence_iova_,rptr_hi=(uint32_t)(fence_iova_>>32);
@@ -473,13 +483,12 @@ IOReturn NativeAdrenoRing::program()
         RingRptrAddress,rptr_lo,RingRptrAddress+1,rptr_hi,RingWptr,0,RingScratch,0};
     for(size_t i=0;i<sizeof(writes)/sizeof(writes[0]);i+=2)
         if(io_.write32(io_.cookie,writes[i],writes[i+1]))return poison();
-    uint32_t rptr=0;IOReturn status=readRptr(&rptr);
-    if(status)return status;
-    next_=rptr;return kIOReturnSuccess;
+    next_=0;
+    return kIOReturnSuccess;
 }
 IOReturn NativeAdrenoRing::restart(uint32_t completed)
 {
-    if(!attached_)return kIOReturnNotReady;
+    if(!attached_ || secondary_)return kIOReturnNotReady;
     /* Not checked against this ring's own last number: the two rings share one number space, so the hung or completed fence the caller
      * restarts at may be one the other ring issued (untagged-cbea3217c: the hung job 71 sat on ring 1, ring 0 had issued only 70). */
     poisoned_=false;
@@ -488,10 +497,12 @@ IOReturn NativeAdrenoRing::restart(uint32_t completed)
     fence_[1]=completed;fence_[RingBvFenceOffset/4]=completed;
     if(preempt_)initPreemptPage();
     for(size_t i=0;i<ring_bytes_/4;++i)ring_[i]=0;
-    if(cache_.publish(cache_.cookie,fence_,fence_bytes_) || cache_.publish(cache_.cookie,ring_,ring_bytes_))return poison();
+    if(cache_.publish(cache_.cookie,fence_,fence_bytes_) || cache_.publish(cache_.cookie,ring_,ring_bytes_) ||
+        io_.barrier(io_.cookie))return poison();
     IOReturn status=program();
     if(status)return status;
     seqno_=completed;completed_=completed;
+    current_=true;restore_wptr_=false;
     context_=0;reset_pending_=true;table_=0;table_pending_=false;
     return kIOReturnSuccess;
 }
@@ -505,7 +516,7 @@ IOReturn NativeAdrenoRing::restartSecondary(uint32_t completed)
     for(size_t i=0;i<ring_bytes_/4;++i)ring_[i]=0;
     if(cache_.publish(cache_.cookie,fence_,fence_bytes_) || cache_.publish(cache_.cookie,ring_,ring_bytes_))return poison();
     next_=0;rptr_shadow_=0;seqno_=completed;completed_=completed;
-    restore_wptr_=false;reset_pending_=true;table_pending_=false;
+    current_=false;restore_wptr_=false;reset_pending_=true;table_pending_=false;
     return kIOReturnSuccess;
 }
 void NativeAdrenoRing::setTimeline(bool on)
@@ -535,7 +546,7 @@ IOReturn NativeAdrenoRing::fenceValue(uint32_t *value)
 }
 IOReturn NativeAdrenoRing::submitUnfenced(const uint32_t *words,size_t word_count)
 {
-    if(!attached_ || poisoned_)return kIOReturnNotReady;
+    if(!attached_ || poisoned_ || !current_)return kIOReturnNotReady;
     if(!words || !word_count)return kIOReturnBadArgument;
     const uint32_t size_words=(uint32_t)(ring_bytes_/4),mask=size_words-1;
     if(word_count>size_words-8)return kIOReturnNoResources;
@@ -552,7 +563,7 @@ IOReturn NativeAdrenoRing::submitUnfenced(const uint32_t *words,size_t word_coun
 IOReturn NativeAdrenoRing::idle(const NativeAdrenoRingClock *clock,uint32_t timeout_us)
 {
     enum : uint32_t {RbbmStatus=0x0210,GpuBusyIgnAhb=1u<<23};
-    if(!attached_ || poisoned_)return kIOReturnNotReady;
+    if(!attached_ || poisoned_ || !current_)return kIOReturnNotReady;
     if(!clock || !clock->now_us)return kIOReturnBadArgument;
     const uint64_t start=clock->now_us(clock->cookie);
     for(;;) {
@@ -584,19 +595,29 @@ IOReturn NativeAdrenoRing::busHalt(bool gx_off,unsigned spins)
 {
     enum : uint32_t {RbbmGbifHalt=0x0016,RbbmGbifHaltAck=0x0017,GbifHalt=0x3c45,GbifHaltAck=0x3c46,ClientHalt=1u,ArbHalt=2u};
     if(!attached_)return kIOReturnNotReady;
-    uint32_t ack=0;unsigned i=0;
-    if(gx_off) {
-        if(io_.write32(io_.cookie,RbbmGbifHalt,1))return kIOReturnIOError;
-        for(i=0;i<spins;++i) {if(io_.read32(io_.cookie,RbbmGbifHaltAck,&ack))return kIOReturnIOError;if(ack&1)break;}
-        if(i==spins)return kIOReturnTimeout;
+    if(!spins)return kIOReturnBadArgument;
+    const auto request=[&](uint32_t reg,uint32_t ack_reg,uint32_t mask)->IOReturn {
+        if(io_.write32(io_.cookie,reg,mask))return kIOReturnIOError;
+        for(unsigned i=0;i<spins;++i) {
+            uint32_t ack=0;
+            if(io_.read32(io_.cookie,ack_reg,&ack))return kIOReturnIOError;
+            if(ack&mask)return kIOReturnSuccess;
+        }
+        return kIOReturnTimeout;
+    };
+    IOReturn status=gx_off?request(RbbmGbifHalt,RbbmGbifHaltAck,1):kIOReturnSuccess;
+    const bool gbif_requested=!status;
+    if(gbif_requested) {
+        status=request(GbifHalt,GbifHaltAck,ClientHalt);
+        if(!status)status=request(GbifHalt,GbifHaltAck,ArbHalt);
+        // A confirmed GX halt remains in place until the reset and board hw_init.
+        if(!status && !io_.write32(io_.cookie,GbifHalt,0))return kIOReturnSuccess;
+        if(!status)status=kIOReturnIOError;
     }
-    if(io_.write32(io_.cookie,GbifHalt,ClientHalt))return kIOReturnIOError;
-    for(i=0;i<spins;++i) {if(io_.read32(io_.cookie,GbifHaltAck,&ack))return kIOReturnIOError;if((ack&ClientHalt)==ClientHalt)break;}
-    if(i==spins)return kIOReturnTimeout;
-    if(io_.write32(io_.cookie,GbifHalt,ArbHalt))return kIOReturnIOError;
-    for(i=0;i<spins;++i) {if(io_.read32(io_.cookie,GbifHaltAck,&ack))return kIOReturnIOError;if((ack&ArbHalt)==ArbHalt)break;}
-    if(i==spins)return kIOReturnTimeout;
-    return io_.write32(io_.cookie,GbifHalt,0)?kIOReturnIOError:kIOReturnSuccess;
+    // A failed MMIO write can have reached hardware. Clear every halt this call attempted.
+    const bool gbif_uncertain=gbif_requested && io_.write32(io_.cookie,GbifHalt,0);
+    const bool gx_uncertain=gx_off && io_.write32(io_.cookie,RbbmGbifHalt,0);
+    return (gbif_uncertain || gx_uncertain)?poison():status;
 }
 IOReturn NativeAdrenoRing::detach()
 {

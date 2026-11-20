@@ -193,6 +193,7 @@ private:
     /* noteStall's CP snapshot (native_adreno_stall, _stall_mem, _stall_ring), taken before the first stage acts. */
     void snapshot(uint32_t next,uint32_t waited,uint64_t now,uint64_t pending,NativeAdrenoRing *stalled);
     uint32_t stall_begin_cp_[6]{};   /* the CP's progress at the stalled fence's first timed-out wait */
+    bool stall_begin_cp_valid_=false;
     uint64_t ring_retired_us_[2]{};uint32_t ring_retired_fence_[2]{};   /* the newest retirement seen on each ring */
     bool attached_=false,poisoned_=false;
     uint32_t audit_tick_=0;   /* submissions since attach; every eighth one audits its IB lines */

@@ -39,7 +39,7 @@ static void put64(uint8_t *at,uint64_t value)
 {
     put32(at,(uint32_t)value);put32(at+4,(uint32_t)(value>>32));
 }
-static uint32_t get32(const uint8_t *at)
+static uint32_t get32(const volatile uint8_t *at)
 {
     return uint32_t(at[0])|uint32_t(at[1])<<8|uint32_t(at[2])<<16|uint32_t(at[3])<<24;
 }
@@ -68,7 +68,7 @@ bool NativeAdrenoPreempt::setRecordWptr(uint8_t *record,uint32_t wptr)
 }
 uint32_t NativeAdrenoPreempt::recordWord(const uint8_t *record,uint32_t byte_offset)
 {
-    return record&&byte_offset<64?get32(record+byte_offset):0;
+    return record && byte_offset<=64-sizeof(uint32_t)?get32(record+byte_offset):0;
 }
 uint32_t NativeAdrenoPreempt::recordWptr(const uint8_t *record)
 {
@@ -253,9 +253,14 @@ bool NativeAdrenoPreempt::trigger(uint32_t ring,bool uses_gmem,
     void (*capture_tail)(void *,NativeAdrenoPublishedTail *),void *tail_cookie)
 {
     if(!attached_ || armed_ || ring>=NativeAdrenoPreemptRingCount || ring==loaded_)return false;
-    /* Hold the GPU awake before programming any restore register. */
-    if(io_.gmu_write32 && io_.gmu_write32(io_.gmu_cookie,GmuPreemptKeepalive,1))return false;
-    keepalive_=true;
+    // A failed rollback can leave a vote on the GMU. Retry clearing it
+    // before programming another switch, and remember an uncertain set.
+    if(!releaseKeepalive())return false;
+    keepalive_=io_.gmu_write32!=nullptr;
+    if(keepalive_ && io_.gmu_write32(io_.gmu_cookie,GmuPreemptKeepalive,1)) {
+        releaseKeepalive();
+        return false;
+    }
     if(io_.barrier(io_.cookie)) {releaseKeepalive();return false;}
     const uint64_t info=rings_.smmu_info[ring],record=rings_.record[ring];
     event_=openEvent(ring);

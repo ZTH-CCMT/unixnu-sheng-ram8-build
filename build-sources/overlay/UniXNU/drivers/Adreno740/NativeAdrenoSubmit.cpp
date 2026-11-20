@@ -890,7 +890,8 @@ IOReturn NativeAdrenoSubmit::noteStall(uint32_t observed,const NativeAdrenoRingC
         }
         stall_fence=next;stall_timeouts=0;stall_stage=StallInitial;
         /* Where the CP was at the fence's first timed-out wait, to tell at the first stage whether it moved since. */
-        if(stalled->progressState(stall_begin_cp_))for(unsigned i=0;i<6;++i)stall_begin_cp_[i]=~0u;
+        stall_begin_cp_valid_=stalled->progressState(stall_begin_cp_)==kIOReturnSuccess;
+        if(!stall_begin_cp_valid_)for(unsigned i=0;i<6;++i)stall_begin_cp_[i]=UINT32_MAX;
     }
     stall_last_us=now;
     const uint64_t pending=now-stall_began_us;
@@ -900,13 +901,18 @@ IOReturn NativeAdrenoSubmit::noteStall(uint32_t observed,const NativeAdrenoRingC
      * before the stage too, so its registers are the stall's and not the stage's result. */
     if(kick_due) {
         uint32_t at[6]={},later[6]={};
-        if(stalled->progressState(at))for(unsigned k=0;k<6;++k)at[k]=~0u;
+        const bool at_valid=stalled->progressState(at)==kIOReturnSuccess;
+        if(!at_valid)for(unsigned k=0;k<6;++k)at[k]=UINT32_MAX;
         IODelay(500);
-        if(stalled->progressState(later))for(unsigned k=0;k<6;++k)later[k]=~0u;
-        uint32_t moved=0;
+        const bool later_valid=stalled->progressState(later)==kIOReturnSuccess;
+        if(!later_valid)for(unsigned k=0;k<6;++k)later[k]=UINT32_MAX;
+        const bool first_interval=stall_begin_cp_valid_ && at_valid;
+        const bool later_interval=at_valid && later_valid;
+        // Low bits report movement. The corresponding bits at 8 and 9 mark comparisons that could not be made.
+        uint32_t moved=(first_interval?0u:1u<<8) | (later_interval?0u:1u<<9);
         for(unsigned k=0;k<6;++k) {
-            if(at[k]!=stall_begin_cp_[k])moved|=1;
-            if(later[k]!=at[k])moved|=2;
+            if(first_interval && at[k]!=stall_begin_cp_[k])moved|=1;
+            if(later_interval && later[k]!=at[k])moved|=2;
             native_adreno_stall_kick[2+k]=stall_begin_cp_[k];native_adreno_stall_kick[8+k]=at[k];native_adreno_stall_kick[14+k]=later[k];
         }
         const Job *const owner=find(next);

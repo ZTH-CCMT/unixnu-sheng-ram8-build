@@ -13,11 +13,36 @@
     } \
 } while (0)
 
-struct Peer {uint32_t cntl=0;uint64_t now=0;bool fail=false;uint32_t failed_read=UINT32_MAX;unsigned sqe_calls=0;std::vector<uint32_t> order;};
-static int write(void *v,uint32_t r,uint32_t n) {auto &p=*(Peer*)v;p.order.push_back(r);if(p.fail)return 1;if(r==0x08a0)p.cntl=n;return 0;}
-static int read(void *v,uint32_t r,uint32_t *n) {auto &p=*(Peer*)v;*n=r==0x08a0?p.cntl:0;return r==p.failed_read?17:0;}
+struct Peer {
+ uint32_t cntl=0, registers[0x9000]={};
+ uint64_t now=0;
+ bool fail=false, failClear=false;
+ uint32_t failed_read=UINT32_MAX;
+ unsigned sqe_calls=0;
+ std::vector<uint32_t> order;
+};
+static int write(void *v,uint32_t r,uint32_t n) {
+ auto &p=*(Peer*)v;
+ p.order.push_back(r);
+ if(p.fail)return 1;
+ CHECK(r<sizeof p.registers/sizeof p.registers[0]);
+ p.registers[r]=n;
+ if(r==0x08a0)p.cntl=n;
+ return 0;
+}
+static int read(void *v,uint32_t r,uint32_t *n) {
+ auto &p=*(Peer*)v;
+ CHECK(r<sizeof p.registers/sizeof p.registers[0]);
+ *n=r==0x08a0?p.cntl:p.registers[r];
+ return r==p.failed_read?17:0;
+}
 static int barrier(void *) {return 0;}
-static int gmu(void *v,uint32_t,uint32_t n) {((Peer*)v)->order.push_back(n?0xaabb:0xccdd);return 0;}
+static int gmu(void *v,uint32_t r,uint32_t n) {
+ auto &p=*(Peer*)v;
+ CHECK(r==0x1f8c4);
+ p.order.push_back(n?0xaabb:0xccdd);
+ return !n && p.failClear;
+}
 static uint64_t now(void *v) {return ((Peer*)v)->now;}
 static int sqe(void *v,NativeAdrenoSqeSnapshot *out)
 {
@@ -43,13 +68,19 @@ static void testEvidence()
      *out=*c.tail;
  },&tail_peer));
  r0[8]=0x34;p.failed_read=0x08a2;p.now+=1000001;
+ p.registers[0x08ab]=0xfeed;
+ p.registers[0x0806]=0x105;
+ p.registers[0x0807]=0x207;
  CHECK(a.captureTimeoutEvidence(2,&out) && p.sqe_calls==1);
  CHECK(out.version==1 && out.word_count==NativeAdrenoSwitchEvidenceWords && out.reason==2);
  CHECK(out.sequence==native_adreno_switch_count && out.trigger_us[0]==55 && out.from_ring==0 && out.to_ring==1);
  CHECK(out.before.record[0][2]==0x12 && out.after.record[0][2]==0x34);
  CHECK(out.before.valid_mask==15 && out.after.valid_mask==15);
  CHECK(out.register_status[2]==17 && out.registers[2]==UINT32_MAX && !(out.register_valid_mask&4));
- CHECK(out.registers[1]==0 && (out.register_valid_mask&2));
+ CHECK(out.registers[1]==0x40000 && (out.register_valid_mask&2));
+ CHECK(out.registers[3]==0x20000 && out.registers[4]==0 && out.registers[5]==0xfeed);
+ CHECK(out.registers[6]==0x105 && out.registers[7]==0x207);
+ CHECK(out.register_valid_mask==(0x1ffu&~4u));
  CHECK(out.sqe_status==19 && out.sqe.words[0][0]==0 && (out.sqe.valid_mask[0][0]&1));
  CHECK(out.sqe.words[0][1]==UINT32_MAX && !(out.sqe.valid_mask[0][0]&2));
  CHECK(out.sqe.words[1][0]==UINT32_MAX && !out.sqe.valid_mask[1][0]);
@@ -100,6 +131,16 @@ int main() {
      CHECK(a.complete() && a.releaseKeepalive());
  }
  CHECK(!a.noteTimeout(nullptr,frozen) && !std::memcmp(frozen,untouched,sizeof(frozen)));
- p.fail=true;CHECK(!a.trigger(0,true) && p.order.back()==0xccdd && a.stats().faulted==2);
+ p.fail=true;p.failClear=true;
+ CHECK(!a.trigger(0,true) && p.order.back()==0xccdd && a.stats().faulted==2);
+ p.fail=false;p.order.clear();
+ CHECK(!a.trigger(0,true) && p.order==std::vector<uint32_t>{0xccdd});
+ p.failClear=false;p.order.clear();
+ CHECK(a.trigger(0,true) && p.order[0]==0xccdd && p.order[1]==0xaabb);
+ p.cntl&=~1u;
+ CHECK(a.complete() && a.releaseKeepalive());
+ r0[60]=0x67;r0[61]=0x45;r0[62]=0x23;r0[63]=1;
+ CHECK(NativeAdrenoPreempt::recordWord(r0,60)==0x01234567);
+ CHECK(!NativeAdrenoPreempt::recordWord(r0,61) && !NativeAdrenoPreempt::recordWord(r0,63));
  CHECK(!a.detach());std::puts("PASS preemption ordering, timeout snapshot, stale/repeated capture refusal, late completion, restart, circular wrap and refused trigger");
 }

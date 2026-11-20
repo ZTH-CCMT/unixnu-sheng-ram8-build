@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstring>
 #include <vector>
+extern "C" volatile uint32_t native_adreno_wptr_fence[4];
 #define CHECK(x) do {if(!(x)){std::fprintf(stderr,"line %d: %s\n",__LINE__,#x);std::exit(1);}}while(0)
 struct Peer {
     std::vector<uint32_t> regs;
@@ -12,6 +13,7 @@ struct Peer {
     unsigned read_calls=0,publish=0,acquire=0,barriers=0;
     unsigned fail_write=0,fail_read=0,fail_barrier=0,fail_publish=0,fail_acquire=0;
     unsigned client_ack_after=0,arb_ack_after=0,halt_polls=0;
+    uint32_t fail_clear_reg=UINT32_MAX;
     bool log_order=false;std::vector<const char *> order;
     Peer():regs(0x10000,0){}
 };
@@ -20,7 +22,7 @@ static uint64_t clock_us=0;
 static int write32(void *cookie,uint32_t reg,uint32_t value)
 {
     CHECK(cookie==&peer && reg<peer.regs.size());
-    if(peer.writes.size()+1==peer.fail_write)return 1;
+    if(peer.writes.size()+1==peer.fail_write || (!value && reg==peer.fail_clear_reg))return 1;
     peer.regs[reg]=value;peer.writes.emplace_back(reg,value);
     if(reg==0x3c45)peer.halt_polls=0;
     if(peer.log_order)peer.order.push_back("write");
@@ -29,7 +31,7 @@ static int write32(void *cookie,uint32_t reg,uint32_t value)
 static int read32(void *cookie,uint32_t reg,uint32_t *value)
 {
     CHECK(cookie==&peer && value && reg<peer.regs.size());++peer.read_calls;
-    if(peer.read_calls==peer.fail_read)return 1;
+    if(peer.read_calls==peer.fail_read){*value=0;return 1;}
     if(reg==0x3c46 && peer.regs[0x3c45]) {
         const unsigned polls=++peer.halt_polls;
         const uint32_t request=peer.regs[0x3c45];
@@ -158,6 +160,43 @@ static void testDrainBus()
     }
     std::puts("PASS GBIF drain requires both acknowledgements, honours polling boundaries and clears temporary halt");
 }
+static void testResetBusHalt()
+{
+    constexpr uint32_t gx_halt=0x0016,gbif_halt=0x3c45;
+    struct HaltCase {
+        bool gx,gx_ack;
+        unsigned client_ack,arb_ack,read_error_offset;
+        uint32_t fail_clear_reg;
+        IOReturn result;
+        uint32_t gx_remaining,gbif_remaining;
+    };
+    const HaltCase cases[]={
+        {true,true,2,2,0,UINT32_MAX,kIOReturnSuccess,1,0},
+        {false,false,2,2,0,UINT32_MAX,kIOReturnSuccess,0,0},
+        {true,false,1,1,0,UINT32_MAX,kIOReturnTimeout,0,0},
+        {true,true,0,1,0,UINT32_MAX,kIOReturnTimeout,0,0},
+        {true,true,1,0,0,UINT32_MAX,kIOReturnTimeout,0,0},
+        {false,false,1,0,0,UINT32_MAX,kIOReturnTimeout,0,0},
+        {true,true,1,1,1,UINT32_MAX,kIOReturnIOError,0,0},
+        {true,true,1,1,2,UINT32_MAX,kIOReturnIOError,0,0},
+        {true,true,1,1,3,UINT32_MAX,kIOReturnIOError,0,0},
+        {true,true,1,0,0,gbif_halt,kIOReturnIOError,0,2},
+        {true,true,1,1,1,gx_halt,kIOReturnIOError,1,0}
+    };
+    for(const auto &test:cases) {
+        reset();NativeAdrenoRing r;CHECK(attach(r)==kIOReturnSuccess);
+        const size_t writes=peer.writes.size();
+        CHECK(r.busHalt(test.gx,0)==kIOReturnBadArgument && peer.writes.size()==writes);
+        peer.regs[0x0017]=test.gx_ack;
+        peer.client_ack_after=test.client_ack;peer.arb_ack_after=test.arb_ack;
+        if(test.read_error_offset)peer.fail_read=peer.read_calls+test.read_error_offset;
+        peer.fail_clear_reg=test.fail_clear_reg;
+        CHECK(r.busHalt(test.gx,2)==test.result);
+        CHECK(peer.regs[gx_halt]==test.gx_remaining && peer.regs[gbif_halt]==test.gbif_remaining);
+        CHECK(r.poisoned()==(test.fail_clear_reg!=UINT32_MAX));
+    }
+    std::puts("PASS reset halt uses bounded acknowledgements and releases attempted halts on failure");
+}
 static void testRingBoundaries()
 {
     const uint32_t word=0xabc;
@@ -180,6 +219,15 @@ static void testRingBoundaries()
         CHECK(second.attachSecondary(&io,&cache,ring,sizeof(ring),0x100000,fence,sizeof(fence),0x108000)==kIOReturnSuccess);
         CHECK(second.submit(&word,1,&end)==kIOReturnSuccess && end==1);
         CHECK(peer.writes.empty() && second.restorePending());
+        CHECK(second.submitUnfenced(&word,1)==kIOReturnNotReady);
+        CHECK(second.restoreWptr()==kIOReturnNotReady);
+        CHECK(second.idle(&clock_,0)==kIOReturnNotReady);
+        CHECK(peer.writes.empty() && second.restorePending());
+        second.setCurrent(true);
+        CHECK(second.restoreWptr()==kIOReturnSuccess && !second.restorePending());
+        CHECK(peer.writes.size()==1 && peer.regs[0x0807]==second.writePointer());
+        CHECK(second.restart(1)==kIOReturnNotReady);
+        CHECK(second.restartSecondary(1)==kIOReturnSuccess && !second.current());
     }
     {
         reset();NativeAdrenoRing ringObject;
@@ -196,18 +244,38 @@ static void testRingBoundaries()
         fail_fence_read=mode==0;fail_fence_clear=mode==1;dropped=1;
         CHECK(ringObject.submit(&word,1,&end)==kIOReturnIOError && !end && ringObject.poisoned());
     }
-    std::puts("PASS short timeline mapping, fence IDs, inactive plain submit and WPTR status errors");
+    {
+        reset();NativeAdrenoRing r;
+        uint32_t rptr=0,wptr=0;
+        CHECK(r.readHardwarePointers(rptr,wptr)==0 && rptr==UINT32_MAX && wptr==UINT32_MAX);
+        peer.regs[0x0806]=1;
+        CHECK(attach(r)==kIOReturnIOError && r.poisoned() && peer.writes.empty());
+    }
+    for(unsigned mode=0;mode<2;++mode) {
+        reset();NativeAdrenoRing r;
+        peer.fail_publish=1;
+        const IOReturn status=mode
+            ?r.attachSecondary(&io,&cache,ring,sizeof(ring),0x100000,fence,sizeof(fence),0x108000)
+            :attach(r);
+        CHECK(status==kIOReturnIOError && r.poisoned() && peer.writes.empty());
+    }
+    std::puts("PASS short timeline mapping, fence IDs, inactive ring guards and fence page publication");
 }
 
 int main()
 {
     testDrainBus();
+    testResetBusHalt();
     testPublishedTail();
     testRingBoundaries();
     /* Exact register programming and one complete submission. */
     {
         reset();NativeAdrenoRing r;
+        peer.log_order=true;
         CHECK(attach(r)==kIOReturnSuccess);
+        CHECK(peer.order.size()>=3 && !std::strcmp(peer.order[0],"publish") &&
+            !std::strcmp(peer.order[1],"barrier") && !std::strcmp(peer.order[2],"write"));
+        peer.order.clear();
         const uint32_t expected[][2]={
             {0x0800,0x100000},{0x0801,0},{0x0802,(12u)|(2u<<8)},
             {0x0804,0x108000},{0x0805,0},{0x0807,0},{0x0885,0}};
@@ -236,7 +304,7 @@ int main()
         CHECK(op(ring[37])==0x46 && ring[38]==(0x31u|(1u<<27)|(1u<<31)));
         CHECK(ring[39]==0x108004 && ring[40]==0 && ring[41]==1);   /* msm_rbmemptrs.fence, where wait() reads */
         CHECK(op(ring[42])==0x17 && ring[43]==3 && op(ring[44])==0x65 && ring[45]==0x100);
-        CHECK(peer.publish==1);
+        CHECK(peer.publish==2);
         /* Cache publication precedes the barrier, which precedes WPTR. */
         CHECK(peer.order.size()==3 && !std::strcmp(peer.order[0],"publish") &&
             !std::strcmp(peer.order[1],"barrier") && !std::strcmp(peer.order[2],"write"));
@@ -319,6 +387,27 @@ int main()
         CHECK(after-before==4 && fence_clears==3 && fence_reads==4);   /* the first write and three repeats */
         dropped=0;CHECK(r.kick()==kIOReturnSuccess);
     }
+    {
+        reset();NativeAdrenoRing r;
+        NativeAdrenoRingIo fenced=io;fenced.fence_cookie=&peer;fenced.fence_status=fence_status;
+        CHECK(r.attach(&fenced,&cache,ring,sizeof(ring),0x100000,fence,sizeof(fence),0x108000)==kIOReturnSuccess);
+        const uint32_t exhausted=native_adreno_wptr_fence[3];
+        const size_t first_write=peer.writes.size();
+        dropped=201; // Initial write plus the entire 200-retry budget.
+        const uint32_t word=0xabc;
+        uint32_t issued=0;
+        CHECK(r.submit(&word,1,&issued)==kIOReturnSuccess && issued==1 && !r.poisoned());
+        CHECK(native_adreno_wptr_fence[3]==exhausted+1 && !dropped && !flagged);
+        CHECK(fence_reads==201 && fence_clears==201 && peer.writes.size()==first_write+201);
+        for(size_t i=first_write;i<peer.writes.size();++i)
+            CHECK(peer.writes[i].first==0x0807 && peer.writes[i].second==r.writePointer());
+        // Exhaustion does not retire the job. A later kick can publish the pointer again.
+        CHECK(r.wait(issued,&clock_,0,nullptr)==NativeAdrenoRingFenceTimeout && r.outstanding()==1);
+        CHECK(r.kick()==kIOReturnSuccess && peer.writes.size()==first_write+202 && fence_reads==202);
+        fence[1]=issued;
+        CHECK(r.wait(issued,&clock_,0,nullptr)==NativeAdrenoRingFenceComplete && !r.outstanding());
+        std::puts("PASS WPTR retry exhaustion, later kick and observed fence completion");
+    }
     /* Wrap-around emission keeps packets contiguous modulo the ring. */
     {
         reset();NativeAdrenoRing r;CHECK(attach(r)==kIOReturnSuccess);
@@ -389,8 +478,8 @@ int main()
         /* Publication, barrier and WPTR failures poison after partial commit. */
         for(unsigned kind=0;kind<3;++kind) {
             reset();NativeAdrenoRing r;CHECK(attach(r)==kIOReturnSuccess);
-            if(kind==0)peer.fail_publish=1;
-            if(kind==1)peer.fail_barrier=1;
+            if(kind==0)peer.fail_publish=peer.publish+1;
+            if(kind==1)peer.fail_barrier=peer.barriers+1;
             if(kind==2)peer.fail_write=peer.writes.size()+1;
             const uint32_t one=0x1234;uint32_t end=0;
             CHECK(r.submit(&one,1,&end)==kIOReturnIOError && !end && r.poisoned());
@@ -431,7 +520,7 @@ int main()
         r.setCurrent(false);peer.regs[0x0806]=8191;fence[0]=r.writePointer();
         const unsigned reads=peer.read_calls;
         CHECK(r.submitFramed(&nop,1,&end)==kIOReturnSuccess && peer.read_calls==reads);
-        CHECK(r.restart(2)==kIOReturnSuccess && (fence[16]>>16&127)==0x21);
+        CHECK(r.restart(2)==kIOReturnSuccess && r.current() && !r.restorePending() && (fence[16]>>16&127)==0x21);
         std::puts("PASS preemption postamble, executed table snapshot, inactive-ring read pointer and restart");
     }
 

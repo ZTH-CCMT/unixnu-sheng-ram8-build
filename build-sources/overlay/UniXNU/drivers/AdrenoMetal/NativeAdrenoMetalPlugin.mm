@@ -39,6 +39,12 @@
 #include "PrimeShaders.h"
 #include "ExceptionDiag.h"
 
+extern "C" {
+volatile uint32_t native_prime_compiling, native_prime_libraries_done, native_prime_libraries_total,
+    native_prime_made, native_prime_rate, native_prime_functions_resumed;
+volatile uint32_t native_prime_libraries_primed, native_prime_libraries_skipped, native_prime_scope;
+}
+
 #if TARGET_OS_OSX
 #include "IOGPUMetalDeviceShim.h"
 // macOS: +[IOGPUMetalDevice registerAcceleratorService:] takes the bundle's MetalPluginClassName only if it subclasses IOGPUMetalDevice.

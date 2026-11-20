@@ -31,7 +31,7 @@ struct NativeAdrenoRingIo {
 };
 struct NativeAdrenoRingCache {
     void *cookie;
-    /* Clean owned ring bytes to PoC before the device reads them. */
+    /* Publish CPU-initialized ring or fence bytes before device access. */
     int (*publish)(void *,const volatile uint32_t *words,size_t bytes);
     /* Invalidate the fence page before the CPU reads CP-written values. */
     int (*acquire)(void *,volatile uint32_t *words,size_t bytes);
@@ -92,10 +92,14 @@ public:
     ~NativeAdrenoRing()=default;
     NativeAdrenoRing(const NativeAdrenoRing &)=delete;
     NativeAdrenoRing &operator=(const NativeAdrenoRing &)=delete;
-    /* ring_bytes is a power of two in [8KiB,1MiB]; ring_iova must be aligned
-     * to ring_bytes. fence_bytes >=64 and fence_iova 8-aligned. The fence page
-     * layout is: +0 CP read-pointer shadow, +4 completed timestamp, +8 spare.
-     * All outputs are prevalidated before any register write. */
+    /* ring_bytes is a power of two in [8 KiB, 1 MiB]; ring_iova must be aligned to ring_bytes.
+     * fence_bytes is at least 64 and less than 16 MiB; fence_iova is 8-byte aligned.
+     * Fence byte offsets: +0 BR read-pointer shadow, +4 BR completion timestamp,
+     * +8 BV read-pointer shadow, +12 BV completion timestamp.
+     * Preemption also uses +64 for the 11-word CP postamble and +128 for the
+     * last executed TTBR0 (low, high, and a reserved word).
+     * Optional timeline slots start at +512 (64 slots of two 64-bit counter values).
+     * Each optional feature checks the mapping size before use. */
     IOReturn attach(const NativeAdrenoRingIo *,const NativeAdrenoRingCache *,
         void *ring,size_t ring_bytes,uint64_t ring_iova,
         void *fence,size_t fence_bytes,uint64_t fence_iova);
@@ -126,7 +130,7 @@ public:
     uint32_t readHardwarePointers(uint32_t &rptr,uint32_t &wptr) const;
     void setCurrent(bool current) {current_=current;}
     bool current() const {return current_;}
-    /* Gives the waiting write pointer again; after a switch into this ring, and after a restart. */
+    /* Publishes the pending write pointer after switching into this ring. */
     IOReturn restoreWptr();
     /* Fills this ring's preemption record (msm's a6xx_preempt_record): its base, its read-pointer shadow, its BV shadow, its CP_RB_CNTL
      * and the write pointer the CP resumes at. */
@@ -170,7 +174,7 @@ public:
     /* After a GPU reset (the board's restart, NativeAdrenoSubmit::recover): programs the ring registers again as attach() does, empties
      * the ring and sets the memptrs fences to `completed`, as msm's recover_worker advances memptrs->fence past the hung submission. The
      * next submission gets fence completed + 1 and starts with a context entry; no table switch is pending (the caller installs one).
-     * Clears poison. The CP must be halted or reset. */
+     * Clears poison and makes this primary ring current. The CP must be halted or reset at RPTR zero. */
     IOReturn restart(uint32_t completed);
     /* The same for a secondary ring, after the GPU restart programmed the first one: no register is written, the ring is emptied and
      * its numbering continues at `completed`; its write pointer waits for the switch that brings the CP back. */
@@ -178,7 +182,7 @@ public:
     /* The fence value the CP last wrote, read even when the ring is poisoned (the recovery's starting point). */
     IOReturn fenceValue(uint32_t *value);
     /* Words without a timestamp fence, for the restart's CP init and secure-mode packets (a7xx_cp_init and a6xx_hw_init send theirs
-     * outside any submission and wait with a6xx_idle); no fence number is used, so the replayed submissions keep theirs. */
+     * outside any submission and wait with a6xx_idle); the ring must be current. No fence number is used. */
     IOReturn submitUnfenced(const uint32_t *words,size_t word_count);
     /* a6xx_idle: the CP read every ring word (RPTR == WPTR), then RBBM_STATUS GPU_BUSY_IGN_AHB clear. */
     IOReturn idle(const NativeAdrenoRingClock *,uint32_t timeout_us);
@@ -186,7 +190,8 @@ public:
      * what the ROQ fetched but the SQE has not consumed (CP_ROQ_AVAIL_IB1/IB2 bits 31:16). */
     IOReturn progressState(uint32_t out[6]);
     /* a6xx_bus_clear_pending_transactions(gx_off): with gx_off the GX side of GBIF first (RBBM_GBIF_HALT), then new client requests and
-     * all AXI requests, each until acknowledged (spin_until: bounded here by `spins` reads), then the halt cleared. */
+     * all AXI requests. On success, GBIF is released and the board reset releases the optional GX halt. On failure this
+     * clears each attempted halt. If a release write fails, the ring is poisoned. */
     IOReturn busHalt(bool gx_off,unsigned spins);
     uint64_t table() const {return table_;}
     bool tablePending() const {return table_pending_;}
@@ -202,7 +207,7 @@ public:
     /* Reads the CP's state for a fence that stopped advancing into out[NativeAdrenoRingStallWords]: RBBM_STATUS..STATUS3,
      * RBBM_INT_0_STATUS, CP_HW_FAULT, CP_STATUS_1, CP_PROTECT_STATUS, CP_RB_RPTR, CP_RB_WPTR, CP_IB1_BASE (lo, hi),
      * CP_IB1_REM_SIZE, CP_IB2_BASE (lo, hi), CP_IB2_REM_SIZE, CP_BV_RB_RPTR, CP_BV_IB1_BASE lo, CP_BV_IB1_REM_SIZE,
-     * CP_BV_IB2_REM_SIZE. Never writes a register; a failed read is poison. */
+     * CP_BV_IB2_REM_SIZE and CP_BV_IB2_BASE (lo, hi). No register writes. A read error invalidates the snapshot. */
     IOReturn stallState(uint32_t *out);
     /* Caller owns the submission lock and knows this is the loaded ring.
      * Read actual hardware publication boundary, never publish next_. A failed
