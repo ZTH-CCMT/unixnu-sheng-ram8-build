@@ -7,6 +7,7 @@
 #pragma once
 #import <Metal/Metal.h>
 #include <mach/mach_time.h>
+#include <memory>
 #include <stdint.h>
 #include <unistd.h>
 #include "GpuScanoutPresenter.h"
@@ -43,34 +44,43 @@ class Client {
 public:
     // Reads the mode and maps the scanout; false with stats.step telling where it stopped.
     bool open(id<MTLDevice> device, const Transport &transport, Stats *stats) {
+        presenter_.reset();
+        scanout_ = {};
         transport_ = transport;
         stats_ = stats;
+        if (!stats_) return false;
+        if (!device || !transport_.call || !transport_.mapScanout) return fail(2, 0);
         NGPMode mode = {};
         note(0x6710);
         int status = transport_.call(transport_.context, NGP_METHOD_MODE, nullptr, 0, &mode, sizeof mode);
         note(0x6711);
         if (status || mode.version != NGP_VERSION || mode.format != NGP_BGRX8888 || !mode.width || !mode.height ||
-            mode.stride < mode.width * 4 || mode.bytes < mode.stride * mode.height) return fail(2, status);
+            mode.width > UINT32_MAX || mode.height > UINT32_MAX || mode.stride > SIZE_MAX ||
+            mode.stride < mode.width * 4 || mode.height > mode.bytes / mode.stride) return fail(2, status);
         const size_t page = (size_t)getpagesize();
         uint64_t address = 0, length = 0;
         note(0x6712);
         status = transport_.mapScanout(transport_.context, &address, &length);
         note(0x6713);
-        if (status || !address || length < mode.bytes) return fail(3, status);
-        // The mapping covers whole pages; the framebuffer allocation ends on a page boundary, the copy never writes past the last row.
-        gpupresent::Scanout scanout = {(void *)(uintptr_t)address, (size_t)((mode.bytes + page - 1) & ~(page - 1)), (size_t)mode.stride,
+        if (status || !page || !address || address > UINTPTR_MAX || (address & (page - 1)) ||
+            mode.bytes > SIZE_MAX - (page - 1)) return fail(3, status);
+        const size_t bytes = (size_t)((mode.bytes + page - 1) & ~(page - 1));
+        if (bytes > length || bytes > UINTPTR_MAX - address) return fail(3, status);
+        gpupresent::Scanout scanout = {(void *)(uintptr_t)address, bytes, (size_t)mode.stride,
                                        (uint32_t)mode.width, (uint32_t)mode.height};
         note(0x6714);
-        scanout_ = scanout;
-        presenter_ = new gpupresent::Presenter(device, scanout);
+        auto presenter = std::make_unique<gpupresent::Presenter>(device, scanout);
         note(0x6715);
-        if (!presenter_->ready()) return fail(3, 0);
+        if (!presenter->ready()) return fail(3, 0);
+        presenter_ = std::move(presenter);
+        scanout_ = scanout;
         stats_->step = 4;
         return true;
     }
     // One wait (at most timeoutMs) and, when the display driver offered a frame, one GPU copy and its completion. Returns false on a
     // protocol error that makes further serving pointless.
     bool serveOne(uint64_t timeoutMs) {
+        if (!presenter_) return false;
         NGPWait wait = {timeoutMs};
         NGPSwap swap = {};
         if (!stats_->timeouts && !stats_->frames) note(0x6720);   // first wait
@@ -82,18 +92,18 @@ public:
             return false;
         }
         const size_t page = (size_t)getpagesize();
-        {   // measurement: the second half of the run copies half the rows
-            static uint64_t first = 0;
-            const uint64_t nowS = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000000000ull;
-            if (!first) first = nowS;
-            (void)first; gpupresent::gHalfRows.store(false, std::memory_order_relaxed);
-        }
         note(0x6730);   // a frame was offered
         const uint64_t offeredUs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000;
         if (NBWaitInFlight) NBWaitInFlight(offeredUs);
         const uint64_t began = mach_absolute_time();
-        const gpupresent::Result r = presenter_->present({(const void *)(uintptr_t)swap.address, (size_t)((swap.bytes + page - 1) & ~(page - 1)),
-                                                          (size_t)swap.stride, swap.width, swap.height, swap.reserved, swap.format});
+        gpupresent::Result r = gpupresent::kBadFrame;
+        if (page && swap.address && swap.address <= UINTPTR_MAX && swap.bytes <= SIZE_MAX - (page - 1) &&
+            swap.stride <= SIZE_MAX) {
+            const size_t bytes = (size_t)((swap.bytes + page - 1) & ~(page - 1));
+            if(bytes <= UINTPTR_MAX - swap.address)
+                r = presenter_->present({(const void *)(uintptr_t)swap.address, bytes,
+                                         (size_t)swap.stride, swap.width, swap.height, swap.reserved, swap.format});
+        }
         {
             static mach_timebase_info_data_t base;
             if (!base.denom) mach_timebase_info(&base);
@@ -117,6 +127,12 @@ private:
     // surface the GPU copied. The lower part of the panel is skipped: the diagnostic renderer paints there. Evidence only; nothing is written.
     void verify(const NGPSwap &swap) {
         const uint32_t rows = swap.height < 400 ? swap.height : 400, words = swap.width;
+        const uint64_t rowBytes = uint64_t(words) * sizeof(uint32_t);
+        if (!rows || !words || !swap.address || !scanout_.base ||
+            swap.width != scanout_.width || swap.height != scanout_.height ||
+            ((swap.address | swap.stride | uintptr_t(scanout_.base) | scanout_.stride) & 3) ||
+            swap.stride < rowBytes || scanout_.stride < rowBytes ||
+            rows > swap.bytes / swap.stride || rows > scanout_.bytes / scanout_.stride) return;
         const volatile uint32_t *shown = (const volatile uint32_t *)scanout_.base;
         const volatile uint32_t *surface = (const volatile uint32_t *)(uintptr_t)swap.address;
         for (uint32_t y = 0; y < rows; ++y) {
@@ -129,7 +145,7 @@ private:
     void note(uint32_t value) {if (transport_.mark) transport_.mark(transport_.context, value);}
     bool fail(int step, int error) {stats_->step = step; stats_->error = error; return false;}
     Transport transport_ = {};
-    gpupresent::Presenter *presenter_ = nullptr;
+    std::unique_ptr<gpupresent::Presenter> presenter_;
     gpupresent::Scanout scanout_ = {};
     Stats *stats_ = nullptr;
 };

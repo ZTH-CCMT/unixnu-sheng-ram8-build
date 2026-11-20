@@ -225,11 +225,9 @@ static CommitRecord gCommitRing[32];
 // uptime clock), t1 the command buffer's id (its shared state's address; 0 the scheduler thread), a stage, b arg, c sequence}. Times are nowUs().
 struct TraceRec {uint32_t type,idx;uint64_t t0,t1,t2,t3;uint32_t a,b,c,d,tid,cpu0,cpu1,tid2;};
 static_assert(sizeof(TraceRec)==72,"trace record");
-static TraceRec gTrace[16384];
 static NBMetalTraceQueue<TraceRec,16384> gChainTrace;
 static std::atomic<bool> gChainSealed{false};
 static void traceStartWriter();
-static std::atomic<uint32_t> gTraceHead{0};
 static std::atomic<bool> gTraceStarted{false};
 // What this process's queues asked for with setGPUPriority:/setBackgroundGPUPriority: and how many of those reached the driver.
 static std::atomic<uint32_t> gAskFg{0xffffffffu},gAskBg{0xffffffffu},gAskCount{0},gAskSent{0};
@@ -254,9 +252,7 @@ static void tracePush(const TraceRec &rec) {
  }
  if(rec.type==12 && (rec.a>=40 || !native_gpu_latency_stage(rec.a)))return;
  if(rec.type==9 || rec.type==10 || rec.type==11)return;
- const uint32_t at=gTraceHead.fetch_add(1);
- gTrace[at%16384]=rec;
- gTrace[at%16384].idx=rec.type==1?rec.idx:at;
+ if(!gChainSealed.load(std::memory_order_relaxed))gChainTrace.push(rec);
 }
 // The runtime's compact stage ring has a 16-bit argument. Keep memory sizes and
 // handle halves directly from its full-width diagnostic hook in the file.
@@ -423,7 +419,8 @@ static void traceStartWriter() {
   pthread_setname_np("frame-trace");
   int fd=-1;
   static const char *const paths[]={"/private/var/mobile/Library/Caches/com.apple.backboardd/m2v/frames.trace","/private/var/root/Library/Caches/com.apple.backboardd/m2v/frames.trace"};
-  uint32_t written=0;
+  uint64_t fileBytes=0;
+  TraceRec batch[256];
   struct PassRec {uint64_t ns;uint32_t seq;uint16_t width,height;uint8_t mode,colors,flags,swap;uint16_t draws,format;uint32_t kpx;uint64_t gpuBegin,gpuEnd;uint16_t fsInstrs,fsTex,fsSy,fsSs;int8_t fsWaves,fsRegs;uint8_t samples,ds;uint32_t bandwidth,verts,fsHash;};
   struct SubRec {uint64_t ns;uint32_t seq,fence,syncWaitUs,callUs,spaceWaitUs;uint16_t busy;uint8_t chunks,buffers;};
   static_assert(sizeof(PassRec)==72 && sizeof(SubRec)==32,"turnip ring records");
@@ -455,7 +452,7 @@ static void traceStartWriter() {
    if(passRead) {
     PassRec recs[64];uint32_t newest=0;
     for(;;) {
-     const uint32_t n=passRead(passFrom,recs,64,&newest);
+     const uint32_t n=std::min(passRead(passFrom,recs,64,&newest),64u);
      // A pass recorded in the last 300 ms may not have run yet: it is read, with its GPU times, at the next turn.
      const uint64_t ripe=nowUs()-300000;
      uint32_t taken=0;
@@ -485,7 +482,7 @@ static void traceStartWriter() {
    if(subRead) {
     SubRec recs[64];uint32_t newest=0;
     for(;;) {
-     const uint32_t n=subRead(subFrom,recs,64,&newest);
+     const uint32_t n=std::min(subRead(subFrom,recs,64,&newest),64u);
      for(uint32_t i=0;i<n;i++) {
       const SubRec &p=recs[i];
       if(metalChainOn() && subFrom && p.seq!=subFrom){TraceRec gap{};gap.type=49;gap.t0=nowUs();gap.a=8;gap.t1=subFrom;gap.t2=p.seq;tracePush(gap);}
@@ -503,7 +500,7 @@ static void traceStartWriter() {
     StageRec recs[256];
     for(;;) {
      uint64_t next=stageFrom;
-     const size_t n=nmb_stage_ring_read(stageFrom,recs,256,&next);
+     const size_t n=std::min<size_t>(nmb_stage_ring_read(stageFrom,recs,256,&next),256);
      for(size_t i=0;i<n;i++) {
       TraceRec rec={};rec.type=12;rec.t0=recs[i].ns/1000;rec.t1=recs[i].id;rec.a=recs[i].stage;rec.b=recs[i].arg;rec.c=recs[i].seq;
       tracePush(rec);
@@ -522,21 +519,23 @@ static void traceStartWriter() {
     }
    }
    if(metalChainOn()){chainDrain(fd);continue;}
-   uint32_t head=gTraceHead.load();
-   if(head<written+4)continue;
-   head-=4;                                   // records still being filled stay for the next round
-   if(head-written>16000)written=head-16000;   // the ring lapped the writer: the oldest are gone
    // The file stops growing at kFramesTraceCap (64 MiB): it stays within half of the diagnostic export region, and Data never
    // holds more than that of it. Later records are dropped.
    static constexpr uint64_t kFramesTraceCap=64ull<<20;
-   static uint64_t fileBytes=0;
-   while(written<head){
-    uint32_t n=head-written;const uint32_t room=16384-written%16384;if(n>room)n=room;
+   while(!gChainSealed.load(std::memory_order_relaxed)){
     const uint64_t left=(kFramesTraceCap-fileBytes)/sizeof(TraceRec);
-    if(!left){written=head;break;}
-    if(n>left)n=(uint32_t)left;
-    if(write(fd,&gTrace[written%16384],n*sizeof(TraceRec))<0)break;
-    written+=n;fileBytes+=n*sizeof(TraceRec);
+    if(!left){gChainSealed.store(true,std::memory_order_relaxed);break;}
+    const size_t count=gChainTrace.pop(batch,std::min<uint64_t>(left,256));
+    if(!count)break;
+    const size_t bytes=count*sizeof(TraceRec);
+    if(!chainPwrite(fd,batch,bytes,fileBytes)) {
+     const int error=errno;
+     (void)ftruncate(fd,(off_t)fileBytes);
+     gChainSealed.store(true,std::memory_order_relaxed);
+     os_log(OS_LOG_DEFAULT,"frame trace writer stopped errno=%{public}d",error);
+     break;
+    }
+    fileBytes+=bytes;
    }
   }
  }).detach();
@@ -599,27 +598,30 @@ static bool harmlessProblem(NSString *what) {
 static void noteProblem(NSString *what) {
  gProblems++;
  if(tQuietProblems)return;
- std::lock_guard<std::mutex> lock(gProblemLock);
- // The client's line shows its latest real problem (a later failure is what ends a process; the first one was often a harmless note).
- if(!harmlessProblem(what)) {
-  char line[sizeof gFirstProblem];
-  strlcpy(line,what.UTF8String?:"?",sizeof line);
-  if(strcmp(line,gFirstProblem)) {
-   memcpy(gFirstProblem,line,sizeof line);
-   if(native_bridge_metal_problem_hook)native_bridge_metal_problem_hook(gFirstProblem);
+ const char *text=what.UTF8String?:"?";
+ const bool significant=!harmlessProblem(what);
+ char line[sizeof gFirstProblem]={};
+ bool changed=false;
+ {
+  std::lock_guard<std::mutex> lock(gProblemLock);
+  if(significant) {
+   strlcpy(line,text,sizeof line);
+   changed=strcmp(line,gFirstProblem)!=0;
+   if(changed)memcpy(gFirstProblem,line,sizeof line);
   }
+  memcpy(gLastProblems[1],gLastProblems[0],sizeof gLastProblems[0]);
+  strlcpy(gLastProblems[0],text,sizeof gLastProblems[0]);
  }
+ if(changed && native_bridge_metal_problem_hook)native_bridge_metal_problem_hook(line);
  // With gpu-trace=1 each distinct refusal text reaches the kernel GPU ring (event 65, 88 characters a part), for the processes
  // whose crash follows a nil Metal object (iconservicesagent in untagged-102cb4a069).
  if(gpuTraceOn() && gFrameTransport) {
-  const char *text=what.UTF8String?:"?";const size_t length=strlen(text);
+  const size_t length=strlen(text);
   for(uint64_t part=0;part<2 && part*88<length;++part) {
    NativeGpuTraceRecord rec{};rec.event=GpuTraceProblem;rec.value[0]=part;
    strncpy((char *)&rec.value[1],text+part*88,88);(void)gFrameTransport(NativeGpuTraceMethod,&rec,sizeof(rec));
   }
  }
- memcpy(gLastProblems[1],gLastProblems[0],sizeof gLastProblems[0]);
- strlcpy(gLastProblems[0],what.UTF8String?:"?",sizeof gLastProblems[0]);
 }
 // A note from the plugin (NativeAdrenoMetalPlugin.mm), for the telemetry's problem lines.
 extern "C" void native_bridge_metal_note(const char *what) {noteProblem([NSString stringWithUTF8String:what]?:@"?");}
@@ -959,7 +961,10 @@ static NSString *compileArguments(MTLCompileOptions *options) {
 static NSError *nbError(NSString *why) {
  return [NSError errorWithDomain:@"org.blu-sharky.native-metal" code:-1 userInfo:@{NSLocalizedDescriptionKey:why?:@"refused"}];
 }
-static NSString *lastError() {return [NSString stringWithUTF8String:nmb_last_error()];}
+static NSString *lastError() {
+ const char *text=nmb_last_error();
+ return (text?[NSString stringWithUTF8String:text]:nil)?:@"no error detail";
+}
 // The render pipeline journal: one line per render pipeline creation (when, on which thread, how long, the outcome, both functions with
 // every constant value, the attachments, blending and vertex descriptor) appended to pipelines.log in the runtime's cache directory, which
 // the board log exports with the caches (CacheExport.h): every pipeline a boot made, or was refused, can be made again on the host.
@@ -1686,7 +1691,8 @@ static void noteUnalignedTexture(MTLTextureDescriptor *d,NSUInteger offset,NSUIn
 @end
 static bool methodABI(id object,SEL selector,const char *encoding) {
  Method method=class_getInstanceMethod(object_getClass(object),selector);
- return method && !strcmp(method_getTypeEncoding(method),encoding);
+ const char *actual=method?method_getTypeEncoding(method):nullptr;
+ return actual && encoding && !strcmp(actual,encoding);
 }
 // Packed bytes of scalar and vector function constants.
 static uint64_t constantBytes(uint64_t type) {
@@ -1794,7 +1800,9 @@ static bool forEachLibraryEntry(NBLibrary *library,const std::function<bool(cons
 - (NSArray<NSString *> *)functionNames {
  NSMutableArray *names=[NSMutableArray array];
  for(uint32_t i=0,n=nmb_library_function_count(_handle);i<n;i++) {
-  char name[256];nmb_library_function_name(_handle,i,name,sizeof name);[names addObject:[NSString stringWithUTF8String:name]];
+  char name[256]={};nmb_library_function_name(_handle,i,name,sizeof name);
+  name[sizeof name-1]=0;
+  if(NSString *decoded=[NSString stringWithUTF8String:name];decoded.length)[names addObject:decoded];
  }
  return names;
 }

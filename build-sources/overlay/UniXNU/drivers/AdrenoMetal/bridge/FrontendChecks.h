@@ -81,6 +81,7 @@ static id<MTLRenderPipelineState> pipeline(id<MTLDevice> device, id<MTLLibrary> 
 // Draws the fixture quad (vertex positions/colors at buffers 0/1) into `target`, cleared blue first.
 static void drawQuad(id<MTLCommandBuffer> cb, id<MTLRenderPipelineState> state, id<MTLTexture> target, id<MTLTexture> sampled,
                      const float (*positions)[2], unsigned count) {
+    if(!cb || !state || !target)return;
     MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
     pass.colorAttachments[0].texture = target;
     pass.colorAttachments[0].loadAction = MTLLoadActionClear;

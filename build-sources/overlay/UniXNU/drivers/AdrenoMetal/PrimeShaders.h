@@ -57,11 +57,13 @@ static const char *const kRoots[] = {"/System/Library", "/Applications", "/Syste
 static std::set<std::string> readLines(const std::string &path) {
     std::set<std::string> lines;
     if (FILE *f = fopen(path.c_str(), "r")) {
-        char line[1024];
-        while (fgets(line, sizeof line, f)) {
-            line[strcspn(line, "\n")] = 0;
-            if (line[0]) lines.insert(line);
+        char *line = nullptr;
+        size_t capacity = 0;
+        for (ssize_t length; (length = getline(&line, &capacity, f)) >= 0;) {
+            if (length && line[length-1] == '\n') --length;
+            if (length) lines.emplace(line, static_cast<size_t>(length));
         }
+        free(line);
         fclose(f);
     }
     return lines;
@@ -104,7 +106,7 @@ static std::vector<std::string> libraries(const std::string &listPath, std::stri
     int lastErrno = 0;
     std::set<std::string> list = listPath.empty() ? std::set<std::string>() : readLines(listPath);
     const char *source = listPath.empty() ? "(none)" : listPath.c_str();
-    if (list.empty()) {list = embeddedLines(); source = "embedded";}
+    if (list.empty()) {list = embeddedLines(); source = list.empty()?"no primelist":"embedded";}
     for (const std::string &path : list) {
         ++lines;
         struct stat st = {};
@@ -234,7 +236,8 @@ static std::string imageUuid(const char *suffix) {
 // Turnip's build, which keys its pipeline cache (int-249: 4099 misses after a Turnip rebuild). A change of either primes every library
 // again; a plugin rebuild alone keeps what was finished.
 static std::string buildId() {
-    return std::string(nmb_runtime_build()) + "-" + imageUuid("/libvulkan_freedreno.dylib");
+    const char *runtime=nmb_runtime_build();
+    return std::string("v2-") + (runtime?runtime:"unknown") + "-" + imageUuid("/libvulkan_freedreno.dylib");
 }
 
 // A kernel that calls visible functions it does not define (`NeedsInput(LinkedFunction { symbol: "..." })`): link the library's function of
@@ -268,7 +271,7 @@ static bool linkedKernel(id<MTLDevice> device, id<MTLLibrary> lib, id<MTLFunctio
 
 // One library: every function it names, in its order; returns the log line.
 static std::string library(id<MTLDevice> device, const std::string &path, const std::string &current, const std::set<std::string> &bad,
-                           const std::string &functionsPath, const std::set<std::string> &functionsDone, const std::string &build) {
+                           const std::string &functionsPath, const std::set<std::string> &functionsDone, const std::string &build, bool &opened) {
     unsigned kernels = 0, renders = 0, made = 0, refused = 0, skipped = 0, zeroed = 0, linkedMade = 0, halfMade = 0;
     uint64_t waited = 0;
     std::string firstRefusal;   // the first refused function and why, so the log tells translator gaps from unspecialized constants
@@ -280,7 +283,11 @@ static std::string library(id<MTLDevice> device, const std::string &path, const 
         native_prime_compiling = 3;
         id<MTLLibrary> lib = [device newLibraryWithURL:[NSURL fileURLWithPath:@(path.c_str())] error:&error];
         native_prime_compiling = 0;
-        if (!lib) return path + " library refused: " + (error ? error.localizedDescription.UTF8String : "no error");
+        if (!lib) {
+            const char *why=error.localizedDescription.UTF8String;
+            return path + " library refused: " + (why?why:"no error");
+        }
+        opened=true;
         NSArray<NSString *> *names = lib.functionNames;
         for (NSString *name in names) {
             @autoreleasepool {
@@ -341,13 +348,18 @@ static std::string library(id<MTLDevice> device, const std::string &path, const 
                     ok = false;
                 }
                 native_prime_compiling = 0;
-                appendLine(functionsPath, doneKey);
+                unlink(current.c_str());
+                if(ok)appendLine(functionsPath, doneKey);
                 ok ? ++made : ++refused;
                 if (ok) native_prime_made = native_prime_made + 1;
                 if (!ok && firstRefusal.empty()) {
                     NSString *why = error.localizedDescription ?: @"no error";
                     firstRefusal = std::string(" first-refused=") + name.UTF8String + ": " + why.UTF8String;
-                    if (firstRefusal.size() > 220) firstRefusal.resize(220);
+                    if (firstRefusal.size() > 220) {
+                        size_t end=220;
+                        while(end && (static_cast<unsigned char>(firstRefusal[end])&0xc0)==0x80)--end;
+                        firstRefusal.resize(end);
+                    }
                     for (char &c : firstRefusal) if (c == '\n' || c == '\t') c = ' ';
                 }
                 error = nil;
@@ -410,7 +422,9 @@ static void run(id<MTLDevice> device, std::string root, unsigned delaySeconds, c
             continue;
         }
 #endif
-        appendLine(logPath, library(device, path, current, bad, functionsPath, functionsDone, build));
+        bool opened=false;
+        appendLine(logPath, library(device, path, current, bad, functionsPath, functionsDone, build, opened));
+        if(!opened)continue;
         native_prime_libraries_primed = native_prime_libraries_primed + 1;
         appendLine(donePath, id);
         done.insert(id);

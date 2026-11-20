@@ -332,7 +332,12 @@ public:
   char *getAdditionalDeviceInfoString() override { return const_cast<char *>("volatile storage; no persistent trust claim"); }
   IOReturn reportBlockSize(UInt64 *value) override { *value = 512; return kIOReturnSuccess; }
   IOReturn reportEjectability(bool *value) override { *value = false; return kIOReturnSuccess; }
-  IOReturn reportMaxValidBlock(UInt64 *value) override { *value = capacity - 1; return kIOReturnSuccess; }
+  IOReturn reportMaxValidBlock(UInt64 *value) override {
+    if (!value) return kIOReturnBadArgument;
+    if (!capacity) return kIOReturnNotReady;
+    *value = capacity - 1;
+    return kIOReturnSuccess;
+  }
   IOReturn reportMediaState(bool *present, bool *changed) override {
     *present = online; if (changed) *changed = false; return kIOReturnSuccess;
   }
@@ -381,15 +386,15 @@ bool NativeRamBlock::start(IOService *provider)
     if(logical>0x80000000ULL){
       uint64_t nonzero=0;
       if(!seedCountNonzero(memory,bytes,&nonzero))return false;
-      big.bytes=logical;big.capacity=nonzero;
+      isBig=true;big.bytes=logical;big.capacity=nonzero;
       big.index=static_cast<uint64_t *>(IOMallocZero((nonzero?nonzero:1)*sizeof(uint64_t)));
       big.page=static_cast<uint8_t **>(IOMallocZero((nonzero?nonzero:1)*sizeof(uint8_t *)));
       if(!big.index||!big.page||!seedImportSparse(big,memory,bytes,ops))return false;
-      isBig=true;sparse.bytes=logical;
+      sparse.bytes=logical;
     }else{
       sparse.bytes=logical;
       sparse.pages=static_cast<uint8_t **>(IOMallocZero((logical/4096)*sizeof(uint8_t *)));
-      if(!ramSparseImport(sparse,memory,bytes,ops))return false;
+      if(!sparse.pages || !ramSparseImport(sparse,memory,bytes,ops))return false;
     }
   }
   capacity = logical / 512;
@@ -515,7 +520,7 @@ IOReturn NativeRamBlock::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 blo
       for(uint64_t i=firstPage;i<=lastPage && overlay.active;){
         uint32_t n=0;
         while(n<kStagePages && i+n<=lastPage && sparse.pages[i+n]){memcpy(stage+(uint64_t)n*persist::kBlock,sparse.pages[i+n],persist::kBlock);++n;}
-        if(!n || !overlay.writeRun(store,i,n,stage)){persistFailed();break;}
+        if(!n || !overlay.writeRun(store,i,n,stage)){persistFailed();actual=0;break;}
         __atomic_fetch_add(&native_data_persist_writes,n,__ATOMIC_RELAXED);
         __atomic_fetch_add(&native_data_persist_syncs,1,__ATOMIC_RELAXED);   // one run = one durable commit
         native_data_persist_present=overlay.present;

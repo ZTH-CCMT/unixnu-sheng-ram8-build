@@ -28,11 +28,12 @@ if adreno.is_dir():
         gpu_methods.append(body[at:body.index(end, at)])
 methods = []
 # The cancellation method ends at its closing brace: it answers differently on macOS inside its own conditional block.
-for start, end, keep in [('    bool isValidated(', '    uint64_t traceRequestIds[8];', ''),
+for start, end, keep in [('    bool isValidated(', '    uint64_t traceRequestIds[8]', ''),
                          ('    static uint32_t gpuResetEpoch(', '    unsigned validatedCount()', ''),
-                         ('    void addValidated(', '    const OriginalLegacySwapRequest *gpuRequest=', ''),
+                         ('    bool addValidated(', '    const OriginalLegacySwapRequest *gpuRequest=', ''),
                          ('    static void sortScanoutPages(', '    int directSlot(', ''),
                          ('    bool gpuWrote(', '    static void fenceFired(', ''),
+                         ('    void latchTick()', '    // Back to the boot loader', ''),
                          ('    bool cancelSwapsAfterTimeout()', '\n    }\n#endif', '\n    }')]:
     at = text.index(start)
     methods.append(text[at:text.index(end, at)].replace(' override', '') + keep)
@@ -74,7 +75,7 @@ static bool (*queryLegacy)(uint32_t *,uint32_t *)=legacy;
 #define native_adreno_fences (*queryLegacy)
 static IOReturn (*queryScanout)(const uint64_t *,unsigned,bool *,uint32_t *,uint32_t *)=nullptr;
 #define native_adreno_scanout_wait (*queryScanout)
-enum {GpuTraceDisplayFence=22};
+enum {GpuTraceDisplayFence=22,GpuTraceDisplayLatch=23};
 static unsigned lastReason,abortReports,failedReports;
 template<class... Args> static void gpuTraceEvent(unsigned,unsigned,uint64_t,unsigned reason,Args...) {
     lastReason=reason;
@@ -112,6 +113,21 @@ struct Display {
     bool fenceCaptured=false,fenceSlow=false,traceGpuComplete=false,gpuRetired=false,transferred=false,scanoutCaptured=false;
     Timer timer;
     Timer *fenceTimer=&timer;
+    Timer latch;
+    Timer *latchTimer=&latch;
+    const OriginalLegacySwapRequest *latchRequest=nullptr;
+    uint64_t latchStart=0;
+    bool latchTimedOut=false;
+    int shownSlot=-1,pendingSlot=-1;
+    uint32_t mdp[1]={};
+    static constexpr uint32_t kCtlFlush=0;
+    unsigned kicks=0,finished=0;
+    void kickSwapQueue() {++kicks;}
+    void finishTransfer(const OriginalLegacySwapRequest *request,bool force) {
+        assert(retireSwap(request,force));
+        transferred=false;
+        ++finished;
+    }
     unsigned waits=0,passed=0;
     uint64_t traceId(const OriginalLegacySwapRequest *) {return 1;}
     void stat(unsigned) {}
@@ -359,7 +375,36 @@ static void stress() {
     std::puts("PASS late submit, unavailable fence register, mapping budget, reset, failed producer and legacy fallback");
 }
 #endif
+static void testLatch() {
+    Display d;
+    OriginalLegacySwapRequest requests[9];
+    for(unsigned i=0;i<8;++i)assert(d.addValidated(&requests[i],resetEpoch));
+    assert(!d.addValidated(&requests[8],resetEpoch));
+    for(unsigned i=0;i<8;++i)assert(d.isValidated(&requests[i]));
+    assert(d.addValidated(&requests[0],resetEpoch));
+
+    d.latchRequest=&requests[0];d.shownSlot=0;d.pendingSlot=1;d.transferred=true;
+    d.latchStart=clockNow;d.mdp[0]=3;
+    d.latchTick();
+    assert(d.latch.delay==500 && d.shownSlot==0 && d.pendingSlot==1 && !d.finished);
+    clockNow+=50000000ull;
+    d.latchTick();d.latchTick();
+    assert(d.latch.delay==8000 && d.shownSlot==0 && d.pendingSlot==1 && !d.finished);
+    assert(native_legacy_direct[3]==1);
+    d.cancelSwapsAfterTimeout();
+    assert(!d.latchRequest && d.pendingSlot==1 && !d.transferred);
+    d.mdp[0]=0;d.latchTick();
+    assert(d.shownSlot==1 && d.pendingSlot==-1 && !d.finished && d.kicks==1);
+
+    assert(d.addValidated(&requests[0],resetEpoch));
+    d.latchRequest=&requests[0];d.pendingSlot=2;d.transferred=true;
+    d.latchTick();
+    assert(d.shownSlot==2 && d.pendingSlot==-1 && d.finished==1 && !d.transferred);
+    std::puts("PASS: full validation queue and delayed display latch after swap cancellation");
+}
+
 int main() {
+    testLatch();
     OriginalLegacySwapRequest a,b;
     Display d;
     // Reproduce request 41: known pending target, then a busy query.

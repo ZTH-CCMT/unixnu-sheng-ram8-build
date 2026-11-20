@@ -264,12 +264,15 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
             }
         }
     }
-    void addValidated(const OriginalLegacySwapRequest *request,uint32_t epoch) {
-        if(isValidated(request))return;
-        unsigned slot=0;
-        for(unsigned i=0;i<8;++i)if(!validated[i]){slot=i;break;}
-        validatedGpuEpoch[slot]=epoch;
-        validated[slot]=request;validatedAt[slot]=nowUs();
+    bool addValidated(const OriginalLegacySwapRequest *request,uint32_t epoch) {
+        if(isValidated(request))return true;
+        for(unsigned i=0;i<8;++i) {
+            if(validated[i])continue;
+            validatedGpuEpoch[i]=epoch;
+            validated[i]=request;validatedAt[i]=nowUs();
+            return true;
+        }
+        return false;
     }
     const OriginalLegacySwapRequest *gpuRequest=nullptr;
     uint64_t gpuTraceRequest=0;
@@ -305,6 +308,7 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     IOTimerEventSource *latchTimer=nullptr;
     const OriginalLegacySwapRequest *latchRequest=nullptr;
     uint64_t latchStart=0,directClock=0;
+    bool latchTimedOut=false;
     int shownSlot=-1,pendingSlot=-1;
     uint32_t shownStride=0;
     // Keep the first successful fence snapshot for this request across pending and busy polls.
@@ -326,19 +330,23 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         IOWorkLoop *loop=getWorkLoop();
         latchTimer=loop?IOTimerEventSource::timerEventSource(this,&NativeLegacyDisplay::latchFired):nullptr;
         fenceTimer=loop?IOTimerEventSource::timerEventSource(this,&NativeLegacyDisplay::fenceFired):nullptr;
-        if(!mdpMap || !directPages || !latchTimer || !fenceTimer || loop->addEventSource(fenceTimer)!=kIOReturnSuccess || loop->addEventSource(latchTimer)!=kIOReturnSuccess) {
+        mdp=mdpMap?reinterpret_cast<volatile uint32_t *>(mdpMap->getVirtualAddress()):nullptr;
+        const bool fenceAdded=mdp && directPages && latchTimer && fenceTimer &&
+            loop->addEventSource(fenceTimer)==kIOReturnSuccess;
+        if(!fenceAdded || loop->addEventSource(latchTimer)!=kIOReturnSuccess) {
+            if(fenceAdded)loop->removeEventSource(fenceTimer);
+            mdp=nullptr;
             OSSafeReleaseNULL(mdpMap);OSSafeReleaseNULL(latchTimer);OSSafeReleaseNULL(fenceTimer);
             if(directPages){IOFreeData(directPages,kDirectPageBytes);directPages=nullptr;}
             return;
         }
-        mdp=reinterpret_cast<volatile uint32_t *>(mdpMap->getVirtualAddress());
         directOn=true;gDirectDisplay=this;
     }
     // The diagnostic screenshot reads the boot memory, which the display no longer scans: draw the surface on screen into it (rows of the
     // visible width) so the picture shows what the panel shows.
     friend void native_legacy_direct_snapshot(void);
     void snapshot() {
-        if(!directOn || directBoot || shownSlot<0 || !bootMapping || !shownStride)return;
+        if(!directOn || directBoot || pendingSlot>=0 || shownSlot<0 || !bootMapping || !shownStride)return;
         IOMemoryDescriptor *source=directSlots[shownSlot].memory;
         PE_Video video={};uint32_t width=0,height=0;getDisplayDimensions(&width,&height);
         if(!source || PE_current_console(&video) || video.v_baseAddr!=bootMapping->getPhysicalAddress() || video.v_width!=width || video.v_height!=height)return;
@@ -524,18 +532,28 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     void fenceTick() {transferred=false;kickSwapQueue();}
     static void latchFired(OSObject *owner,IOTimerEventSource *) {static_cast<NativeLegacyDisplay *>(owner)->latchTick();}
     void latchTick() {
-        if(!latchRequest)return;
+        if(pendingSlot<0)return;
         uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time()-latchStart,&ns);
-        gpuTraceEvent(GpuTraceDisplayLatch,0,traceId(latchRequest),mdp[kCtlFlush/4],ns,shownSlot,pendingSlot);
-        if((mdp[kCtlFlush/4]&0x3) && ns<50000000ull){latchTimer->setTimeoutUS(500);return;}
-        if(ns>=50000000ull)native_legacy_direct[3]=native_legacy_direct[3]+1;
+        const uint32_t flush=mdp[kCtlFlush/4];
+        gpuTraceEvent(GpuTraceDisplayLatch,0,latchRequest?traceId(latchRequest):0,flush,ns,shownSlot,pendingSlot);
+        if(flush&0x3) {
+            if(ns>=50000000ull && !latchTimedOut) {
+                native_legacy_direct[3]=native_legacy_direct[3]+1;
+                latchTimedOut=true;
+            }
+            // Either slot may still be scanned. Keep both pinned until hardware acknowledges the flip.
+            latchTimer->setTimeoutUS(latchTimedOut?8000:500);
+            return;
+        }
         const uint32_t us=uint32_t(ns/1000);
         if(us>native_legacy_direct[4])native_legacy_direct[4]=us;
         native_legacy_direct[5]=native_legacy_direct[5]+us;
         shownSlot=pendingSlot;pendingSlot=-1;
-        stat(10);note(5,shownSlot,latchRequest);
         const OriginalLegacySwapRequest *request=latchRequest;latchRequest=nullptr;
-        finishTransfer(request,true);
+        if(request) {
+            stat(10);note(5,shownSlot,request);
+            finishTransfer(request,true);
+        } else kickSwapQueue();   // The family already cancelled this request.
     }
     // Back to the boot loader's memory (the blank frame and the copy are drawn there).
     void directToBoot() {
@@ -714,7 +732,7 @@ public:
         unsigned enabled=0;PE_parse_boot_argn("offline-legacy-transfer",&enabled,sizeof(enabled));
         stat(1);
         if(enabled!=1 || !logicalPM || !bootMapping || !primary){stat(3);return;}
-        if(transferred){stat(2);return;}
+        if(transferred || pendingSlot>=0){stat(2);return;}
         const OriginalLegacySwapRequest *request=pendingSwapRequest();
         if(!request || !isValidated(request)){stat(4);return;}
         // This bounded first-frame transfer preserves the original queue's
@@ -788,8 +806,7 @@ public:
                 }
             }
         }
-        if(directOn && !half && !gpuBypass && latchRequest)stat(5);
-        if(directOn && !half && !gpuBypass && !latchRequest) {
+        if(directOn && !half && !gpuBypass && sourceStride<=UINT16_MAX) {
             int slot=-1;
             if(!prepareDirectSwap(request,surface,memory,slot))return;
             if(slot>=0) {
@@ -798,7 +815,7 @@ public:
                 native_legacy_direct[0]=native_legacy_direct[0]+1;countFormat(5);
                 stat(9);note(4,slot,request);noteFlipDelay(request);
                 shadowValid=false;pendingSlot=slot;latchRequest=request;transferred=true;
-                latchStart=mach_absolute_time();latchTimer->setTimeoutUS(500);
+                latchStart=mach_absolute_time();latchTimedOut=false;latchTimer->setTimeoutUS(500);
                 return;
             }
             native_legacy_direct[7]=native_legacy_direct[7]+1;
@@ -822,7 +839,7 @@ public:
         // Surfaces may be write-combined (iPadOS 27 display surfaces are): reading them uncached costs seconds per frame. Read through
         // a cacheable view, after cleaning and invalidating it so lines from the previous frame are not reused.
         IOMemoryMap *source=memory->map(kIOMapAnywhere|kIOMapReadOnly|kIOMapCopybackCache);
-        if(!source || !source->getVirtualAddress() || source->getLength()<allocation) {
+        if(!source || !source->getVirtualAddress() || source->getLength()<allocation || source->getLength()>UINT32_MAX) {
             OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnNoMemory,request,0);return;
         }
         flush_dcache64((addr64_t)source->getVirtualAddress(),(unsigned)source->getLength(),false);
@@ -936,7 +953,9 @@ public:
     bool cancelSwapsAfterTimeout() override {
         native_legacy_swap_timeouts=native_legacy_swap_timeouts+1;
         clearFenceWait();
-        for(auto &entry: validated)entry=nullptr;
+        for(unsigned i=0;i<8;++i)if(validated[i])removeValidated(validated[i]);
+        // Keep the pending hardware slot and its timer, but release the family's request reference.
+        latchRequest=nullptr;
         gpuRequest=nullptr;gpuRetired=false;transferred=false;
 #if defined(NATIVE_LEGACY_MACOS) && NATIVE_LEGACY_MACOS
         // macOS names this slot are_timings_enabled: disp_has_no_clients_gated reprograms the display with a dummy swap when it is
@@ -957,7 +976,8 @@ public:
     static constexpr unsigned kSwapInfoRing=6;
     SwapInfo swapInfo[kSwapInfoRing];   // no initializers: IOKit objects are allocated zeroed (see validatedAt)
     unsigned swapInfoRead,swapInfoWrite;
-    IOReturn collectCompletionReports(uint32_t swapID,void *,uint32_t *,uint32_t) override {
+    IOReturn collectCompletionReports(uint32_t swapID,void *,uint32_t *count,uint32_t) override {
+        if(count)*count=0;
         auto self=reinterpret_cast<unsigned char *>(this);
         const unsigned char *swap=nullptr;memcpy(&swap,self+kLegacyCurrentSwap,sizeof(swap));
         uint32_t dropped=0;
@@ -969,7 +989,11 @@ public:
         memcpy(&info.words[2],swap+kRequestSwapInfoA,8);
         uint32_t second=0;memcpy(&second,swap+kRequestSwapInfoB,4);info.words[3]=second;
         uint16_t held=0;memcpy(&held,self+kLegacySwapInfoHeld,2);
-        if(held){swapInfoWrite=(swapInfoWrite+1)%kSwapInfoRing;return kIOReturnSuccess;}
+        if(held){
+            swapInfoWrite=(swapInfoWrite+1)%kSwapInfoRing;
+            if(swapInfoWrite==swapInfoRead)swapInfoRead=(swapInfoRead+1)%kSwapInfoRing;
+            return kIOReturnSuccess;
+        }
         for(;swapInfoRead!=swapInfoWrite;swapInfoRead=(swapInfoRead+1)%kSwapInfoRing)native_legacy_swap_info_dispatch(this,&swapInfo[swapInfoRead]);
         native_legacy_swap_info_dispatch(this,&info);
         return kIOReturnSuccess;
@@ -1073,6 +1097,7 @@ public:
                 reason=5;accepted=true;
             }
         }
+        if(accepted && !addValidated(request,scanout?epoch:0)){accepted=false;reason=7;}
         if(accepted){
             // The OS's compositor now owns the panel: the kernel console stops drawing into the framebuffer and stays on the serial
             // console, as IOFramebuffer does when the window server takes a Mac's display over. With vc-text=1 (text console on the
@@ -1080,7 +1105,7 @@ public:
 #if defined(NATIVE_LEGACY_MACOS) && NATIVE_LEGACY_MACOS
             if(!consoleReleased){consoleReleased=true;PE_initialize_console(nullptr,kPEDisableScreen);}
 #endif
-            addValidated(request,scanout?epoch:0);stat(0);note(1,-1,request);const unsigned depth=validatedCount();if(depth>native_legacy_swapstat[15])native_legacy_swapstat[15]=depth;}
+            stat(0);note(1,-1,request);const unsigned depth=validatedCount();if(depth>native_legacy_swapstat[15])native_legacy_swapstat[15]=depth;}
         else removeValidated(request);
         native_legacy_swap_validation_observed(accepted,reason,request,surface);return accepted;
     }
