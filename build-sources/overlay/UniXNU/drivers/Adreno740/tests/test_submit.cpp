@@ -1519,6 +1519,25 @@ int main(int argc,char **argv)
         CHECK(p.submit.detach()==kIOReturnSuccess);
         std::puts("PASS the submission log without and with diag=1, and the timed phases");
     }
+    {
+        Path p;CHECK(exposed(p)==kIOReturnSuccess);
+        NativeAdrenoSubmitBuffer buffer{p.handle,0x800000,4096};
+        uint32_t issued=0;
+        for(uint32_t n=1;n<=3;++n)
+            CHECK(p.submit.submit(&buffer,1,0,&issued)==kIOReturnSuccess && issued==n);
+        fencemem[1]=2;
+        CHECK(p.submit.observeFence(2,nullptr,0)==kIOReturnSuccess && p.ring.completedFence()==2);
+        CHECK(p.submit.outstanding()==3 && p.object.deviceReferences()==4);
+        const unsigned sampled=cp.acquire;
+        CHECK(p.submit.retireCompleted()==kIOReturnSuccess && cp.acquire==sampled+1);
+        CHECK(p.submit.outstanding()==1 && p.object.deviceReferences()==2);
+        CHECK(p.submit.stats().references_retired==2 && p.submit.detach()==kIOReturnBusy);
+        fencemem[1]=3;
+        CHECK(p.submit.retireCompleted()==kIOReturnSuccess && cp.acquire==sampled+2);
+        CHECK(p.submit.detach()==kIOReturnSuccess && p.ring.completedFence()==3);
+        CHECK(p.object.deviceReferences()==1);
+        std::puts("PASS one completion read per ring retires only jobs covered by its timestamp");
+    }
     std::printf("PASS: 1 execbuf submission with exact IB packet and fence, 8 pre-reference refusals, 1 duplicate-buffer reference case and 1 poisoned-commit retention case over software SMMU/CP peers; 2 write-combine audit cases (trusted, dirty and failed); 1 hangcheck and 1 recovery with replay, 1 usable VM after recovery and 1 failed restart\n");
     testHiddenActiveFence();
     testSwitchCompletesWithoutInterrupt();

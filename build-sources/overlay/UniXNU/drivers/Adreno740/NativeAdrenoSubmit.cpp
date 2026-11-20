@@ -550,7 +550,7 @@ IOReturn NativeAdrenoSubmit::release(Job &job,bool completed)
     if(vm->acquireImported())return poison();
     if(completed) {
         uint64_t start=0,end=0;
-        NativeAdrenoRing *r=ringOfFence(job.fence);
+        NativeAdrenoRing *r=ring(job.ring);
         const uint32_t stamped=r?r->timeline(job.fence,&start,&end):0;
         gpuTraceEvent(GpuTraceRetire,job.owner,job.fence,job.queue,job.ring,job.submit_us,start,end,stamped,job.replays);
         noteJobTime(job,stamped,start,end);
@@ -831,7 +831,7 @@ IOReturn NativeAdrenoSubmit::observeFence(uint32_t fence,const NativeAdrenoRingC
     driveSwitch(clock);
     NativeAdrenoRing *const r=ringOfFence(fence);
     if(!r)return kIOReturnBadArgument;
-    const NativeAdrenoRingFence result=waitOnRing(r,false,fence,clock,timeout_us,nullptr);
+    const NativeAdrenoRingFence result=waitOnRing(r,fence,clock,timeout_us,nullptr);
     if(result==NativeAdrenoRingFencePoisoned)return poison();
     if(result==NativeAdrenoRingFenceArgument)return kIOReturnBadArgument;
     if(result==NativeAdrenoRingFenceTimeout)return kIOReturnTimeout;
@@ -1024,14 +1024,14 @@ void NativeAdrenoSubmit::snapshot(uint32_t next,uint32_t waited,uint64_t now,uin
  * of a ring the CP is not running, which gets the CP once the other ring goes idle or its job has aged, and a switch the CP finished
  * has to be completed for the incoming ring to get its write pointer. Without that a low-ring job behind a busy high ring sat out the
  * whole timeout, and after 2 s the hang check took it for a ring the CP cannot reach and restarted the GPU. */
-NativeAdrenoRingFence NativeAdrenoSubmit::waitOnRing(NativeAdrenoRing *r,bool held,uint32_t fence,const NativeAdrenoRingClock *clock,
+NativeAdrenoRingFence NativeAdrenoSubmit::waitOnRing(NativeAdrenoRing *r,uint32_t fence,const NativeAdrenoRingClock *clock,
     uint32_t timeout_us,uint32_t *observed)
 {
     if(!preemption() || !timeout_us || !clock || !clock->now_us)
-        return held?r->wait(fence,clock,timeout_us,observed):r->observeFence(fence,clock,timeout_us,observed);
+        return r->observeFence(fence,clock,timeout_us,observed);
     const uint64_t start=clock->now_us(clock->cookie);
     for(;;) {
-        const NativeAdrenoRingFence state=held?r->wait(fence,clock,0,observed):r->observeFence(fence,clock,0,observed);
+        const NativeAdrenoRingFence state=r->observeFence(fence,clock,0,observed);
         if(state!=NativeAdrenoRingFenceTimeout)return state;
         if(clock->now_us(clock->cookie)-start>=timeout_us)return NativeAdrenoRingFenceTimeout;
         if(clock->idle && clock->idle(clock->cookie))return NativeAdrenoRingFenceTimeout;
@@ -1052,7 +1052,7 @@ IOReturn NativeAdrenoSubmit::wait(uint32_t fence,const NativeAdrenoRingClock *cl
     if(!r)return kIOReturnBadArgument;
     if(!job) {
         native_adreno_fence_wait[6]=native_adreno_fence_wait[6]+1;
-        const NativeAdrenoRingFence passed=waitOnRing(r,false,fence,clock,timeout_us,&observed);
+        const NativeAdrenoRingFence passed=waitOnRing(r,fence,clock,timeout_us,&observed);
         if(passed==NativeAdrenoRingFencePoisoned)return poison();
         if(passed==NativeAdrenoRingFenceArgument) {native_adreno_fence_wait[7]=fence;return kIOReturnBadArgument;}
         if(passed==NativeAdrenoRingFenceTimeout) {
@@ -1064,7 +1064,7 @@ IOReturn NativeAdrenoSubmit::wait(uint32_t fence,const NativeAdrenoRingClock *cl
         }
         return kIOReturnSuccess;
     }
-    const NativeAdrenoRingFence result=waitOnRing(r,true,fence,clock,timeout_us,&observed);
+    const NativeAdrenoRingFence result=waitOnRing(r,fence,clock,timeout_us,&observed);
     if(result==NativeAdrenoRingFencePoisoned)return poison();
     if(result==NativeAdrenoRingFenceArgument) {native_adreno_fence_wait[7]=fence;return kIOReturnBadArgument;}
     if(result==NativeAdrenoRingFenceTimeout) {
@@ -1104,12 +1104,21 @@ IOReturn NativeAdrenoSubmit::waitRange(uint64_t first,uint64_t count,const Nativ
 IOReturn NativeAdrenoSubmit::retireCompleted()
 {
     if(!attached_ || poisoned_)return kIOReturnNotReady;
+    uint32_t done[NativeAdrenoPreemptRingCount]={};
+    bool sampled[NativeAdrenoPreemptRingCount]={};
     for(auto &job:jobs_) {
-        if(!job.active)continue;
-        NativeAdrenoRing *const r=ringOfFence(job.fence);
-        const NativeAdrenoRingFence state=r?r->observeFence(job.fence,nullptr,0,nullptr):NativeAdrenoRingFenceArgument;
-        if(state==NativeAdrenoRingFencePoisoned)return poison();
-        if(state!=NativeAdrenoRingFenceComplete)continue;
+        if(!job.active || !job.fence || job.ring>=ring_count_)continue;
+        const unsigned index=job.ring;
+        NativeAdrenoRing *const r=ring(index);
+        if(job.fence>r->lastSubmitted())continue;
+        if(!sampled[index]) {
+            // One CP timestamp covers every earlier job on this ring.
+            const auto state=r->observeFence(job.fence,nullptr,0,&done[index]);
+            if(state==NativeAdrenoRingFencePoisoned)return poison();
+            if(state==NativeAdrenoRingFenceArgument)continue;
+            sampled[index]=true;
+        }
+        if(job.fence>done[index])continue;
         const IOReturn status=release(job);
         if(status)return status;
         ++stats_.completed;

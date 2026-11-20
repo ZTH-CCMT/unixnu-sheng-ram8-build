@@ -34,6 +34,9 @@ for start, end, keep in [('    bool isValidated(', '    uint64_t traceRequestIds
                          ('    static void sortScanoutPages(', '    int directSlot(', ''),
                          ('    bool gpuWrote(', '    static void fenceFired(', ''),
                          ('    void latchTick()', '    // Back to the boot loader', ''),
+                         ('    void startTransferEvents()', '    void forgetDirectDisplay()', ''),
+                         ('    void finishGpuSwap(', '    // Hands the pending head', ''),
+                         ('    void clearRetirement()', '#if defined(NATIVE_LEGACY_CANCEL_SWAPS)', ''),
                          ('    bool cancelSwapsAfterTimeout()', '\n    }\n#endif', '\n    }')]:
     at = text.index(start)
     methods.append(text[at:text.index(end, at)].replace(' override', '') + keep)
@@ -49,6 +52,17 @@ enum {kIOReturnSuccess,kIOReturnUnsupported,kIOReturnBusy,kIOReturnNotReady,kIOR
 struct OriginalLegacySwapRequest {};
 struct OSObject {};
 struct IOMemoryDescriptor {};
+struct IOLock {bool locked=false;};
+static IOLock *IOLockAlloc() {return new IOLock;}
+static void IOLockLock(IOLock *lock) {assert(!lock->locked);lock->locked=true;}
+static void IOLockUnlock(IOLock *lock) {assert(lock->locked);lock->locked=false;}
+#define OSSafeReleaseNULL(source) do {if(source){source->release();source=nullptr;}} while(0)
+static bool takeGpuOffer=true;
+static bool native_legacy_gpu_offer(void *,IOMemoryDescriptor *,uint64_t,unsigned,unsigned,unsigned) {return takeGpuOffer;}
+static unsigned completedCopies,failedCopies;
+static uint64_t native_legacy_early_failures;
+static void native_legacy_transfer_observed(int status,const void *,uint64_t) {assert(!status);++completedCopies;}
+static void native_legacy_gpu_fallback_observed(int status) {assert(status);++failedCopies;}
 static uint32_t resetEpoch=1;
 static uint32_t epoch() { return resetEpoch; }
 static uint32_t (*queryEpoch)()=epoch;
@@ -86,8 +100,55 @@ struct Timer {
     unsigned delay=0,polls=0;
     void setTimeoutUS(unsigned us) {delay=us;++polls;}
     void cancelTimeout() {delay=0;}
+    void setTimeoutMS(unsigned ms) {setTimeoutUS(ms*1000);}
+    using Action=void (*)(OSObject *,Timer *);
+    Action action=nullptr;
+    static Timer *timerEventSource(OSObject *,Action action) {
+        auto *source=new Timer;
+        source->action=action;
+        return source;
+    }
+    void fire(OSObject *owner) {assert(delay);delay=0;action(owner,this);}
+    void release() {delete this;}
 };
-struct Display {
+using IOTimerEventSource=Timer;
+struct IOInterruptEventSource {
+    using Action=void (*)(OSObject *,IOInterruptEventSource *,int);
+    Action action;
+    unsigned pending=0;
+    static IOInterruptEventSource *interruptEventSource(OSObject *,Action action) {return new IOInterruptEventSource{action};}
+    bool enabled=false;
+    void enable() {enabled=true;}
+    void interruptOccurred(void *,void *,int) {assert(enabled);++pending;}
+    void run(OSObject *owner) {assert(pending);const unsigned count=pending;pending=0;action(owner,this,int(count));}
+    void release() {delete this;}
+};
+struct IOWorkLoop {
+    template<class Source> IOReturn addEventSource(Source *) {return kIOReturnSuccess;}
+    template<class Source> void removeEventSource(Source *) {}
+};
+struct Display : OSObject {
+    using NativeLegacyDisplay=Display;
+    IOWorkLoop loop;
+    IOWorkLoop *getWorkLoop() {return &loop;}
+    IOLock *gpuCompletionLock=nullptr;
+    IOInterruptEventSource *gpuCompletionSource=nullptr;
+    bool gpuCopyOutstanding=false,gpuResultReady=false,gpuBypass=false;
+    uint64_t gpuLength=0;
+    int gpuResult=0,refs=1;
+    void retain() {++refs;}
+    void release() {assert(refs>1);--refs;}
+    ~Display() {
+        if(gpuCompletionLock) {
+            stopTransferEvents();
+            assert(refs==1);
+            delete gpuCompletionLock;
+        }
+    }
+    bool forceRetirement=false,retireEnabled=true,familyBusy=false;
+    const OriginalLegacySwapRequest *retireRequest=nullptr,*head=nullptr;
+    IOTimerEventSource *retireTimer=nullptr;
+    const OriginalLegacySwapRequest *pendingSwapRequest() const {return head;}
     const OriginalLegacySwapRequest *fenceFor=nullptr,*gpuRequest=nullptr,*validated[8]={};
     uint32_t fenceTarget=0,validatedGpuEpoch[8]={};
     uint32_t scanoutTargets[2]={};
@@ -99,9 +160,10 @@ struct Display {
     const uint64_t *mappedPages=nullptr;
     const uint64_t *scanoutPages(unsigned) const {return mappedPages;}
     bool retireSwap(const OriginalLegacySwapRequest *request,bool force) {
-        assert(force && transferred && isValidated(request));
+        assert((force || retireEnabled) && transferred && isValidated(request));
+        if(familyBusy)return false;
         removeValidated(request);
-        ++retirements;
+        ++retirements;++finished;
         return true;
     }
     int directSlot(OSObject *,IOMemoryDescriptor *) {
@@ -123,11 +185,6 @@ struct Display {
     static constexpr uint32_t kCtlFlush=0;
     unsigned kicks=0,finished=0;
     void kickSwapQueue() {++kicks;}
-    void finishTransfer(const OriginalLegacySwapRequest *request,bool force) {
-        assert(retireSwap(request,force));
-        transferred=false;
-        ++finished;
-    }
     unsigned waits=0,passed=0;
     uint64_t traceId(const OriginalLegacySwapRequest *) {return 1;}
     void stat(unsigned) {}
@@ -397,14 +454,98 @@ static void testLatch() {
     assert(d.shownSlot==1 && d.pendingSlot==-1 && !d.finished && d.kicks==1);
 
     assert(d.addValidated(&requests[0],resetEpoch));
-    d.latchRequest=&requests[0];d.pendingSlot=2;d.transferred=true;
+    d.head=d.latchRequest=&requests[0];d.pendingSlot=2;d.transferred=true;
     d.latchTick();
     assert(d.shownSlot==2 && d.pendingSlot==-1 && d.finished==1 && !d.transferred);
     std::puts("PASS: full validation queue and delayed display latch after swap cancellation");
 }
 
+static void testRetirement() {
+    Display d;
+    OriginalLegacySwapRequest a,b;
+    d.startTransferEvents();
+    d.addValidated(&a,resetEpoch);
+    d.head=&a;
+    d.transferred=d.familyBusy=true;
+    d.finishTransfer(&a);
+    assert(d.retireRequest==&a && d.retireTimer->delay==1000 && d.transferred && !d.retirements && !d.kicks);
+    d.retireTimer->fire(&d);
+    assert(d.retireTimer->delay==1000 && d.transferred && !d.retirements);
+    d.familyBusy=false;
+    d.retireTimer->fire(&d);
+    assert(!d.retireRequest && !d.retireTimer->delay && !d.transferred && d.retirements==1 && d.kicks==1);
+
+    d.addValidated(&b,resetEpoch);
+    d.head=&b;
+    d.transferred=d.familyBusy=true;
+    d.finishTransfer(&b,true);
+    d.cancelSwapsAfterTimeout();
+    assert(!d.retireRequest && !d.retireTimer->delay && !d.transferred && d.retirements==1);
+    d.retireTimer->action(&d,d.retireTimer);
+    assert(d.retirements==1 && d.kicks==1);   // A stale timer never touches the cancelled head.
+
+    d.retireEnabled=false;
+    d.finishTransfer(&b);
+    assert(!d.retireRequest && !d.retireTimer->delay && d.kicks==1);
+    Display noTimer;
+    noTimer.addValidated(&a,resetEpoch);
+    noTimer.head=&a;
+    noTimer.transferred=noTimer.familyBusy=true;
+    noTimer.finishTransfer(&a);
+    assert(noTimer.retireRequest==&a && noTimer.transferred);
+    noTimer.familyBusy=false;
+    noTimer.finishTransfer(noTimer.retireRequest,noTimer.forceRetirement);
+    assert(!noTimer.retireRequest && !noTimer.transferred && noTimer.retirements==1);
+    std::puts("PASS: busy family head retries retirement only, with or without a timer; cancellation suppresses the retry");
+}
+
+static void testGpuHandoff() {
+    Display d;
+    OriginalLegacySwapRequest a,b;
+    IOMemoryDescriptor memory;
+    assert(!d.offerGpuCopy(&memory,8,1,1,0));
+    d.startTransferEvents();
+    takeGpuOffer=false;
+    assert(!d.offerGpuCopy(&memory,8,1,1,0) && d.refs==1 && !d.gpuCopyBusy());
+    takeGpuOffer=true;
+    d.addValidated(&a,resetEpoch);
+    d.head=d.gpuRequest=&a;
+    d.transferred=true;
+    assert(d.offerGpuCopy(&memory,8,1,1,0) && d.refs==2);
+    d.gpuComplete(0);
+    assert(d.gpuCompletionSource->pending==1 && d.refs==2 && !d.retirements && d.gpuCopyBusy());
+    d.gpuCompletionSource->run(&d);
+    assert(d.refs==1 && d.retirements==1 && d.kicks==1 && !d.transferred && !d.gpuCopyBusy() && completedCopies==1);
+
+    d.addValidated(&b,resetEpoch);
+    d.head=d.gpuRequest=&b;
+    d.transferred=true;
+    assert(d.offerGpuCopy(&memory,8,1,1,0));
+    d.cancelSwapsAfterTimeout();
+    assert(d.gpuCopyBusy() && d.transferred && d.refs==2);
+    assert(!d.offerGpuCopy(&memory,8,1,1,0));
+    d.gpuComplete(0);
+    d.gpuCompletionSource->run(&d);
+    assert(d.refs==1 && d.retirements==1 && d.kicks==2 && !d.transferred && completedCopies==1);
+
+    assert(d.offerGpuCopy(&memory,8,1,1,0));
+    d.gpuComplete(-1);
+    d.stopTransferEvents();
+    assert(d.refs==1 && !d.gpuCopyBusy() && !d.gpuCompletionSource && !failedCopies);
+
+    d.startTransferEvents();
+    assert(d.offerGpuCopy(&memory,8,1,1,0));
+    d.stopTransferEvents();
+    assert(d.refs==2 && d.gpuCopyBusy() && !d.gpuCompletionSource);
+    d.gpuComplete(-1);
+    assert(d.refs==1 && !d.gpuCopyBusy() && !failedCopies);
+    std::puts("PASS: GPU completion is deferred and balances the display reference across refusals, cancellation and stop");
+}
+
 int main() {
     testLatch();
+    testRetirement();
+    testGpuHandoff();
     OriginalLegacySwapRequest a,b;
     Display d;
     // Reproduce request 41: known pending target, then a busy query.

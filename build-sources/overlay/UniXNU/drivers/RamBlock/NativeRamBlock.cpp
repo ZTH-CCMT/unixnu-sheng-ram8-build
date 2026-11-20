@@ -73,8 +73,8 @@ class NativeRamBlock : public IOBlockStorageDevice {
   uint64_t capacity = 0;
   bool online = false;
   RamSparseDisk sparse = {};
-  // A disk above 2 GiB keeps only the nonzero pages of its seed (SeedDisk.h), in memory proportional to the content, and is served by the
-  // direct (store-backed) path alone: it needs the persistent store open read-write, or its requests fail.
+  // A disk above 2 GiB keeps only the nonzero seed pages (SeedDisk.h). When a persistent
+  // overlay opens, its changed pages are read directly from the store. Writes require read-write mode.
   SeedDisk big = {};
   bool isBig = false;
   uint8_t seedHash[32] = {};
@@ -86,10 +86,16 @@ class NativeRamBlock : public IOBlockStorageDevice {
   //  - a write holds its page range (writes to the same pages never overlap; a partial page is read, merged and written back) and the
   //    flush lock shared; a flush holds it exclusive, so every bit it writes names a page the sync before it made durable;
   //  - bitLock serializes Overlay::commitRun (bits, their bitmap blocks in write through, the dirty marks) and the flush timer state.
-  // Lock order: page range, flush lock, bitLock; flushMutex before the flush lock. Reads take none of them.
+  // Writers take the page range and flush lock before borrowing a staging buffer. A writer waiting for
+  // either lock leaves the pool available to reads. bitLock nests inside the flush lock.
   static constexpr uint32_t kStagePool = 8, kRanges = 16;
   uint8_t *stagePool[kStagePool] = {};
   uint32_t stageFree = 0, stageCount = 0;
+  struct StageWaiter {
+    StageWaiter *next = nullptr;
+    uint8_t *buffer = nullptr;
+  };
+  StageWaiter *stageHead = nullptr, *stageTail = nullptr;  // poolLock held
   IOLock *poolLock = nullptr, *rangeLock = nullptr, *bitLock = nullptr, *flushMutex = nullptr;
   IORWLock *flushRw = nullptr;
   struct PageRange { uint64_t first, last; bool used; } ranges[kRanges] = {};
@@ -165,16 +171,36 @@ class NativeRamBlock : public IOBlockStorageDevice {
   }
   uint8_t *takeStage() {
     IOLockLock(poolLock);
-    while (!stageFree) IOLockSleep(poolLock, &stageFree, THREAD_UNINT);
-    const unsigned k = static_cast<unsigned>(__builtin_ctz(stageFree));
-    stageFree &= ~(1u << k);
+    if (stageFree) {
+      const unsigned k = static_cast<unsigned>(__builtin_ctz(stageFree));
+      stageFree &= ~(1u << k);
+      IOLockUnlock(poolLock);
+      return stagePool[k];
+    }
+    StageWaiter waiter;
+    if (stageTail) stageTail->next = &waiter;
+    else stageHead = &waiter;
+    stageTail = &waiter;
+    while (!waiter.buffer) IOLockSleep(poolLock, &waiter, THREAD_UNINT);
     IOLockUnlock(poolLock);
-    return stagePool[k];
+    return waiter.buffer;
   }
   void giveStage(uint8_t *buffer) {
     IOLockLock(poolLock);
-    for (unsigned k = 0; k < stageCount; ++k) if (stagePool[k] == buffer) stageFree |= 1u << k;
-    IOLockWakeup(poolLock, &stageFree, true);
+    if (StageWaiter *waiter = stageHead) {
+      stageHead = waiter->next;
+      if (!stageHead) stageTail = nullptr;
+      // Hand the buffer directly to the oldest waiter before another request can take it.
+      waiter->buffer = buffer;
+      IOLockWakeup(poolLock, waiter, true);
+    } else {
+      for (unsigned k = 0; k < stageCount; ++k) {
+        if (stagePool[k] == buffer) {
+          stageFree |= 1u << k;
+          break;
+        }
+      }
+    }
     IOLockUnlock(poolLock);
   }
   void takeRange(uint64_t first, uint64_t last) {
@@ -583,8 +609,8 @@ IOReturn NativeRamBlock::directReadWrite(IOMemoryDescriptor *buffer, uint64_t of
   *actual = 0;
   if (write && __atomic_load_n(&directFailed, __ATOMIC_ACQUIRE)) return kIOReturnIOError;
   const uint64_t t0 = mach_absolute_time();
-  uint8_t *buf = takeStage();
   if (write) { takeRange(first, last); IORWLockRead(flushRw); }
+  uint8_t *buf = takeStage();
   *waited += mach_absolute_time() - t0;
   StoreOps store; store.cached = writeBack;
   BitCommit commit = {this, store};

@@ -134,9 +134,14 @@ public:
         uint64_t base=physical_base,physical=base+offset;
         if(fixture.mode==Scattered || (fixture.mode==ScatterUnlessContiguous && !contiguous)) {
             physical=base+2*offset;
-            if(fixture.mode==ScatterUnlessContiguous)*length=4096;
+            *length=4096;
         }
-        if(fixture.mode==Paired)physical=base+offset+((offset/8192)*4096);
+        if(fixture.mode==Paired) {
+            physical=base+offset+((offset/8192)*4096);
+            *length=std::min(*length,8192-(offset%8192));
+        }
+        if(offset==0 && (fixture.mode==ZeroPhysical || fixture.mode==UnalignedPhysical ||
+           fixture.mode==ShortSegment || fixture.mode==HighPhysical))*length=4096;
         if(offset==4096) {
             if(fixture.mode==ZeroPhysical)physical=0;
             if(fixture.mode==UnalignedPhysical)++physical;

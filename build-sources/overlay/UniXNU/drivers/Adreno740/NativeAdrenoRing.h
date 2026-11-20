@@ -103,8 +103,9 @@ public:
     IOReturn attach(const NativeAdrenoRingIo *,const NativeAdrenoRingCache *,
         void *ring,size_t ring_bytes,uint64_t ring_iova,
         void *fence,size_t fence_bytes,uint64_t fence_iova);
-    /* Programs nothing. Refuses while submissions are unobserved or poisoned,
-     * because only the caller can establish real GPU quiescence and unmap. */
+    /* Programs nothing. Refuses while submitted fences are unobserved or the
+     * ring is poisoned. The caller must independently establish quiescence
+     * before unmapping, including unfenced work and trailing ring packets. */
     IOReturn detach();
     /* Emit an entire command stream followed by the timestamp fence and commit
      * it with one WPTR update. Returns a nonzero fence value on success. The
@@ -195,13 +196,13 @@ public:
     IOReturn busHalt(bool gx_off,unsigned spins);
     uint64_t table() const {return table_;}
     bool tablePending() const {return table_pending_;}
-    /* Polls the CP-written timestamp after invalidating the fence page. Never
-     * writes registers and never advances the ring. Timeout is not poison. */
+    /* Polls the CP-written timestamp and records confirmed completion. Never
+     * writes registers or changes either ring pointer. Timeout is not poison. */
     NativeAdrenoRingFence wait(uint32_t fence,const NativeAdrenoRingClock *,
         uint32_t timeout_us,uint32_t *observed);
-    /* Observe a previously issued fence without retiring or accounting for it.
-     * Used before a new submission waits on an earlier batch; only fence values
-     * this ring issued are accepted. Never writes a register. */
+    /* Like wait(), updates the ring's completion watermark from a valid
+     * sample, even if the requested fence is still pending. Job references
+     * are managed independently by the submitter. */
     NativeAdrenoRingFence observeFence(uint32_t fence,const NativeAdrenoRingClock *,
         uint32_t timeout_us,uint32_t *observed);
     /* Reads the CP's state for a fence that stopped advancing into out[NativeAdrenoRingStallWords]: RBBM_STATUS..STATUS3,

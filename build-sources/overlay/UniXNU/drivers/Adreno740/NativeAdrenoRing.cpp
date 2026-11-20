@@ -672,8 +672,8 @@ IOReturn NativeAdrenoRing::submitWords(const uint32_t *words,size_t word_count,u
      * leaves it (the switch back stays pending with STOP set). */
     status=framed?emitFramedFence(at,number,&end,preempt_):emitFence(at,number,&end);
     if(status)return status;
-    /* Whole-ring publication is deliberate: a submission may wrap, and one
-     * clean of the owned pool is cheaper than a split range proof. */
+    /* A submission may wrap. One publication covers both pieces. Sheng's
+     * non-cacheable ring mapping needs only an ordering barrier here. */
     {
         const uint32_t slot=native_adreno_ring_log_count&3;
         const uint32_t total=(end-next_)&mask;
@@ -705,6 +705,7 @@ NativeAdrenoRingFence NativeAdrenoRing::observeFence(uint32_t fence,
         const uint32_t value=fence_[1];
         if(observed)*observed=value;
         if(value>seqno_) {poison();return NativeAdrenoRingFencePoisoned;}
+        if(value>completed_)completed_=value;
         if(value>=fence)return NativeAdrenoRingFenceComplete;
         if(!clock || !clock->now_us)return NativeAdrenoRingFenceTimeout;
         if(clock->now_us(clock->cookie)-start>=timeout_us)return NativeAdrenoRingFenceTimeout;
@@ -714,18 +715,5 @@ NativeAdrenoRingFence NativeAdrenoRing::observeFence(uint32_t fence,
 NativeAdrenoRingFence NativeAdrenoRing::wait(uint32_t fence,const NativeAdrenoRingClock *clock,
     uint32_t timeout_us,uint32_t *observed)
 {
-    if(observed)*observed=0;
-    if(!attached_ || poisoned_)return NativeAdrenoRingFencePoisoned;
-    if(!fence || fence>seqno_)return NativeAdrenoRingFenceArgument;
-    uint64_t start=clock && clock->now_us?clock->now_us(clock->cookie):0;
-    for(;;) {
-        if(cache_.acquire(cache_.cookie,fence_,fence_bytes_)) {poison();return NativeAdrenoRingFencePoisoned;}
-        const uint32_t value=fence_[1];
-        if(observed)*observed=value;
-        if(value>=fence) {if(value>seqno_) {poison();return NativeAdrenoRingFencePoisoned;}completed_=value;
-            return NativeAdrenoRingFenceComplete;}
-        if(!clock || !clock->now_us)return NativeAdrenoRingFenceTimeout;
-        if(clock->now_us(clock->cookie)-start>=timeout_us)return NativeAdrenoRingFenceTimeout;
-        if(clock->idle && clock->idle(clock->cookie))return NativeAdrenoRingFenceTimeout;
-    }
+    return observeFence(fence,clock,timeout_us,observed);
 }

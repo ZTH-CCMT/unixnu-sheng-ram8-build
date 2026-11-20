@@ -12,6 +12,7 @@
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOWorkLoop.h>
 #include <IOKit/IOUserClient.h>
+#include <IOKit/IOInterruptEventSource.h>
 #include <IOKit/IOTimerEventSource.h>
 #include <IOKit/IODeviceMemory.h>
 #include <kern/clock.h>
@@ -314,6 +315,15 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     // swap releases the frame shown before it, whose copy has finished (transferred held this one back); the offered frame itself stays
     // in use until the next swap retires, so the compositor never writes a frame the GPU is still reading.
     bool gpuRetired=false;
+    // gpuCompletionLock serializes the producer with detaching the source. The family gate owns the frame state.
+    IOLock *gpuCompletionLock=nullptr;
+    IOInterruptEventSource *gpuCompletionSource=nullptr;
+    bool gpuCopyOutstanding=false;
+    bool gpuResultReady;
+    int gpuResult;
+    IOTimerEventSource *retireTimer=nullptr;
+    const OriginalLegacySwapRequest *retireRequest=nullptr;
+    bool forceRetirement;
     // The refresh tick runs on the family's work loop, the loop of the command gate that registers and removes the vsync clients, so the
     // client queue (kLegacyVsyncClients) never changes while the sender walks it.
     IOTimerEventSource *vsyncTimer=nullptr;
@@ -612,6 +622,7 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         vsyncNext+=vsyncInterval;
         if(vsyncNext<=now){vsyncNext=now+vsyncInterval;native_legacy_vsync_observed(3,vsyncHz);}
         vsyncArmed=true;vsyncTimer->wakeAtTime(vsyncNext);
+        if(retireRequest && !retireTimer)kickSwapQueue();
     }
     void startVsync() {
         unsigned hz=native_legacy_refresh_hz();
@@ -634,15 +645,102 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         if(IOWorkLoop *loop=getWorkLoop())loop->removeEventSource(vsyncTimer);
         OSSafeReleaseNULL(vsyncTimer);vsyncArmed=false;
     }
-public:
-    // Called by the GPU client's completion (any thread): the swap is finished on the framebuffer's work loop.
-    void gpuComplete(int status) {
-        struct Args {NativeLegacyDisplay *display;int status;} args={this,status};
+    void startTransferEvents() {
         IOWorkLoop *loop=getWorkLoop();
-        auto action=[](OSObject *,void *a0,void *,void *,void *)->IOReturn {
-            Args *a=static_cast<Args *>(a0);a->display->finishGpuSwap(a->status);return kIOReturnSuccess;
-        };
-        if(loop)loop->runAction(action,this,&args);else finishGpuSwap(status);
+        if(!loop)return;
+        IOTimerEventSource *timer=IOTimerEventSource::timerEventSource(this,&NativeLegacyDisplay::retirementReady);
+        if(timer) {
+            if(loop->addEventSource(timer)==kIOReturnSuccess)retireTimer=timer;
+            else timer->release();
+        }
+        if(!gpuCompletionLock) {
+            gpuCompletionLock=IOLockAlloc();
+            if(!gpuCompletionLock)return;
+            gpuResultReady=false;
+        }
+        IOInterruptEventSource *source=IOInterruptEventSource::interruptEventSource(this,&NativeLegacyDisplay::gpuCopyReady);
+        if(!source)return;
+        if(loop->addEventSource(source)!=kIOReturnSuccess){source->release();return;}
+        source->enable();
+        IOLockLock(gpuCompletionLock);
+        // If stop left a copy at the presenter, its completion must still be consumed.
+        gpuCompletionSource=source;
+        IOLockUnlock(gpuCompletionLock);
+    }
+    void stopTransferEvents() {
+        clearRetirement();
+        IOWorkLoop *loop=getWorkLoop();
+        if(retireTimer) {
+            if(loop)loop->removeEventSource(retireTimer);
+            OSSafeReleaseNULL(retireTimer);
+        }
+        if(!gpuCompletionLock)return;
+        IOLockLock(gpuCompletionLock);
+        IOInterruptEventSource *source=gpuCompletionSource;
+        gpuCompletionSource=nullptr;
+        const bool queued=gpuResultReady;
+        if(queued){
+            gpuResultReady=false;
+            __atomic_store_n(&gpuCopyOutstanding,false,__ATOMIC_RELEASE);
+        }
+        IOLockUnlock(gpuCompletionLock);
+        if(source) {
+            if(loop)loop->removeEventSource(source);
+            source->release();
+        }
+        if(queued)release();
+    }
+    bool gpuCopyBusy() const {
+        return __atomic_load_n(&gpuCopyOutstanding,__ATOMIC_ACQUIRE);
+    }
+    bool offerGpuCopy(IOMemoryDescriptor *memory,uint64_t stride,uint32_t width,uint32_t height,uint32_t format) {
+        if(!gpuCompletionLock)return false;
+        IOLockLock(gpuCompletionLock);
+        if(!gpuCompletionSource || gpuCopyBusy()) {
+            IOLockUnlock(gpuCompletionLock);
+            return false;
+        }
+        retain();   // The presenter keeps only a raw callback target.
+        __atomic_store_n(&gpuCopyOutstanding,true,__ATOMIC_RELEASE);
+        IOLockUnlock(gpuCompletionLock);
+        if(native_legacy_gpu_offer(this,memory,stride,width,height,format))return true;
+        IOLockLock(gpuCompletionLock);
+        __atomic_store_n(&gpuCopyOutstanding,false,__ATOMIC_RELEASE);
+        IOLockUnlock(gpuCompletionLock);
+        release();
+        return false;
+    }
+    static void gpuCopyReady(OSObject *owner,IOInterruptEventSource *,int) {
+        auto *display=static_cast<NativeLegacyDisplay *>(owner);
+        IOLockLock(display->gpuCompletionLock);
+        if(!display->gpuResultReady) {
+            IOLockUnlock(display->gpuCompletionLock);
+            return;
+        }
+        const int status=display->gpuResult;
+        display->gpuResultReady=false;
+        __atomic_store_n(&display->gpuCopyOutstanding,false,__ATOMIC_RELEASE);
+        IOLockUnlock(display->gpuCompletionLock);
+        display->finishGpuSwap(status);
+        display->release();
+    }
+public:
+    // Called without the family gate. Signal the preallocated work source and return to the presenter.
+    void gpuComplete(int status) {
+        if(!gpuCompletionLock)return;
+        bool stopped=false;
+        IOLockLock(gpuCompletionLock);
+        if(gpuCopyBusy() && !gpuResultReady) {
+            if(gpuCompletionSource) {
+                gpuResult=status;gpuResultReady=true;
+                gpuCompletionSource->interruptOccurred(nullptr,nullptr,0);
+            } else {
+                __atomic_store_n(&gpuCopyOutstanding,false,__ATOMIC_RELEASE);
+                stopped=true;
+            }
+        }
+        IOLockUnlock(gpuCompletionLock);
+        if(stopped)release();
     }
     void forgetDirectDisplay() {
         if(IOLock *lock=__atomic_load_n(&gDirectDisplayLock,__ATOMIC_ACQUIRE)) {
@@ -657,6 +755,7 @@ public:
         auto shutdown=[](OSObject *,void *argument,void *,void *,void *)->IOReturn {
             auto *display=static_cast<NativeLegacyDisplay *>(argument);
             display->primary=false;
+            display->stopTransferEvents();
             display->transferred=false;display->gpuRequest=nullptr;display->gpuRetired=false;
             for(unsigned i=0;i<8;++i)if(display->validated[i])display->removeValidated(display->validated[i]);
             display->directToBoot();
@@ -695,7 +794,11 @@ public:
         };
         if(loop)loop->runAction(shutdown,this,this);else shutdown(this,this,nullptr,nullptr,nullptr);
     }
-    void free() override {forgetDirectDisplay();stopVsync();if(logicalPM){PMstop();logicalPM=false;}primary=false;OSSafeReleaseNULL(bootMapping);IOMobileFramebufferLegacy::free();}
+    void free() override {
+        forgetDirectDisplay();stopVsync();stopTransferEvents();
+        if(gpuCompletionLock){IOLockFree(gpuCompletionLock);gpuCompletionLock=nullptr;}
+        if(logicalPM){PMstop();logicalPM=false;}primary=false;OSSafeReleaseNULL(bootMapping);IOMobileFramebufferLegacy::free();
+    }
     void stop(IOService *provider) override {
         stopVsync();
         stopDirect();
@@ -714,7 +817,7 @@ public:
         loadFrameOptions();
         if(!startDisplay(provider))return false;
         publishOneLayer();
-        startVsync();startDirect();return true;
+        startTransferEvents();startVsync();startDirect();return true;
     }
     // CoreAnimation reads how many layers the display scans out from IOMFBNumLayers (MaxNumLayers). Without the property it may hand a
     // full-screen layer (an app's Metal layer) to the display as a detached layer of its own, copied through the IOSurfaceAccelerator
@@ -807,7 +910,10 @@ public:
     void kickOnce() {
         stat(1);
         if(!transferEnabled || !logicalPM || !bootMapping || !primary){stat(3);return;}
-        if(transferred || pendingSlot>=0){stat(2);return;}
+        // If the retirement timer was unavailable, a later kick can retry
+        // completion without copying or scanning out the frame again.
+        if(retireRequest && !retireTimer){finishTransfer(retireRequest,forceRetirement);return;}
+        if(transferred || pendingSlot>=0 || gpuCopyBusy()){stat(2);return;}
         const OriginalLegacySwapRequest *request=pendingSwapRequest();
         if(!request || !isValidated(request)){stat(4);return;}
         // This bounded first-frame transfer preserves the original queue's
@@ -897,7 +1003,7 @@ public:
         }
         directToBoot();
         stat(7);note(7,-1,request);
-        if(!gpuBypass && native_legacy_gpu_offer(this,memory,sourceStride,width,height,half?halfOfferFormat:NGP_BGRX8888)) {
+        if(!gpuBypass && offerGpuCopy(memory,sourceStride,width,height,half?halfOfferFormat:NGP_BGRX8888)) {
             // The GPU writes the scanout memory behind the CPU's back: the differential copy's picture of it is stale from now on.
             native_legacy_swap_stage(1);countFormat(half?7:6);
             shadowValid=false;gpuRequest=request;gpuTraceRequest=traceId(request);gpuLength=length;transferred=true;
@@ -972,7 +1078,10 @@ public:
     // The GPU client reported its copy (status 0) or lost it. Success retires the swap like a finished copy; anything else uses the CPU copy.
     void finishGpuSwap(int status) {
         const OriginalLegacySwapRequest *request=gpuRequest;
-        if(!request)return;
+        if(!request) {
+            // The family cancelled the request. This completion only unlocks the next copy.
+            transferred=false;kickSwapQueue();return;
+        }
         gpuRequest=nullptr;
         if(gpuRetired) {
             // The swap retired when the client took it; its copy ending only releases the next frame. A failed copy loses this frame
@@ -1004,13 +1113,25 @@ public:
         native_legacy_retirement_observed(this);
         return true;
     }
-    // Separately gated retirement after a real scanout store, shared by copied and blank frames.
+    void clearRetirement() {
+        if(retireRequest && retireTimer)retireTimer->cancelTimeout();
+        retireRequest=nullptr;
+    }
+    static void retirementReady(OSObject *owner,IOTimerEventSource *) {
+        auto *display=static_cast<NativeLegacyDisplay *>(owner);
+        if(display->retireRequest)display->finishTransfer(display->retireRequest,display->forceRetirement);
+    }
+    // The store or hardware latch already finished. A busy family head retries just its retirement.
     void finishTransfer(const OriginalLegacySwapRequest *request,bool force=false) {
-        // Only after the real copy and store barrier: select the actual pending head and let the unchanged family release it and wake
-        // waiters. This reports memory scanout completion, not a panel vblank or hardware fence.
-        if(!retireSwap(request,force))return;
-        // The unchanged family has retired this generation and released its current reference. Permit the next independently validated
-        // single pending frame. Keep the latch set while completion can reenter this method, and whenever retirement remains disabled.
+        if(!retireEnabled && !force)return;
+        // Compare pointers before attempting activation. The family owns the request and can cancel it.
+        if(isValidated(request) && pendingSwapRequest()==request && !retireSwap(request,force)) {
+            retireRequest=request;forceRetirement=force;
+            if(retireTimer)retireTimer->setTimeoutMS(1);
+            return;
+        }
+        clearRetirement();
+        // Keep transferred set until completion has returned; it can reenter kickSwapQueue.
         transferred=false;
         kickSwapQueue();
     }
@@ -1022,10 +1143,11 @@ public:
     bool cancelSwapsAfterTimeout() override {
         native_legacy_swap_timeouts=native_legacy_swap_timeouts+1;
         clearFenceWait();
+        clearRetirement();
         for(unsigned i=0;i<8;++i)if(validated[i])removeValidated(validated[i]);
         // Keep the pending hardware slot and its timer, but release the family's request reference.
         latchRequest=nullptr;
-        gpuRequest=nullptr;gpuRetired=false;transferred=false;
+        gpuRequest=nullptr;gpuRetired=false;transferred=gpuCopyBusy();
 #if defined(NATIVE_LEGACY_MACOS) && NATIVE_LEGACY_MACOS
         // macOS names this slot are_timings_enabled: disp_has_no_clients_gated reprograms the display with a dummy swap when it is
         // true. The virtual-machine display answers false, as a display with no timing generator does.

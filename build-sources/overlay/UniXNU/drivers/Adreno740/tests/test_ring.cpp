@@ -316,6 +316,25 @@ int main()
         CHECK(r.wait(2,&clock_,5000,&observed)==NativeAdrenoRingFenceArgument);
         CHECK(r.detach()==kIOReturnSuccess);
     }
+    {
+        reset();NativeAdrenoRing r;CHECK(attach(r)==kIOReturnSuccess);
+        const uint32_t word=0xabc;
+        uint32_t issued=0,observed=0;
+        CHECK(r.submit(&word,1,&issued)==kIOReturnSuccess && issued==1);
+        CHECK(r.submit(&word,1,&issued)==kIOReturnSuccess && issued==2);
+        fence[1]=1;
+        CHECK(r.observeFence(2,nullptr,0,&observed)==NativeAdrenoRingFenceTimeout && observed==1);
+        CHECK(r.completedFence()==1 && r.outstanding()==1 && r.detach()==kIOReturnBusy);
+        fence[1]=0;
+        CHECK(r.observeFence(1,nullptr,0,&observed)==NativeAdrenoRingFenceTimeout && observed==0);
+        CHECK(r.completedFence()==1);
+        fence[1]=2;
+        CHECK(r.observeFence(1,nullptr,0,&observed)==NativeAdrenoRingFenceComplete && observed==2);
+        CHECK(r.completedFence()==2 && r.outstanding()==0);
+        peer.regs[0x0806]=r.writePointer();
+        CHECK(r.idle(&clock_,0)==kIOReturnSuccess && r.detach()==kIOReturnSuccess);
+        std::puts("PASS observation updates ring completion without regressing on an older sample");
+    }
     /* Timeline stamps: the CP's always-on counter is read into the fence page before the user words and after them, and read back by fence. */
     {
         reset();NativeAdrenoRing r;

@@ -153,14 +153,18 @@ IOReturn NativeAdrenoMemory::takeSegments(IOBufferMemoryDescriptor *descriptor,s
     span_capacity_=bytes/4096;
     spans_=IONewData(NativeAdrenoPhysicalSpan,span_capacity_);
     if(!spans_)return kIOReturnNoMemory;
-    for(size_t offset=0;offset<bytes;offset+=4096) {
+    for(size_t offset=0;offset<bytes;) {
         IOByteCount length=0;
-        addr64_t physical=descriptor->getPhysicalSegment(offset,&length,kIOMemoryMapperNone);
-        if(!physical || (physical&4095) || length<4096 || physical>=limit || 4096>limit-physical)return kIOReturnUnsupported;
+        const addr64_t physical=descriptor->getPhysicalSegment(offset,&length,kIOMemoryMapperNone);
+        if(length>bytes-offset)length=bytes-offset;
+        length&=~IOByteCount(4095);
+        if(!physical || (physical&4095) || !length || physical>=limit || length>limit-physical)
+            return kIOReturnUnsupported;
         if(contiguous && offset && physical!=spans_[0].physical+offset)return kIOReturnUnsupported;
         if(span_count_ && physical==spans_[span_count_-1].physical+spans_[span_count_-1].bytes)
-            spans_[span_count_-1].bytes+=4096;
-        else spans_[span_count_++]={offset,physical,4096};
+            spans_[span_count_-1].bytes+=length;
+        else spans_[span_count_++]={offset,physical,length};
+        offset+=length;
     }
     return kIOReturnSuccess;
 }
@@ -227,7 +231,8 @@ failed:
 }
 /* No task: the memory is mapped nowhere until a client view maps it. The cache mode is the memory entry's, so every mapping of it (the
  * client views) and the pages themselves take it. */
-static IOBufferMemoryDescriptor *systemDescriptor(size_t bytes,bool write_combined,uint64_t *made=nullptr,uint64_t *wired=nullptr)
+static IOReturn systemDescriptor(size_t bytes,bool write_combined,unsigned bits,IOBufferMemoryDescriptor *&out,
+    uint64_t *made=nullptr,uint64_t *wired=nullptr)
 {
     IOOptionBits options=static_cast<IOOptionBits>(kIODirectionInOut)|static_cast<IOOptionBits>(kIOMemoryMapperNone)|
         static_cast<IOOptionBits>(kIOMemoryPageable);
@@ -238,28 +243,50 @@ static IOBufferMemoryDescriptor *systemDescriptor(size_t bytes,bool write_combin
      * 64 MiB) took 163 ms each at the median and 21.7 s in all, synchronously in the caller (the render server's and the widget
      * renderer's allocations, the stalls at an app launch and on the widget page), while every success was 64 to 128 KiB. So larger
      * BOs never ask, and after a failure no request of that size or larger asks again for 5 s. */
-    static uint32_t contigKiB=UINT32_MAX;
-    if(contigKiB==UINT32_MAX) {contigKiB=0;PE_parse_boot_argn("gpu-bo-contig",&contigKiB,sizeof contigKiB);}
-    static const size_t contigMax=size_t(128)*1024;
-    static size_t failedBytes=0;
+    static uint32_t cachedMinimum=UINT32_MAX;
+    uint32_t contigKiB=__atomic_load_n(&cachedMinimum,__ATOMIC_RELAXED);
+    if(contigKiB==UINT32_MAX) {
+        contigKiB=0;
+        PE_parse_boot_argn("gpu-bo-contig",&contigKiB,sizeof contigKiB);
+        __atomic_store_n(&cachedMinimum,contigKiB,__ATOMIC_RELAXED);
+    }
+    constexpr size_t contigMax=size_t(128)*1024;
+    static bool scanning=false;
+    static size_t failedBytes=0;   /* read and written only while holding the scan reservation */
     static uint64_t failedAt=0,backoff=0;
-    if(!backoff)nanoseconds_to_absolutetime(UINT64_C(5000000000),&backoff);
-    const uint64_t now=mach_absolute_time();
-    if(failedBytes && now-failedAt>=backoff)failedBytes=0;
-    if(contigKiB && bytes>=size_t(contigKiB)*1024 && bytes<=contigMax && !(failedBytes && bytes>=failedBytes)) {
-        IOBufferMemoryDescriptor *run=IOBufferMemoryDescriptor::inTaskWithPhysicalMask(nullptr,
-            (options&~static_cast<IOOptionBits>(kIOMemoryPageable))|static_cast<IOOptionBits>(kIOMemoryPhysicallyContiguous),bytes,UINT64_C(0xfffffffff000));
-        if(run && run->prepare()==kIOReturnSuccess) {native_adreno_bo_contig[0]=native_adreno_bo_contig[0]+1;return run;}
-        if(run)run->release();
-        native_adreno_bo_contig[1]=native_adreno_bo_contig[1]+1;
-        if(!failedBytes || bytes<failedBytes)failedBytes=bytes;
-        failedAt=now;
+    if(contigKiB && bytes>=uint64_t(contigKiB)*1024 && bytes<=contigMax &&
+        !__atomic_exchange_n(&scanning,true,__ATOMIC_ACQUIRE)) {
+        IOBufferMemoryDescriptor *run=nullptr;
+        if(!backoff)nanoseconds_to_absolutetime(UINT64_C(5000000000),&backoff);
+        if(failedBytes && mach_absolute_time()-failedAt>=backoff)failedBytes=0;
+        if(!failedBytes || bytes<failedBytes) {
+            const uint64_t mask=((UINT64_C(1)<<(bits?bits:40))-1)&~UINT64_C(4095);
+            run=IOBufferMemoryDescriptor::inTaskWithPhysicalMask(nullptr,
+                (options&~static_cast<IOOptionBits>(kIOMemoryPageable))|static_cast<IOOptionBits>(kIOMemoryPhysicallyContiguous),bytes,mask);
+            if(run && run->prepare()!=kIOReturnSuccess) {run->release();run=nullptr;}
+            if(run) native_adreno_bo_contig[0]=native_adreno_bo_contig[0]+1;
+            else {
+                native_adreno_bo_contig[1]=native_adreno_bo_contig[1]+1;
+                if(!failedBytes || bytes<failedBytes)failedBytes=bytes;
+                failedAt=mach_absolute_time();
+            }
+        }
+        __atomic_store_n(&scanning,false,__ATOMIC_RELEASE);
+        if(run) {
+            out=run;
+            return kIOReturnSuccess;
+        }
     }
     IOBufferMemoryDescriptor *descriptor=IOBufferMemoryDescriptor::inTaskWithOptions(nullptr,options,bytes,4096);
     if(made)*made=mach_absolute_time();
-    if(descriptor && descriptor->prepare()!=kIOReturnSuccess) {descriptor->release();descriptor=nullptr;}
+    const IOReturn status=descriptor?descriptor->prepare():kIOReturnNoMemory;
     if(wired)*wired=mach_absolute_time();
-    return descriptor;
+    if(status!=kIOReturnSuccess) {
+        if(descriptor)descriptor->release();
+        return status;
+    }
+    out=descriptor;
+    return kIOReturnSuccess;
 }
 IOReturn NativeAdrenoMemory::prepareSystem(size_t bytes,bool write_combined,NativeAdrenoSystemPages *out,unsigned bits)
 {
@@ -274,8 +301,9 @@ IOReturn NativeAdrenoMemory::prepareSystem(size_t bytes,bool write_combined,Nati
         }
     }
     uint64_t made=0,wired=0;
-    IOBufferMemoryDescriptor *descriptor=systemDescriptor(bytes,write_combined,&made,&wired);
-    if(!descriptor)return kIOReturnNoMemory;
+    IOBufferMemoryDescriptor *descriptor=nullptr;
+    const IOReturn status=systemDescriptor(bytes,write_combined,bits,descriptor,&made,&wired);
+    if(status!=kIOReturnSuccess)return status;
     if(!made)made=wired=mach_absolute_time();   /* a contiguous run: made and wired in one step */
     if(descriptor->getLength()!=bytes) {descriptor->complete();descriptor->release();return kIOReturnUnsupported;}
     bool cleaned=false;
@@ -318,7 +346,8 @@ IOReturn NativeAdrenoMemory::allocateSystem(size_t bytes,unsigned bits,size_t bu
     } else if(prepared || NativeAdrenoPoolAllocate(bytes,UINT64_C(1)<<bits,write_combined,&grant_)!=kIOReturnSuccess) {
         /* A caller that offers prepared pages holds the driver's lock: the pool's zero fill maps its run in the kernel map and is not
          * done under it (prepareSystem already asked the pool, outside the lock). */
-        grant_=nullptr;descriptor_=systemDescriptor(bytes,write_combined);
+        grant_=nullptr;
+        status=systemDescriptor(bytes,write_combined,bits,descriptor_);
     }
     if(grant_) {
         /* Pool pages: the grant's runs are the spans. A grant that does not fit this client's physical limit after all (it was
@@ -328,10 +357,9 @@ IOReturn NativeAdrenoMemory::allocateSystem(size_t bytes,unsigned bits,size_t bu
             if(spans_)IODeleteData(spans_,NativeAdrenoPhysicalSpan,span_capacity_);
             spans_=nullptr;span_count_=span_capacity_=0;
             NativeAdrenoPoolRelease(grant_);grant_=nullptr;cleaned=false;
-            descriptor_=systemDescriptor(bytes,write_combined);
+            status=systemDescriptor(bytes,write_combined,bits,descriptor_);
         }
     }
-    status=descriptor_ || grant_?kIOReturnSuccess:kIOReturnNoMemory;
     if(status==kIOReturnSuccess) {
         system_=true;prepared_=true;bytes_=bytes;write_combined_=write_combined;owner_pid_=proc_selfpid();noteSystem((int64_t)bytes,owner_pid_);
         if(descriptor_)status=descriptor_->getLength()==bytes?takeSegments(descriptor_,bytes,UINT64_C(1)<<bits,false):kIOReturnUnsupported;
@@ -355,7 +383,8 @@ IOReturn NativeAdrenoMemory::allocateSystem(size_t bytes,unsigned bits,size_t bu
 /* An import holds the pages through a memory entry of its own (kIOMemoryPersistent), which references the VM object: the owner may unmap
  * its range while the GPU still uses it (Core Animation frees an image's Shmem once its no-copy buffer is released, before the runtime frees
  * the import), and the object then lives on until the import completes instead of being torn down under a wired UPL (int-233..235: the render
- * thread stuck in vm_deallocate). A range no memory entry can be made of is imported as before; [0] counts the persistent imports, [1] those. */
+ * thread stuck in vm_deallocate). [0] counts persistent descriptors created, [1] fallback descriptors created, including those that fail
+ * later in prepare. Live, successfully pinned imports are counted separately in native_adreno_import_memory. */
 extern "C" {volatile uint32_t native_adreno_import_persistent[2];}
 /* Imports whose pages were all non-cacheable ([1]: no CPU maintenance for them) or not ([0]). */
 extern "C" {volatile uint32_t native_adreno_pool_stats_uncached[2];}

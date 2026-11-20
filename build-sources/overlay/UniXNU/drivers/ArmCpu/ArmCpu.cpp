@@ -2,6 +2,7 @@
 #include <IOKit/IOCPU.h>
 #include <IOKit/IODeviceTreeSupport.h>
 #include <IOKit/IOMemoryDescriptor.h>
+#include <IOKit/IOLib.h>
 #include <IOKit/IOLocks.h>
 #include <libkern/c++/OSData.h>
 #include <libkern/c++/OSSymbol.h>
@@ -52,8 +53,7 @@ volatile uint32_t armcpu_smp_step[8], armcpu_smp_mpidr[8], armcpu_smp_seen_mpidr
 // System registers seen on each secondary core at initCPU entry: CurrentEL, SCTLR_EL1, TCR_EL1, MAIR_EL1 (low words), MIDR_EL1.
 volatile uint32_t armcpu_smp_sys[8][5], armcpu_boot_sys[5];
 volatile int32_t armcpu_smp_psci_rc[8];
-// 1 once the scheduler was told that every core is registered and started (ml_cpu_init_completed, boot-arg armcpu-edge=1). Until then
-// it keeps its start-up state: no thread moves between the clusters.
+// 1 once all CPUs are registered and the opt-in scheduler initialization has completed.
 volatile uint32_t armcpu_cpu_init_completed = 0;
 // PSCI as the firmware answers it, asked once with boot-arg diag=1: 0 how far the questions went (0 not asked, 1 version only, 2 all),
 // 1 PSCI_VERSION, 2 PSCI_FEATURES of CPU_SUSPEND (negative: absent; bit 0 OS-initiated mode, bit 1 extended state IDs),
@@ -275,6 +275,7 @@ static volatile uint32_t gGicShared = 0;
 static uint64_t gRedistStride = 0; // DT redistributor-stride; 0 = infer from GICR_TYPER.VLPIS
 volatile uint32_t armcpu_gic_stride = 0, armcpu_gic_typer_probe[2];
 static bool gSmpWanted = false;
+static bool gEdgeWanted = false;
 // Secondary nubs never wait for the boot CPU (IOSleep needs the timer that only the boot nub enables): they queue here and
 // the boot nub, or a late secondary once the boot CPU is registered, finishes them.
 static class ArmCpu *volatile gPending[ARMCPU_SMP_SLOTS];
@@ -289,6 +290,7 @@ static bool gRemoteGic = false; // smp-gic=1: the boot CPU prepares a new core's
 struct ArmCpuSpi {uint32_t id; void (*handler) (void *); void *context; volatile uint64_t count;};
 static ArmCpuSpi gSpi[ARMCPU_SPI_SLOTS];
 static uint32_t gSpiRoutes[1024];
+static bool gSpiPreparing[1020]; // Protected by the registration lock.
 static volatile uint32_t gSpiUsed = 0;
 static uint64_t gBootAffinity = 0;
 static IOLock *gSpiRegistrationLock;
@@ -592,7 +594,7 @@ bool ArmCpu::start (IOService *provider)
   secondary = logicalId != static_cast<uint32_t> (ml_get_boot_cpu_number ());
   if (secondary) {
     if (!IOCPU::start (provider)) { return false; }
-    armcpu_smp_step[logicalId] = 1;
+    __atomic_store_n (&armcpu_smp_step[logicalId], 1U, __ATOMIC_RELAXED);
     affinity = physical;
     armcpu_smp_mpidr[logicalId] = physical;
     cpuName = OSSymbol::withCStringNoCopy ("ARM architectural secondary CPU");
@@ -629,6 +631,9 @@ bool ArmCpu::start (IOService *provider)
   unsigned smp = 0;
   PE_parse_boot_argn ("smp", &smp, sizeof (smp));
   gSmpWanted = smp != 0;
+  unsigned edge = 0;
+  PE_parse_boot_argn ("armcpu-edge", &edge, sizeof (edge));
+  gEdgeWanted = edge != 0;
   unsigned remote = 0;
   PE_parse_boot_argn ("smp-gic", &remote, sizeof (remote));
   gRemoteGic = remote != 0;
@@ -682,12 +687,14 @@ bool ArmCpu::finishSecondary (void)
   info.powergate_latency = gIdleLatencyNs;
   if (gStats) { info.processor_idle = &ArmCpu::idleNotify; }
   __atomic_fetch_or (&gCoreSeen, 1U << (logicalId & 7), __ATOMIC_RELEASE);
+  // Registration can start the target immediately. Set initial IOCPU state
+  // before it can publish kIOCPUStateRunning from initCPU.
+  setCPUNumber (info.log_id);
+  __atomic_store_n (&armcpu_smp_step[logicalId], 2U, __ATOMIC_RELAXED);
+  setCPUState (kIOCPUStateUninitalized);
   perfmon_interrupt_handler_func pmi = nullptr;
   kern_return_t status = ml_processor_register (&info, &machProcessor, &ipi_handler, &pmi);
   if (status != KERN_SUCCESS) { armcpu_smp_fail[logicalId] = 4; return false; }
-  setCPUNumber (info.log_id);
-  armcpu_smp_step[logicalId] = 2;
-  setCPUState (kIOCPUStateUninitalized);
   registerService ();
   startSecondary ();
   return true;
@@ -724,23 +731,36 @@ static int64_t psciCall (bool hvc, uint64_t function, uint64_t a, uint64_t b, ui
   return static_cast<int64_t> (x0);
 }
 
+static void completeSchedulerAfterCpuStartup (unsigned expected)
+{
+  static uint32_t startRequestsReturned = 0;
+  if (expected < 2 || expected > ARMCPU_SMP_SLOTS ||
+      __atomic_add_fetch (&startRequestsReturned, 1U, __ATOMIC_ACQ_REL) != expected - 1) { return; }
+
+  // Registration boots asynchronously on newer XNU, and its legacy start
+  // entry point returns immediately. Wait for each secondary's initCPU.
+  uint64_t deadline;
+  clock_interval_to_deadline (5, NSEC_PER_SEC, &deadline);
+  while (__atomic_load_n (&armcpu_smp_running, __ATOMIC_ACQUIRE) != expected - 1) {
+    if (mach_absolute_time () >= deadline) {
+      IOLog ("ArmCpu: CPU startup incomplete; scheduler finalization skipped\n");
+      return;
+    }
+    IOSleep (1);
+  }
+  ml_cpu_init_completed ();
+  __atomic_store_n (&armcpu_cpu_init_completed, 1U, __ATOMIC_RELEASE);
+}
+
 void ArmCpu::startThread (void *argument, wait_result_t)
 {
   ArmCpu *self = static_cast<ArmCpu *> (argument);
-  armcpu_smp_step[self->logicalId] = 3;
-  // Kernels that leave the start to the driver block here until the new core reaches the scheduler; a core that never arrives only
-  // stalls this helper thread. Kernels that start a core when it registers return at once.
+  uint32_t registering = 2;
+  __atomic_compare_exchange_n (&armcpu_smp_step[self->logicalId], &registering, 3U, false,
+      __ATOMIC_RELAXED, __ATOMIC_RELAXED);
+  // Older XNU leaves the start to the driver and can block in this call.
   processor_start (self->machProcessor);
-  // Once every secondary core has started, the scheduler sets up its cluster edges (Edge migration and steal rules).
-  static uint32_t started = 0;
-  // armcpu-edge=0 leaves the Edge matrix all-disallowed (no thread moves between clusters). On iPadOS 27 the matrix fails the scheduler's
-  // own consistency check, which the kernel now reports instead of asserting.
-  unsigned edge = 0;
-  PE_parse_boot_argn ("armcpu-edge", &edge, sizeof (edge));
-  if (__atomic_add_fetch (&started, 1U, __ATOMIC_ACQ_REL) + 1 == ml_get_topology_info ()->num_cpus && edge != 0) {
-    ml_cpu_init_completed ();
-    armcpu_cpu_init_completed = 1;
-  }
+  if (gEdgeWanted) { completeSchedulerAfterCpuStartup (ml_get_topology_info ()->num_cpus); }
   thread_terminate (current_thread ());
 }
 
@@ -758,14 +778,14 @@ void ArmCpu::initCPU (bool boot)
 {
   if (secondary) {
     if (!boot) { panic ("ArmCpu: secondary resume is unsupported"); }
-    armcpu_smp_step[logicalId] = 5;
+    __atomic_store_n (&armcpu_smp_step[logicalId], 5U, __ATOMIC_RELAXED);
     uint64_t mpidr;
     __asm__ volatile ("mrs %0, mpidr_el1" : "=r" (mpidr));
     armcpu_smp_seen_mpidr[logicalId] = static_cast<uint32_t> (mpidr);
     // A failure is recorded and the core parked (rather than a panic that hides the other cores' state).
     if ((mpidr & 0xffff) != (affinity & 0xffff)) { armcpu_smp_fail[logicalId] = 1; parkCore (); }
     if (!gRemoteGic && !wakeRedistributor (true)) { armcpu_smp_fail[logicalId] = 2; parkCore (); }
-    armcpu_smp_step[logicalId] = 6;
+    __atomic_store_n (&armcpu_smp_step[logicalId], 6U, __ATOMIC_RELAXED);
     enableGic ();
     if (gSpiIpi) { spiIpiConfigure (gDist, logicalId, affinity); }
     // The shared IOCPUInterruptController blocks registrations until every core is enabled, so the secondary cores
@@ -773,11 +793,11 @@ void ArmCpu::initCPU (bool boot)
     ml_install_interrupt_handler (this, static_cast<int> (logicalId), this, reinterpret_cast<IOInterruptHandler> (&ArmCpu::dispatch), nullptr);
     enableCPUTimeBase (true);
     setCPUState (kIOCPUStateRunning);
-    armcpu_smp_step[logicalId] = 7;
-    __atomic_fetch_add (&armcpu_smp_running, 1, __ATOMIC_RELAXED);
+    __atomic_store_n (&armcpu_smp_step[logicalId], 7U, __ATOMIC_RELAXED);
     // XNU clears SIGPdisabled for a core the first time that core takes an IPI, and cpu_signal() silently skips a core until then; Apple's
     // CPU driver provokes it with a self-IPI from initCPU (osfmk/kern/machine.c, processor_up).
     if (gSelfIpi) { signalCPU (this); }
+    __atomic_fetch_add (&armcpu_smp_running, 1, __ATOMIC_ACQ_REL);
     return;
   }
   if (!boot) { panic ("ArmCpu: secondary/resume CPU startup is unsupported"); }
@@ -895,7 +915,7 @@ void ArmCpu::signalCPU (IOCPU *target)
   uint64_t aff = peer->signalTarget ();
   uint64_t sgi = ((aff & 0xff00000000ULL) << 16) | ((aff & 0xff0000) << 16) |
                  ((aff & 0xff00) << 8) | (1ULL << (aff & 0xff));
-  armcpu_ipi_sent = armcpu_ipi_sent + 1;
+  __atomic_fetch_add (&armcpu_ipi_sent, 1, __ATOMIC_RELAXED);
   // The kernel's cpu_signal path calls this on the sending core with interrupts masked, so that core's statistics need no lock and
   // nothing runs between the two counter reads. The start-up IPI a core sends itself from initCPU is counted but neither stamped
   // nor timed: the core takes it only when it first unmasks interrupts, which is not a cross-core delay, and on the boot core
@@ -1032,7 +1052,7 @@ extern "C" void armcpu_sgi_selfprobe (uint64_t *out)
 extern "C" void armcpu_ipi_selftest (uint64_t aff)
 {
   uint64_t sgi = ((aff & 0xff00000000ULL) << 16) | ((aff & 0xff0000) << 16) | ((aff & 0xff00) << 8) | (1ULL << (aff & 0xff));
-  armcpu_ipi_selftest_sent = armcpu_ipi_selftest_sent + 1;
+  __atomic_fetch_add (&armcpu_ipi_selftest_sent, 1, __ATOMIC_RELAXED);
   if (gSpiIpi) { spiIpiSend (gDist, static_cast<uint32_t> ((aff >> 8) & 7)); return; }
   __asm__ volatile ("dsb ishst; msr icc_sgi1r_el1, %0; isb" :: "r" (sgi) : "memory");
 }
@@ -1100,7 +1120,7 @@ kern_return_t ArmCpu::startCPU (vm_offset_t, vm_offset_t)
   cleanToMemory (LowResetVectorBase, 0x10000);   // reset vector, start_cpu and the code up to the MMU enable
   cleanToMemory (ResetHandlerData, 0x1000);
   cleanToMemory (const_boot_args, 0x1000);
-  armcpu_smp_step[logicalId] = 4;
+  __atomic_store_n (&armcpu_smp_step[logicalId], 4U, __ATOMIC_RELAXED);
   int64_t result = psciCall (hvc, 0xc4000003ULL, affinity & 0xff00ffffffULL, entry, 0);
   armcpu_smp_psci_rc[logicalId] = static_cast<int32_t> (result);
   return result == 0 ? KERN_SUCCESS : KERN_FAILURE;
@@ -1111,27 +1131,60 @@ const OSSymbol *ArmCpu::getCPUName (void)
   return cpuName;
 }
 
-// Readback after configuration: bit 0 group 1, bit 1 enabled, bit 2 edge, bits 8..15 priority; IROUTER separately.
-static IOReturn spiAttachUnlocked (uint32_t intid, bool edge, void (*handler) (void *), void *context,
-                                   uint32_t *readback, uint64_t *router)
+static void waitForSpiRegistration (IOLock *lock, uint32_t intid)
+{
+  while (gSpiPreparing[intid]) {
+    IOLockSleep (lock, &gSpiPreparing[intid], THREAD_UNINT);
+  }
+}
+
+// The registration lock is held on entry and return. Readback after configuration:
+// bit 0 group 1, bit 1 enabled, bit 2 edge, bits 8..15 priority; IROUTER separately.
+static IOReturn spiAttachLocked (IOLock *lock, uint32_t intid, bool edge, void (*handler) (void *), void *context,
+                                 uint32_t *readback, uint64_t *router)
 {
   if (gDist == 0 || armcpu_gic_ready == 0 || handler == nullptr) { return kIOReturnNotReady; }
   const unsigned interrupts = ((read32 (gDist, 4) & 31) + 1) * 32;
   if (intid < 32 || intid >= 1020 || intid >= interrupts) { return kIOReturnBadArgument; }
-  const uint32_t used = __atomic_load_n (&gSpiUsed, __ATOMIC_ACQUIRE);
+  waitForSpiRegistration (lock, intid);
+  uint32_t used = __atomic_load_n (&gSpiUsed, __ATOMIC_ACQUIRE);
   for (uint32_t slot = 0; slot < used; slot++) {
     if (gSpi[slot].id == intid) { return kIOReturnExclusiveAccess; }
   }
   if (used >= ARMCPU_SPI_SLOTS) { return kIOReturnNoResources; }
-  const uint32_t word = (intid / 32) * 4, bit = 1U << (intid % 32);
-  write32 (gDist, 0x180 + word, bit); // ICENABLER while it is reconfigured
-  if (!waitClear (gDist, 0, 1U << 31)) { return kIOReturnTimeout; }
   if (!gSpiControlLock) { gSpiControlLock = IOSimpleLockAlloc (); }
   if (!gSpiControlLock) { return kIOReturnNoResources; }
+
+  const uint32_t word = (intid / 32) * 4, bit = 1U << (intid % 32);
+  gSpiPreparing[intid] = true;
+  const bool wasEnabled = (read32 (gDist, 0x100 + word) & bit) != 0;
+  write32 (gDist, 0x180 + word, bit); // ICENABLER while it is reconfigured
+  // RWP tracks disable propagation. Reserve only this INTID while waiting so
+  // another registration can proceed, and keep the shared register RMWs locked.
+  IOLockUnlock (lock);
+  uint64_t deadline;
+  clock_interval_to_deadline (1, NSEC_PER_SEC, &deadline);
+  bool ready = true;
+  while (read32 (gDist, 0) & (1U << 31)) {
+    if (mach_absolute_time () >= deadline) { ready = false; break; }
+    IOSleep (1);
+  }
+  IOLockLock (lock);
+  gSpiPreparing[intid] = false;
+  IOLockWakeup (lock, &gSpiPreparing[intid], false);
+  if (!ready) { return kIOReturnTimeout; }
+  used = __atomic_load_n (&gSpiUsed, __ATOMIC_ACQUIRE);
+  if (used >= ARMCPU_SPI_SLOTS) {
+    if (wasEnabled) { spiSetEnabled (intid, true); }
+    return kIOReturnNoResources;
+  }
   if (!edge) {
     gSpiLine[used].retry = thread_call_allocate_with_options (spiRetry, &gSpi[used],
         THREAD_CALL_PRIORITY_KERNEL, THREAD_CALL_OPTIONS_ONCE);
-    if (!gSpiLine[used].retry) { return kIOReturnNoResources; }
+    if (!gSpiLine[used].retry) {
+      if (wasEnabled) { spiSetEnabled (intid, true); }
+      return kIOReturnNoResources;
+    }
   }
   write32 (gDist, 0x80 + word, read32 (gDist, 0x80 + word) | bit); // IGROUPR: group 1 (RAZ/WI if secure owns it)
   *reinterpret_cast<volatile uint8_t *> (gDist + 0x400 + intid) = 0xa0;
@@ -1158,7 +1211,7 @@ extern "C" IOReturn armcpu_spi_attach (uint32_t intid, bool edge, void (*handler
   IOLock *lock = spiRegistrationLock ();
   if (lock == nullptr) { return kIOReturnNoResources; }
   IOLockLock (lock);
-  IOReturn result = spiAttachUnlocked (intid, edge, handler, context, readback, router);
+  IOReturn result = spiAttachLocked (lock, intid, edge, handler, context, readback, router);
   IOLockUnlock (lock); return result;
 }
 
@@ -1170,6 +1223,7 @@ extern "C" IOReturn armcpu_spi_share (uint32_t intid, void (*handler) (void *), 
   IOLock *lock = spiRegistrationLock ();
   if (lock == nullptr) { return kIOReturnNoResources; }
   IOLockLock (lock);
+  waitForSpiRegistration (lock, intid);
   const uint32_t used = __atomic_load_n (&gSpiUsed, __ATOMIC_ACQUIRE);
   bool found = false; IOReturn result = kIOReturnSuccess;
   for (uint32_t slot = 0; slot < used; ++slot) {
@@ -1177,7 +1231,7 @@ extern "C" IOReturn armcpu_spi_share (uint32_t intid, void (*handler) (void *), 
     found = true;
     if (gSpi[slot].handler == handler && gSpi[slot].context == context) { IOLockUnlock (lock); return kIOReturnSuccess; }
   }
-  if (!found) { result = spiAttachUnlocked (intid, false, handler, context, nullptr, nullptr); }
+  if (!found) { result = spiAttachLocked (lock, intid, false, handler, context, nullptr, nullptr); }
   else if (read32 (gDist, 0xc00 + (intid / 16) * 4) & (2U << ((intid % 16) * 2))) { result = kIOReturnBadArgument; }
   else if (used >= ARMCPU_SPI_SLOTS) { result = kIOReturnNoResources; }
   else {
@@ -1224,15 +1278,15 @@ extern "C" unsigned armcpu_stats_row (unsigned index, char *row, unsigned size)
   if (row == nullptr || size == 0) { return 0; }
   const uint32_t seen = __atomic_load_n (&gCoreSeen, __ATOMIC_ACQUIRE);
   if (index == 0) {
-    // Sums of the per-core counters, each written by its own core only. armcpu_ipi_sent and armcpu_ipi_interrupts are shared by
-    // all cores without a lock and lose counts.
+    // Sum the counters maintained separately by each core.
     uint64_t sent = 0, taken = 0, deferred = 0, cancelled = 0;
     for (unsigned c = 0; c < ARMCPU_SMP_SLOTS; c++) {
       sent += gCore[c].sent; taken += armcpu_core_sgi[c]; deferred += gCore[c].sentDeferred; cancelled += gCore[c].cancelled;
     }
     snprintf (row, size, "[cpu wake] ipi sent=%llu taken=%llu deferred=%llu cancel=%llu | sched init completed=%u | idle latency us=%u | psci ",
               static_cast<unsigned long long> (sent), static_cast<unsigned long long> (taken),
-              static_cast<unsigned long long> (deferred), static_cast<unsigned long long> (cancelled), armcpu_cpu_init_completed,
+              static_cast<unsigned long long> (deferred), static_cast<unsigned long long> (cancelled),
+              __atomic_load_n (&armcpu_cpu_init_completed, __ATOMIC_ACQUIRE),
               gIdleLatencyNs / 1000U);
     const unsigned n = static_cast<unsigned> (strnlen (row, size));
     if (n + 1 < size) {
