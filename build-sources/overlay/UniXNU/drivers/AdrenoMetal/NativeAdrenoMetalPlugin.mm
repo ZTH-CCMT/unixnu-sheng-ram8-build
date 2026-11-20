@@ -11,6 +11,8 @@
 #include <string>
 #include <sys/stat.h>
 #include <dirent.h>
+#include <fcntl.h>
+#include <errno.h>
 #include <sys/mount.h>
 #include <os/log.h>
 #include "NativeRenderServer.h"
@@ -245,12 +247,23 @@ static void configureQuartzCoreFramebuffer(Gpu *gpu) {
 // "<step> <detail>", through the marker stream (a connection is not needed). The Gpu object is made only on this path.
 // Deletes every "*.import" file under `root`: the copying import of an earlier image wrote each file beside its place and renamed it only
 // once the whole pack was read; a boot that ended first left them all there.
+static bool ownedCacheDirectory(const char *path) {
+    if (mkdir(path, 0700) && errno != EEXIST) return false;
+    const int fd = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) return false;
+    struct stat st = {};
+    const bool owned = fstat(fd, &st) == 0 && S_ISDIR(st.st_mode) &&
+                       st.st_uid == geteuid() && !(st.st_mode & (S_IWGRP | S_IWOTH));
+    close(fd);
+    return owned;
+}
 static void removeHalfImported(const char *root) {
     char *paths[] = {const_cast<char *>(root), nullptr};
     FTS *fts = fts_open(paths, FTS_PHYSICAL | FTS_NOCHDIR | FTS_XDEV, nullptr);
     if (!fts) return;
     while (FTSENT *e = fts_read(fts))
-        if (e->fts_info == FTS_F && e->fts_namelen > 7 && !strcmp(e->fts_name + e->fts_namelen - 7, ".import")) unlink(e->fts_path);
+        if (e->fts_info == FTS_F && e->fts_statp && e->fts_statp->st_uid == geteuid() &&
+            e->fts_namelen > 7 && !strcmp(e->fts_name + e->fts_namelen - 7, ".import")) unlink(e->fts_path);
     fts_close(fts);
 }
 // diag=1 in the render server: the bridge's telemetry table (native_bridge_metal_telemetry) to the kernel's board log every six
@@ -328,7 +341,7 @@ static id clientDevice(unsigned port) {
     if (!confstr(_CS_DARWIN_USER_TEMP_DIR, candidates[1], sizeof candidates[1] - 16)) candidates[1][0] = 0;
     strlcpy(candidates[2], sharedShaderCacheDirectory().c_str(), sizeof candidates[2]);
     id device = nil;
-    const char *lastError = "";
+    std::string lastError;
     unsigned usable = 0;
     for (unsigned i : {2u, 0u, 1u}) {
         if (device) break;
@@ -339,8 +352,7 @@ static id clientDevice(unsigned port) {
         // limit within seconds).
         if (i == 0) {strlcat(candidates[i], "com.apple.metal", sizeof candidates[i]); mkdir(candidates[i], 0700); strlcat(candidates[i], "/", sizeof candidates[i]);}
         if (i != 2) strlcat(candidates[i], "m2v", sizeof candidates[i]);
-        mkdir(candidates[i], 0700);
-        if (access(candidates[i], W_OK) != 0) continue;
+        if (!ownedCacheDirectory(candidates[i]) || access(candidates[i], W_OK) != 0) continue;
         ++usable;
         @try {
             device = native_bridge_metal_open(turnip, candidates[i], registryID, nullptr);
@@ -348,20 +360,24 @@ static id clientDevice(unsigned port) {
             device = nil;
             lastError = "exception";
         }
-        if (!device && !lastError[0]) lastError = nmb_last_error();
+        if (!device && lastError.empty()) {
+            if (const char *why = nmb_last_error()) lastError = why;
+        }
     }
     if (!device && !usable) {
         setenv("METAL2VULKAN_SHADER_CACHE_OPTIONAL", "1", 1);
-        const char *path = candidates[0][0] ? candidates[0] : candidates[1][0] ? candidates[1] : "/var/mobile/tmp/m2v";
+        const char *path = "/dev/null"; // Optional cache: no writable, owner-verified directory was available.
         @try {
             device = native_bridge_metal_open(turnip, path, registryID, nullptr);
         } @catch (NSException *exception) {
             device = nil;
             lastError = "exception";
         }
-        if (!device && !lastError[0]) lastError = nmb_last_error();
+        if (!device && lastError.empty()) {
+            if (const char *why = nmb_last_error()) lastError = why;
+        }
     }
-    if (!device) clientFailure(port, usable ? "no-device" : "no-cachedir", lastError);
+    if (!device) clientFailure(port, usable ? "no-device" : "no-cachedir", lastError.c_str());
     // The client's first problem, once, on the same text line, sent from the thread that hit it: WidgetRenderer crashed on a nil render
     // encoder with no reason anywhere readable (its own log lines need the plugin's format strings, which the device does not keep), and a
     // once-a-second reader never ran before the crash (i568).
@@ -562,8 +578,8 @@ static id deviceForPort(unsigned port) {
         char candidates[7][512] = {};
         if (!confstr(_CS_DARWIN_USER_CACHE_DIR, candidates[0], sizeof candidates[0] - 16)) candidates[0][0] = 0;
         if (!confstr(_CS_DARWIN_USER_TEMP_DIR, candidates[1], sizeof candidates[1] - 16)) candidates[1][0] = 0;
-        strlcpy(candidates[2], "/tmp/", sizeof candidates[2]);
-        strlcpy(candidates[3], "/private/var/tmp/", sizeof candidates[3]);
+        snprintf(candidates[2], sizeof candidates[2], "/tmp/m2v-%u", (unsigned)geteuid());
+        snprintf(candidates[3], sizeof candidates[3], "/private/var/tmp/m2v-%u", (unsigned)geteuid());
         // The user temp directory of the mobile user is under /var/mobile/tmp, which launchd's boot task dirs_cleaner empties at every boot,
         // so with a persistent Data store the pipelines were still compiled again each boot (V row hit0). Try the user's Library/Caches first
         // (marker 0x6814); the earlier candidates keep their markers.
@@ -583,9 +599,9 @@ static id deviceForPort(unsigned port) {
             if (device) break;
             if (!candidates[i][0]) continue;
             if (i == 0) {strlcat(candidates[i], "com.apple.metal", sizeof candidates[i]); mkdir(candidates[i], 0700); strlcat(candidates[i], "/", sizeof candidates[i]);}   // as for the clients below
-            if (i < 5) strlcat(candidates[i], "m2v", sizeof candidates[i]);
-            if (i != 6) mkdir(candidates[i], 0700);
-            if (access(candidates[i], W_OK) != 0) continue;
+            if (i < 2 || i == 4) strlcat(candidates[i], "m2v", sizeof candidates[i]);
+            // The macOS system writer directory already checked kernel ownership in writerDirectory().
+            if ((i != 6 && !ownedCacheDirectory(candidates[i])) || access(candidates[i], W_OK) != 0) continue;
             // Files an earlier image's copying import left half written here (int 590aaee2), which hold memory of the Data disk.
             {
                 static bool once;
@@ -609,7 +625,8 @@ static id deviceForPort(unsigned port) {
         if (!device) {
             gpu->mark(0x68f2);
             char text[64];
-            snprintf(text, sizeof text, "PUB no device: %.40s", nmb_last_error());
+            const char *why = nmb_last_error();
+            snprintf(text, sizeof text, "PUB no device: %.40s", why ? why : "no error detail");
             streamText(*gpu, text);
             return nil;
         }

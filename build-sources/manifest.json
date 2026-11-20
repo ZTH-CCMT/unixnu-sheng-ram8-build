@@ -388,13 +388,13 @@
       "repository": "UniXNU/drivers/AdrenoMetal",
       "path": "NativeAdrenoMetalPlugin.mm",
       "before_sha256": "ade7f1657e5979699609d858fd2201df675f4d9fefe40cdf54f312ee1d8f6a0e",
-      "sha256": "8ddd33c96bf360f648bb94618de5599bd60345c8ceb0281360c7fd5997af75b5"
+      "sha256": "a8e51c81d7b72e8f6b81976a6df606dbeb2ba550e7e34097c94a430d36170f50"
     },
     "UniXNU/drivers/AdrenoMetal/NativeBridgeMetalFrontend.mm": {
       "repository": "UniXNU/drivers/AdrenoMetal",
       "path": "NativeBridgeMetalFrontend.mm",
       "before_sha256": "39cb6dd476349dc98423a4c7b9339f6c8a2492fd2d5817e729ae55be0bd65236",
-      "sha256": "c53999589121a8eb49eedb039d2359a0860209eccbc633b010d52b50e4791a07"
+      "sha256": "6d1d550d43bf219be91b1fde9482fd401998db6861f8655eb25212b1abb75aa6"
     },
     "UniXNU/drivers/AdrenoMetal/PrimeShaders.h": {
       "repository": "UniXNU/drivers/AdrenoMetal",

@@ -5182,32 +5182,6 @@ extern "C" bool native_bridge_metal_system_cache(const char *reader,const uint32
 }
 extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint64_t registryID,void (*missing)(const char *,const char *)) {
  if(gDeviceObject)return gDeviceObject;
- gMissing=missing;gInFlight=[NSMutableSet set];
- if(cache && *cache){configureShaderDiskCache(cache);gCacheRoot=cache;}
- gDevice=nmb_device_open(loader,cache);
- if(loader)gLoaderPath=loader;
- if(diagOn() && loader) {
-  if(gpuTraceOn())if(void *library=dlopen(loader,RTLD_NOW|RTLD_NOLOAD))
-   gFrameTransport=(bool (*)(uint32_t,const void *,uint32_t))dlsym(library,"tu_darwin_frame_diagnostic");
-  nmb_gpu_diagnostic_hook(frameRuntime);
- }
- if(!gDevice){NBLOG(@"native-metal: device refused: %s",nmb_last_error());return nil;}
- watchImportPressure();
- logFlowCounts();
- logClientWork();
- logClientMemory();
- // Where this process's pipeline cache is and whose it is: a cache serves the processes of its user that may write its directory.
- // Then the system layer: read from its directory, filled by this process, refused with the level and why, or not named.
- if(diagOn() || logGpuOn()) {
-  static const char *const kStates[]={"none","read","filled","refused"};
-  os_log(OS_LOG_DEFAULT,"NativeAdrenoMetal cache: %{public}s uid %d system %{public}s %{public}s",cache?cache:"none",(int)getuid(),
-   kStates[gSystemCacheState],gSystemCacheText.c_str());
- }
- if(cache && logGpuOn()){gJournalPath=std::string(cache)+"/pipelines-"+std::to_string(getpid())+".log";gJournalBegan=nowUs();}
- char name[128]={};nmb_device_name(gDevice,name,sizeof name);gName=[NSString stringWithUTF8String:name];gRegistryID=registryID;
- // The target families supportsFamily: answers true, with the rows of Apple's tables the device does not meet in them (nmb_device_family_waivers).
- {char waived[4096]={};nmb_device_family_waivers(gDevice,waived,sizeof waived);
-  for(char *line=waived,*next;*line;line=next){next=strchr(line,'\n');if(next)*next++=0;else next=line+strlen(line);journal(std::string("F ")+line);}}
  Class base=objc_getClass("_MTLDevice");
 #if !TARGET_OS_IPHONE
  // Host instrument: on NSObject every selector a client sends that this file lacks reaches the missing hook, instead of the host's
@@ -5224,7 +5198,36 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
 #endif
 #endif
  if(!base)base=[NSObject class];
- Class cls=objc_allocateClassPair(base,"NativeBridgeMetalDevice",0);if(!cls)return nil;
+ Class cls=objc_getClass("NativeBridgeMetalDevice");
+ const bool newClass=!cls;
+ if(newClass)cls=objc_allocateClassPair(base,"NativeBridgeMetalDevice",0);
+ if(!cls || class_getSuperclass(cls)!=base)return nil;
+ gMissing=missing;gInFlight=[NSMutableSet set];
+ if(cache && *cache){configureShaderDiskCache(cache);gCacheRoot=cache;}
+ gDevice=nmb_device_open(loader,cache);
+ if(loader)gLoaderPath=loader;
+ if(diagOn() && loader) {
+  if(gpuTraceOn())if(void *library=dlopen(loader,RTLD_NOW|RTLD_NOLOAD))
+   gFrameTransport=(bool (*)(uint32_t,const void *,uint32_t))dlsym(library,"tu_darwin_frame_diagnostic");
+  nmb_gpu_diagnostic_hook(frameRuntime);
+ }
+ if(!gDevice){
+  if(newClass)objc_disposeClassPair(cls);
+  NBLOG(@"native-metal: device refused: %@",lastError());
+  return nil;
+ }
+ // Where this process's pipeline cache is and whose it is: a cache serves the processes of its user that may write its directory.
+ // Then the system layer: read from its directory, filled by this process, refused with the level and why, or not named.
+ if(diagOn() || logGpuOn()) {
+  static const char *const kStates[]={"none","read","filled","refused"};
+  os_log(OS_LOG_DEFAULT,"NativeAdrenoMetal cache: %{public}s uid %d system %{public}s %{public}s",cache?cache:"none",(int)getuid(),
+   kStates[gSystemCacheState],gSystemCacheText.c_str());
+ }
+ if(cache && logGpuOn()){gJournalPath=std::string(cache)+"/pipelines-"+std::to_string(getpid())+".log";gJournalBegan=nowUs();}
+ char name[128]={};nmb_device_name(gDevice,name,sizeof name);gName=[NSString stringWithUTF8String:name];gRegistryID=registryID;
+ // The target families supportsFamily: answers true, with the rows of Apple's tables the device does not meet in them (nmb_device_family_waivers).
+ {char waived[4096]={};nmb_device_family_waivers(gDevice,waived,sizeof waived);
+  for(char *line=waived,*next;*line;line=next){next=strchr(line,'\n');if(next)*next++=0;else next=line+strlen(line);journal(std::string("F ")+line);}}
  unsigned count=0;Method *methods=class_copyMethodList([NBDeviceMethods class],&count);
  for(unsigned i=0;i<count;i++)class_addMethod(cls,method_getName(methods[i]),method_getImplementation(methods[i]),method_getTypeEncoding(methods[i]));
  free(methods);installAnswers(cls);class_addProtocol(cls,@protocol(MTLDevice));
@@ -5240,9 +5243,19 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
    {"NBComputeEncoder","MTLComputeCommandEncoder"},{"NBRenderEncoder","MTLRenderCommandEncoder"},{"NBBlitEncoder","MTLBlitCommandEncoder"},
    {"NBHeap","MTLHeap"},{"NBBinaryArchive","MTLBinaryArchive"}};
   for(const auto &c:conformances){Class k=objc_getClass(c[0]);Protocol *pr=objc_getProtocol(c[1]);if(k&&pr)class_addProtocol(k,pr);}}
- objc_registerClassPair(cls);
- gDeviceObject=[cls new];
- if(gDeviceObject && iconMetalTrace()) {
+ if(newClass)objc_registerClassPair(cls);
+ @try {
+  gDeviceObject=[cls new];
+ } @catch (NSException *error) {
+  nmb_device_release(gDevice);gDevice=nullptr;
+  @throw error;
+ }
+ if(!gDeviceObject){nmb_device_release(gDevice);gDevice=nullptr;return nil;}
+ watchImportPressure();
+ logFlowCounts();
+ logClientWork();
+ logClientMemory();
+ if(iconMetalTrace()) {
   char text[88];
   snprintf(text,sizeof(text),"metal-device %s reg=%llx %.42s",class_getName(cls),(unsigned long long)registryID,name);
   iconMetalText(text);
