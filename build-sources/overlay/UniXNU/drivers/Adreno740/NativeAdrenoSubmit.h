@@ -196,10 +196,16 @@ private:
     void noteJobTime(const Job &job,uint32_t stamped,uint64_t start,uint64_t end);
     /* noteStall's CP snapshot (native_adreno_stall, _stall_mem, _stall_ring), taken before the first stage acts. */
     void snapshot(uint32_t next,uint32_t waited,uint64_t now,uint64_t pending,NativeAdrenoRing *stalled);
+    // Internal watchdog state belongs to this submitter, not the exported log.
+    struct StallWatch {
+        uint32_t fence=0,timeouts=0,stage=0,snapshots=0;
+        uint64_t began_us=0,last_us=0,kick_us=0;
+    } stall_;
     uint32_t stall_begin_cp_[6]{};   /* the CP's progress at the stalled fence's first timed-out wait */
     bool stall_begin_cp_valid_=false;
     uint64_t ring_retired_us_[2]{};uint32_t ring_retired_fence_[2]{};   /* the newest retirement seen on each ring */
     bool attached_=false,poisoned_=false;
+    bool gbif_reset_pending_=false;  // One board recovery attempt after an unconfirmed shared halt release.
     uint32_t audit_tick_=0;   /* submissions since attach; every eighth one audits its IB lines */
     /* submit()'s distinct buffers and ring words: too large for the kernel stack at 128 IBs (callers serialize every method) */
     uint64_t scratch_handles_[NativeAdrenoSubmitMaxBuffers]{};

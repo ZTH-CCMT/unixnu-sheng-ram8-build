@@ -54,7 +54,7 @@ struct CpPeer {
     std::vector<uint32_t> regs;
     std::vector<uint32_t> writes;
     unsigned publish=0,acquire=0,barriers=0,fail_publish=0,fail_acquire=0,fail_barrier=0;
-    unsigned sqe_calls=0;bool diagnostic_callbacks=true,clear_stop_on_write=false;
+    unsigned sqe_calls=0;bool diagnostic_callbacks=true,clear_stop_on_write=false,fail_halt_clear=false;
     uint32_t fail_read_reg=~0u,fail_write_reg=~0u;
     CpPeer():regs(0x10000,0){}
 };
@@ -63,7 +63,7 @@ static uint64_t clock_us=0;
 static int cwrite(void *c,uint32_t reg,uint32_t v)
 {
     CHECK(c==&cp && reg<cp.regs.size());
-    if(reg==cp.fail_write_reg)return 1;
+    if(reg==cp.fail_write_reg || (reg==0x3c45 && !v && cp.fail_halt_clear))return 1;
     cp.regs[reg]=reg==0x08a0 && cp.clear_stop_on_write?v&~1u:v;
     cp.writes.push_back(reg);
     return 0;
@@ -1074,14 +1074,14 @@ static void testStallDrainStatus()
     Path p;
     CHECK(exposed(p)==kIOReturnSuccess);
     const NativeAdrenoSubmitBuffer buffer{p.handle,0x800000,4096};
-    struct DrainCase {uint32_t ack;bool read_error;IOReturn result;};
+    struct DrainCase {uint32_t ack;bool read_error,clear_error;IOReturn result;};
     const DrainCase cases[]={
-        {0,false,kIOReturnTimeout},
-        {1,false,kIOReturnTimeout},
-        {3,true,kIOReturnIOError},
-        {3,false,kIOReturnSuccess}
+        {0,false,false,kIOReturnTimeout},
+        {1,false,false,kIOReturnTimeout},
+        {3,true,false,kIOReturnIOError},
+        {3,false,false,kIOReturnSuccess},
+        {3,false,true,kIOReturnIOError}
     };
-    const uint32_t drained=native_adreno_unstick[11];
     // A failed first CP sample must not masquerade as forward motion.
     uint32_t sampled_fence=0;
     CHECK(p.submit.submit(&p.vm,&buffer,1,7,&sampled_fence,&ringclock)==kIOReturnSuccess);
@@ -1111,24 +1111,107 @@ static void testStallDrainStatus()
         clock_us+=50000;
         CHECK(p.submit.wait(fence,&ringclock,0)==kIOReturnTimeout);
         CHECK(native_adreno_stall_kick[20]==1);
-        const uint32_t attempts=native_adreno_unstick[4];
+        const uint32_t attempts=native_adreno_unstick[4],drained=native_adreno_unstick[11];
         cp.regs[0x3c46]=test.ack;
         cp.fail_read_reg=test.read_error?0x3c46:~0u;
+        cp.fail_halt_clear=test.clear_error;
         clock_us+=150000;
         const IOReturn status=p.submit.wait(fence,&ringclock,0);
         CHECK((native_adreno_stall_log[(native_adreno_stall_log_count-1)&31][2]&0xff)==(test.result?5u:3u));
         CHECK(native_adreno_unstick[14]==static_cast<uint32_t>(test.result));
         CHECK(status==(test.result==kIOReturnIOError?kIOReturnIOError:kIOReturnTimeout));
         CHECK(native_adreno_unstick[11]==drained);
-        CHECK(p.submit.fencePending(fence) && p.object.deviceReferences()==2);
-        CHECK(native_adreno_unstick[4]==attempts+1 && cp.regs[0x3c45]==0);
+        CHECK(p.object.deviceReferences()==2 && native_adreno_unstick[4]==attempts+1);
+        if(test.clear_error) {
+            CHECK(cp.regs[0x3c45]==3 && p.ring.poisoned() && p.submit.poisoned());
+            const size_t writes=cp.writes.size();
+            fencemem[1]=fence;
+            CHECK(p.submit.wait(fence,&ringclock,0)==kIOReturnNotReady);
+            CHECK(p.submit.observeFence(fence,&ringclock,0)==kIOReturnNotReady);
+            uint32_t refused=~0u;
+            CHECK(p.submit.submit(&buffer,1,7,&refused)==kIOReturnNotReady && !refused);
+            CHECK(p.object.deviceReferences()==2 && cp.writes.size()==writes);
+            bool hung=false;
+            CHECK(p.submit.hangCheck(&hung)==kIOReturnSuccess && hung);
+            CHECK(cp.writes.size()==writes);
+            fencemem[1]=fence-1;  // Keep the stalled fence unresolved at reset.
+            NativeAdrenoRecovery recovered{};
+            CHECK(p.submit.recover([](void *,NativeAdrenoRing *target,uint32_t completed) {
+                CHECK(cp.regs[0x3c45]==3);
+                cp.fail_halt_clear=false;
+                cp.regs[0x3c45]=0;
+                return target->restart(completed);
+            },nullptr,&ringclock,&recovered)==kIOReturnSuccess);
+            CHECK(!recovered.guilty && !recovered.replayed && !p.submit.poisoned() && !p.ring.poisoned());
+            CHECK(p.submit.wait(fence,&ringclock,0)==kIOReturnAborted && p.object.deviceReferences()==1);
+            continue;
+        }
+        CHECK(p.submit.fencePending(fence) && cp.regs[0x3c45]==0);
         clock_us+=1000;
         CHECK(p.submit.wait(fence,&ringclock,0)==kIOReturnTimeout);
         CHECK(native_adreno_unstick[4]==attempts+1);
         fencemem[1]=fence;
         CHECK(p.submit.wait(fence,&ringclock,0)==kIOReturnSuccess && p.object.deviceReferences()==1);
     }
-    std::puts("PASS stall handler preserves pending buffers and records drain failure instead of success");
+    std::puts("PASS stall drain preserves progress after an ack failure and stops submissions if halt release fails");
+}
+
+static void testDualRingHaltRecovery(bool reset_ok)
+{
+    DualRingPath p;p.setup();
+    // Both fixture instances use the same fence numbers on a fresh attach.
+    const uint32_t done=p.enqueue(0,8);
+    fencemem[1]=done;
+    CHECK(p.submit.retireCompleted()==kIOReturnSuccess);
+    const uint32_t high=p.enqueue(0,8);
+    const uint32_t low=p.enqueue(1,7);
+    CHECK(p.ring.current() && !p.low.current());
+    CHECK(p.submit.wait(high,&ringclock,0)==kIOReturnTimeout);
+    ++cp.regs[0x0928];clock_us+=50000;
+    CHECK(p.submit.wait(high,&ringclock,0)==kIOReturnTimeout);
+    cp.regs[0x3c46]=3;cp.fail_halt_clear=true;clock_us+=150000;
+    CHECK(p.submit.wait(high,&ringclock,0)==kIOReturnIOError);
+    CHECK(p.ring.poisoned() && !p.low.poisoned() && p.submit.poisoned());
+    CHECK(p.submit.outstanding()==2 && p.object.deviceReferences()==3);
+
+    const auto writes=cp.writes.size();
+    const NativeAdrenoSubmitBuffer buffer{p.handle,0x800000,4096};
+    uint32_t refused=~0u;
+    p.submit.nextPriority(1);
+    CHECK(p.submit.submit(&p.vm,&buffer,1,7,&refused,&ringclock)==kIOReturnNotReady && !refused);
+    CHECK(p.submit.wait(low,&ringclock,0)==kIOReturnNotReady);
+    CHECK(p.submit.retireCompleted()==kIOReturnNotReady);
+    CHECK(!p.submit.preemptIrq());
+    bool hung=false;
+    CHECK(p.submit.hangCheck(&hung)==kIOReturnSuccess && hung);
+    CHECK(cp.writes.size()==writes && p.object.deviceReferences()==3);
+
+    NativeAdrenoRecovery outcome{};
+    if(reset_ok) {
+        cp.fail_halt_clear=false;
+        CHECK(p.recoverBoard(outcome)==kIOReturnSuccess && p.restart_count==1);
+        CHECK(!outcome.completed_late && !outcome.replayed && !p.submit.poisoned());
+        CHECK(p.submit.wait(high,&ringclock,0)==kIOReturnAborted);
+        CHECK(p.submit.wait(low,&ringclock,0)==kIOReturnAborted);
+        CHECK(p.object.deviceReferences()==1);
+        const uint32_t resumed=p.enqueue(1,7);
+        CHECK(resumed>low && p.ring.lastSubmitted()==resumed);
+        fencemem[1]=resumed;
+        CHECK(p.submit.retireCompleted()==kIOReturnSuccess);
+        CHECK(p.submit.wait(resumed,&ringclock,0)==kIOReturnSuccess && p.object.deviceReferences()==1);
+    } else {
+        const auto failed=[](void *cookie,NativeAdrenoRing *,uint32_t)->IOReturn {
+            ++static_cast<DualRingPath *>(cookie)->restart_count;
+            return kIOReturnTimeout;
+        };
+        CHECK(p.submit.recover(failed,&p,&ringclock,&outcome)==kIOReturnIOError);
+        CHECK(outcome.status==kIOReturnTimeout && p.restart_count==1);
+        CHECK(p.submit.hangCheck(&hung)==kIOReturnNotReady && !hung);
+        CHECK(p.submit.recover(failed,&p,&ringclock,&outcome)==kIOReturnNotReady && p.restart_count==1);
+        CHECK(p.submit.outstanding()==2 && p.object.deviceReferences()==3 && cp.writes.size()==writes);
+    }
+    std::puts(reset_ok?"PASS shared halt failure stops both rings until reset, aborts old fences and resumes":
+        "PASS failed shared halt reset retains both jobs and cannot loop");
 }
 
 static void testCpuTableRecovery(bool complete)
@@ -1210,7 +1293,7 @@ int main(int argc,char **argv)
         testCpuTableRecovery(true);testCpuTableRecovery(false);return 0;
     }
     if(argc==2 && !std::strcmp(argv[1],"--stall-drain")) {
-        testStallDrainStatus();return 0;
+        testStallDrainStatus();testDualRingHaltRecovery(true);testDualRingHaltRecovery(false);return 0;
     }
     if(argc==2 && !std::strcmp(argv[1],"--wptr-handoff")) {
         testWptrHandoffWithoutAppend();
