@@ -64,6 +64,8 @@ extern "C" volatile uint32_t native_adreno_sync_audit[6];
  * declared. */
 extern "C" volatile uint32_t native_adreno_maint_all;
 class NativeAdrenoVm final {
+    friend class NativeAdrenoSubmit;
+    bool may_have_run_=false;  // Serialized with submission and address-space teardown.
     struct Mapping {
         NativeAdrenoMemory *memory=nullptr;
         uint64_t handle=0,iova=0;

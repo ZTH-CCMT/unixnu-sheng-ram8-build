@@ -1287,8 +1287,44 @@ static void testCpuTableRecovery(bool complete)
     }
 }
 
+static void testForgetUnusedVm()
+{
+    Path primary,process;
+    ArmSmmu4KContextConfig process_config{};
+    CHECK(exposed(primary)==kIOReturnSuccess);
+    attachProcess(process,process_config);
+    uint64_t installed=0;
+    const auto write=[](void *cookie,uint64_t ttbr0)->IOReturn {
+        *static_cast<uint64_t *>(cookie)=ttbr0;
+        return kIOReturnSuccess;
+    };
+    CHECK(primary.submit.setTableSwitching(2,write,&installed)==kIOReturnSuccess);
+    const NativeAdrenoSubmitBuffer kernelJob{primary.handle,0x800000,4096};
+    uint32_t pending=0;
+    CHECK(primary.submit.submit(&primary.vm,&kernelJob,1,8,&pending,&ringclock)==kIOReturnSuccess);
+    const size_t writes=cp.writes.size();
+    const uint64_t before=clock_us;
+    CHECK(primary.submit.forgetVm(&process.vm,&ringclock,10000)==kIOReturnSuccess);
+    CHECK(clock_us==before && cp.writes.size()==writes && !installed);
+    CHECK(primary.submit.fencePending(pending) && primary.object.deviceReferences()==2);
+
+    fencemem[1]=pending;
+    CHECK(primary.submit.retireCompleted()==kIOReturnSuccess);
+    const NativeAdrenoSubmitBuffer processJob{process.handle,0x800000,4096};
+    CHECK(primary.submit.submit(&process.vm,&processJob,1,7,&pending,&ringclock)==kIOReturnSuccess);
+    CHECK(primary.submit.forgetVm(&process.vm,&ringclock,1000)==kIOReturnTimeout && !installed);
+    CHECK(primary.submit.fencePending(pending) && process.object.deviceReferences()==2);
+    fencemem[1]=pending;
+    CHECK(primary.submit.forgetVm(&process.vm,&ringclock,1000)==kIOReturnSuccess);
+    CHECK(installed==primary.vm.ttbr0() && process.object.deviceReferences()==1);
+    std::puts("PASS unused VM skips unrelated GPU work; used VM still waits and restores the kernel table");
+}
+
 int main(int argc,char **argv)
 {
+    if(argc==2 && !std::strcmp(argv[1],"--forget-vm")) {
+        testForgetUnusedVm();return 0;
+    }
     if(argc==2 && !std::strcmp(argv[1],"--replay-cpu-table")) {
         testCpuTableRecovery(true);testCpuTableRecovery(false);return 0;
     }

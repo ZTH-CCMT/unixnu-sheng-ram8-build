@@ -46,7 +46,7 @@
       "repository": "UniXNU/drivers/Adreno740",
       "path": "NativeAdrenoSubmit.cpp",
       "before_sha256": "6343e5fc8fbf8c1d8d1c053b07744372a452021018283da0db9f74ddf566461e",
-      "sha256": "f0483f30ce4106dada96fd29f1a285a11bb5cbd8bbf7b98bee4c29cc2cc37937"
+      "sha256": "f19d987d25880d59651074e6740041cbb66f9c2bf34393fec7a5e4f389e8eec2"
     },
     "UniXNU/drivers/Adreno740/NativeAdrenoSubmit.h": {
       "repository": "UniXNU/drivers/Adreno740",
@@ -70,7 +70,7 @@
       "repository": "UniXNU/drivers/Adreno740",
       "path": "tests/test_submit.cpp",
       "before_sha256": "ea56b6eb4d9cf9936f472ed5bf622d7e9fe74773f2b11a78beb0ba1d7601a4fa",
-      "sha256": "537ccf692ad88ff96f54e97142bdb3d38e9a414d4ae083892f674237dd44e6ed"
+      "sha256": "997117f8ccf519d9f4e822408c102c5ac4ade103b7dd85af127bb369e3dec465"
     },
     "UniXNU/drivers/ArmCpu/ArmCpu.cpp": {
       "repository": "UniXNU/drivers/ArmCpu",
@@ -454,13 +454,13 @@
       "repository": "UniXNU/drivers/Adreno740",
       "path": "NativeAdrenoVm.cpp",
       "before_sha256": "2165865a5543735c6e19174bb9606e0fb08a2dc3cf743aae2f295c96d41ca338",
-      "sha256": "1d9d8c4c4982ff98380a6a3b8d908d4d3042dad06f6348b249bc57744cc0c140"
+      "sha256": "c43dcb444c1843cc1193cb8633292f740afeaa30abbe06b357e52f47e5fa36a0"
     },
     "UniXNU/drivers/Adreno740/NativeAdrenoVm.h": {
       "repository": "UniXNU/drivers/Adreno740",
       "path": "NativeAdrenoVm.h",
       "before_sha256": "78e92782484f940d02338c642825f5215d336793ae2f84b85bb628fb3f9c03f4",
-      "sha256": "cce3dc165fc354c87599cc3ad7e3f736cac77983a2658f7c992b193a432912fa"
+      "sha256": "a871737e0b49dd4988c2e6a6024823c7e91c76df5e87e5b9a99ff955907a4ce9"
     },
     "device/package/BootLatencyTrace.c": {
       "repository": "device",

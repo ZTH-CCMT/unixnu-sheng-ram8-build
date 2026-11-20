@@ -377,6 +377,9 @@ IOReturn NativeAdrenoSubmit::forgetVm(NativeAdrenoVm *vm,const NativeAdrenoRingC
 {
     if(!attached_ || poisoned_)return kIOReturnNotReady;
     if(!vm || vm==vm_)return kIOReturnBadArgument;
+    // A process table that never reached submission cannot be installed or
+    // saved in a preemption record. The caller still invalidates its ASID.
+    if(!vm->may_have_run_)return kIOReturnSuccess;
     IOReturn status=waitAll(clock,timeout_us);
     if(status)return status;
     bool used=table_vm_==vm;
@@ -907,6 +910,9 @@ IOReturn NativeAdrenoSubmit::submit(NativeAdrenoVm *vm,const NativeAdrenoSubmitB
     }
     lap(4);
     target->useContext(ring(0)->context());
+    // Mark before programming TTBR0 or making the ring doorbell visible.
+    // An MMIO failure can leave a partial table switch in hardware.
+    vm->may_have_run_=true;
     status=useVm(vm,clock,index);
     if(status) {
         for(size_t i=0;i<handle_count;++i) {vm_->retireJobAfterCompletion(handles[i]);++stats_.references_retired;}

@@ -160,6 +160,7 @@ IOReturn NativeAdrenoVm::attach(const ArmSmmu4KIo *io,ArmSmmu4KContextConfig *co
         }
         regions_[i].arena->alias_scratch=alias_scratch_;regions_[i].arena->alias_scratch_entries=capacity_;
     }
+    may_have_run_=false;
     attached_=true;
     ArmSmmu4KStatus status=observe();if(status)return fail(status);
     return kIOReturnSuccess;
