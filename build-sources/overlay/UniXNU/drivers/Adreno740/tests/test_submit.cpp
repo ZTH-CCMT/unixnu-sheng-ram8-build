@@ -1130,6 +1130,39 @@ int main(int argc,char **argv)
         CHECK(p.vm.detach()==0 && p.tables.release()==0);
         std::puts("PASS cache failure before GPU mapping drops its reference and allows retry");
     }
+    {
+        for(unsigned fault=0;fault<2;++fault) {
+            Path p;CHECK(exposed(p)==kIOReturnSuccess);
+            NativeAdrenoMemory buffer;
+            const auto live=fixture.live.size(),metadata=fixture.metadata.size();
+            if(fault==0)fixture.allocation_fail=true;else fixture.prepare_fail=true;
+            CHECK(buffer.allocate(4096,40,false,4096)!=kIOReturnSuccess);
+            fixture.allocation_fail=fixture.prepare_fail=false;
+            CHECK(!buffer.backed() && fixture.live.size()==live && fixture.metadata.size()==metadata);
+            CHECK(p.submit.detach()==0 && p.vm.unmap(p.handle)==0 && p.object.release()==0);
+            CHECK(p.vm.detach()==0 && p.tables.release()==0);
+        }
+        std::puts("PASS allocation and prepare failures do not retain a BO");
+    }
+    {
+        NativeAdrenoMemory imported;
+        CHECK(imported.importTask(reinterpret_cast<void *>(0x77),0x20000000,5*4096,40,5*4096)==0);
+        CHECK(imported.spanCount()==5);
+        fixture.physical_operations.clear();
+        CHECK(imported.publishForDevice(4096,2*4096,false,false)==0);
+        CHECK(fixture.physical_operations.size()==2);
+        CHECK(fixture.physical_operations[0].physical==imported.spans()[1].physical);
+        CHECK(fixture.physical_operations[1].physical==imported.spans()[2].physical);
+        for(const auto &operation:fixture.physical_operations)
+            CHECK(operation.bytes==4096 && operation.op==NativeAdrenoClean);
+        fixture.physical_operations.clear();
+        CHECK(imported.acquireDeviceWrites(4*4096,4096)==0);
+        CHECK(fixture.physical_operations.size()==1 &&
+            fixture.physical_operations[0].physical==imported.spans()[4].physical &&
+            fixture.physical_operations[0].op==NativeAdrenoCleanInvalidate);
+        CHECK(imported.release()==0);
+        std::puts("PASS imported cache maintenance covers the requested span range and operation only");
+    }
     /* Every retired job is timed by the driver's clock without the CP's stamps: from its submission, or from the retirement before it
      * on its ring, to its own; a job over 8 ms is named in the slow table and the longest stay in the long table. */
     {
@@ -1492,5 +1525,7 @@ IOReturn NativeAdrenoReassertWriteCombined(const NativeAdrenoPhysicalSpan *spans
 IOReturn NativeAdrenoMaintainPhysicalPages(uint64_t physical,size_t bytes,NativeAdrenoCacheOperation op)
 {
     if(!physical || !bytes || ((physical|bytes)&4095) || op>NativeAdrenoInvalidate)std::abort();
-    ++fixture.physical_calls;fixture.physical_bytes+=bytes;return kIOReturnSuccess;
+    ++fixture.physical_calls;fixture.physical_bytes+=bytes;
+    fixture.physical_operations.push_back({physical,bytes,static_cast<unsigned>(op)});
+    return kIOReturnSuccess;
 }

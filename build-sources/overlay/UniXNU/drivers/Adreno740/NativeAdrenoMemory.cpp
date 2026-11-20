@@ -570,11 +570,19 @@ IOReturn NativeAdrenoMemory::acquireDeviceWrites(size_t offset,size_t bytes,unsi
  * [offset, offset+bytes) by physical address. */
 IOReturn NativeAdrenoMemory::maintainImported(size_t offset,size_t bytes,NativeAdrenoCacheOperation op)
 {
-    for(size_t i=0;i<span_count_;++i) {
-        const NativeAdrenoPhysicalSpan &span=spans_[i];
+    // Span offsets are in allocation order. Start at the first intersecting span.
+    size_t first=0,limit=span_count_;
+    while(first<limit) {
+        const size_t mid=first+(limit-first)/2;
+        const auto &span=spans_[mid];
+        if(span.offset+span.bytes<=offset)first=mid+1;else limit=mid;
+    }
+    const size_t rangeEnd=offset+bytes;
+    for(size_t i=first;i<span_count_;++i) {
+        const auto &span=spans_[i];
+        if(span.offset>=rangeEnd)break;
         const size_t begin=offset>span.offset?offset:span.offset;
-        const size_t end=offset+bytes<span.offset+span.bytes?offset+bytes:span.offset+span.bytes;
-        if(begin>=end)continue;
+        const size_t end=rangeEnd<span.offset+span.bytes?rangeEnd:span.offset+span.bytes;
         const IOReturn status=NativeAdrenoMaintainPhysicalPages(span.physical+(begin-span.offset),end-begin,op);
         if(status)return status;
     }

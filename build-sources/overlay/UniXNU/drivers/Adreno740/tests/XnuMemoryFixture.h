@@ -9,6 +9,9 @@ typedef int boolean_t;   /* the kernel's PE_parse_boot_argn declaration in Nativ
 #include <cstring>
 #include <algorithm>
 #include <vector>
+#if defined(_WIN32)
+#include <malloc.h>
+#endif
 using IOReturn=int;
 using IOOptionBits=unsigned;
 using IOByteCount=size_t;
@@ -48,6 +51,8 @@ struct MemoryFixture {
     uint64_t next_physical=0x30000000;
     size_t contiguous_limit=0;   /* nonzero: physically contiguous requests above this many bytes fail (a fragmented tablet) */
     unsigned imported=0,imports_live=0;
+    struct PhysicalCacheOp {uint64_t physical;size_t bytes;unsigned op;};
+    std::vector<PhysicalCacheOp> physical_operations;
     unsigned physical_calls=0;size_t physical_bytes=0;   /* NativeAdrenoMaintainPhysicalPages doubles */
     IOReturn cpu_status=kIOReturnSuccess;
     SegmentMode mode=Contiguous;
@@ -67,6 +72,21 @@ inline void fixtureMetadataFree(void *p) {
 #define IONewData(type,count) static_cast<type *>(fixtureMetadata(sizeof(type)*(count)))
 #define IODeleteData(ptr,type,count) do {fixtureMetadataFree(ptr);ptr=nullptr;}while(0)
 class IOBufferMemoryDescriptor {
+    static void *allocateBacking(size_t bytes) {
+#if defined(_WIN32)
+        return _aligned_malloc(bytes,4096);
+#else
+        void *ptr=nullptr;
+        return posix_memalign(&ptr,4096,bytes)?nullptr:ptr;
+#endif
+    }
+    static void freeBacking(void *ptr) {
+#if defined(_WIN32)
+        _aligned_free(ptr);
+#else
+        std::free(ptr);
+#endif
+    }
 public:
     void *raw=nullptr;
     size_t bytes=0;
@@ -82,7 +102,7 @@ public:
         auto *d=new IOBufferMemoryDescriptor;
         d->bytes=bytes;d->mask=~UINT64_C(0);d->physical_base=fixture.next_physical;d->unmapped=true;
         fixture.next_physical+=2*bytes+0x10000;
-        if(posix_memalign(&d->raw,4096,bytes+4096))std::abort();
+        if(!(d->raw=allocateBacking(bytes+4096)))std::abort();
         std::memset(d->raw,0,bytes+4096);
         ++fixture.created;++fixture.pageable;if(options&kIOMapWriteCombineCache)++fixture.write_combined_entries;
         fixture.live.push_back(d);return d;
@@ -96,7 +116,7 @@ public:
         auto *d=new IOBufferMemoryDescriptor;
         d->bytes=bytes;d->mask=mask;d->physical_base=fixture.next_physical;d->contiguous=options&kIOMemoryPhysicallyContiguous;
         fixture.next_physical+=2*bytes+0x10000;
-        if(posix_memalign(&d->raw,4096,bytes+4096))std::abort();
+        if(!(d->raw=allocateBacking(bytes+4096)))std::abort();
         std::memset(d->raw,0xa5,bytes+4096);++fixture.created;fixture.live.push_back(d);return d;
     }
     IOReturn prepare() {++fixture.prepared;return fixture.prepare_fail?kIOReturnIOError:kIOReturnSuccess;}
@@ -104,7 +124,7 @@ public:
     void release() {
         if(--retains)return;
         ++fixture.released;auto at=std::find(fixture.live.begin(),fixture.live.end(),this);
-        if(at==fixture.live.end())std::abort();fixture.live.erase(at);std::free(raw);delete this;
+        if(at==fixture.live.end())std::abort();fixture.live.erase(at);freeBacking(raw);delete this;
     }
     void *getBytesNoCopy() {return unmapped || fixture.null_mapping?nullptr:static_cast<char *>(raw)+(fixture.unaligned_mapping?8:0);}
     size_t getLength() {return bytes+(fixture.wrong_length?4096:0);}

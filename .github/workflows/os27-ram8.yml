@@ -52,6 +52,7 @@ jobs:
         run: |
           python3 pipeline/ci/materialize.py --top "$GITHUB_WORKSPACE"
           python3 -B -m unittest discover -s UniXNU/kits/XnuPrelink -p 'test_*.py'
+          python3 pipeline/ci/check_adreno_preemption.py UniXNU/drivers/Adreno740
           python3 device/scripts/check-bluetooth-platform.py
           python3 device/scripts/extract-files.py --section Keyboard
       - name: Check touch timeline with the XNU queue macro

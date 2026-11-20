@@ -71,51 +71,140 @@ _Unwind_Reason_Code nmb_pac_Unwind_Backtrace(void *trace, void *context)
 static PFN_vkGetInstanceProcAddr gGetInstanceProcAddr;
 static PFN_vkCreateInstance gCreateInstance;
 static PFN_vkCreateDebugUtilsMessengerEXT gCreateMessenger;
-// Signs every messenger callback in a pNext chain in place; returns the original values for restore (at most 8 messengers).
-static unsigned signChain(const void *next, void **saved, unsigned cap)
+static PFN_vkCreateDebugReportCallbackEXT gCreateDebugReport;
+
+static int instanceCallbackNode(VkStructureType type)
 {
-    unsigned count = 0;
-    for (VkBaseOutStructure *s = (VkBaseOutStructure *)next; s && count < cap; s = s->pNext) {
-        if (s->sType != VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT) continue;
-        VkDebugUtilsMessengerCreateInfoEXT *info = (VkDebugUtilsMessengerCreateInfoEXT *)s;
-        saved[count++] = (void *)info->pfnUserCallback;
-        if (info->pfnUserCallback) info->pfnUserCallback = (PFN_vkDebugUtilsMessengerCallbackEXT)NMB_SIGN(info->pfnUserCallback);
+    return type == VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT ||
+           type == VK_STRUCTURE_TYPE_DEBUG_REPORT_CALLBACK_CREATE_INFO_EXT;
+}
+
+typedef union {
+    VkDebugUtilsMessengerCreateInfoEXT utils;
+    VkDebugReportCallbackCreateInfoEXT report;
+    VkValidationFlagsEXT flags;
+    VkValidationFeaturesEXT features;
+#if defined(VK_EXT_layer_settings)
+    VkLayerSettingsCreateInfoEXT settings;
+#endif
+#if defined(VK_LUNARG_direct_driver_loading)
+    VkDirectDriverLoadingListLUNARG drivers;
+#endif
+#if defined(VK_EXT_metal_objects)
+    VkExportMetalObjectCreateInfoEXT metal;
+#endif
+} InstanceExtension;
+
+static const void **copyInstanceExtension(InstanceExtension *copy, const VkBaseInStructure *node)
+{
+    switch (node->sType) {
+        case VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT:
+            copy->utils = *(const VkDebugUtilsMessengerCreateInfoEXT *)node;
+            if (copy->utils.pfnUserCallback)
+                copy->utils.pfnUserCallback = (PFN_vkDebugUtilsMessengerCallbackEXT)NMB_SIGN(copy->utils.pfnUserCallback);
+            return &copy->utils.pNext;
+        case VK_STRUCTURE_TYPE_DEBUG_REPORT_CALLBACK_CREATE_INFO_EXT:
+            copy->report = *(const VkDebugReportCallbackCreateInfoEXT *)node;
+            if (copy->report.pfnCallback)
+                copy->report.pfnCallback = (PFN_vkDebugReportCallbackEXT)NMB_SIGN(copy->report.pfnCallback);
+            return &copy->report.pNext;
+        case VK_STRUCTURE_TYPE_VALIDATION_FLAGS_EXT:
+            copy->flags = *(const VkValidationFlagsEXT *)node;
+            return &copy->flags.pNext;
+        case VK_STRUCTURE_TYPE_VALIDATION_FEATURES_EXT:
+            copy->features = *(const VkValidationFeaturesEXT *)node;
+            return &copy->features.pNext;
+#if defined(VK_EXT_layer_settings)
+        case VK_STRUCTURE_TYPE_LAYER_SETTINGS_CREATE_INFO_EXT:
+            copy->settings = *(const VkLayerSettingsCreateInfoEXT *)node;
+            return &copy->settings.pNext;
+#endif
+#if defined(VK_LUNARG_direct_driver_loading)
+        case VK_STRUCTURE_TYPE_DIRECT_DRIVER_LOADING_LIST_LUNARG:
+            copy->drivers = *(const VkDirectDriverLoadingListLUNARG *)node;
+            return &copy->drivers.pNext;
+#endif
+#if defined(VK_EXT_metal_objects)
+        case VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECT_CREATE_INFO_EXT:
+            copy->metal = *(const VkExportMetalObjectCreateInfoEXT *)node;
+            return &copy->metal.pNext;
+#endif
+        default:
+            return NULL;
     }
-    return count;
 }
-static void restoreChain(const void *next, void **saved, unsigned count)
-{
-    unsigned at = 0;
-    for (VkBaseOutStructure *s = (VkBaseOutStructure *)next; s && at < count; s = s->pNext)
-        if (s->sType == VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT)
-            ((VkDebugUtilsMessengerCreateInfoEXT *)s)->pfnUserCallback = (PFN_vkDebugUtilsMessengerCallbackEXT)saved[at++];
-}
+
 static VkResult wrapCreateInstance(const VkInstanceCreateInfo *info, const VkAllocationCallbacks *allocator, VkInstance *instance)
 {
-    void *saved[8];
-    const unsigned count = info ? signChain(info->pNext, saved, 8) : 0;
-    const VkResult result = gCreateInstance(info, allocator, instance);
-    if (info) restoreChain(info->pNext, saved, count);
-    return result;
+    PFN_vkCreateInstance create = __atomic_load_n(&gCreateInstance, __ATOMIC_ACQUIRE);
+    if (!create) return VK_ERROR_INITIALIZATION_FAILED;
+    if (!info || !info->pNext) return create(info, allocator, instance);
+
+    // Copy just the prefix needing a different callback. An unchanged tail
+    // retains its original addresses and any extensions the bridge does not know.
+    InstanceExtension copies[32];
+    const VkBaseInStructure *lastCallback = NULL;
+    unsigned length = 0;
+    for (const VkBaseInStructure *node = info->pNext; node; node = node->pNext) {
+        if (++length > sizeof(copies) / sizeof(copies[0])) return VK_ERROR_INITIALIZATION_FAILED;
+        if (instanceCallbackNode(node->sType)) lastCallback = node;
+    }
+    if (!lastCallback) return create(info, allocator, instance);
+    VkInstanceCreateInfo copy = *info;
+    const void **link = &copy.pNext;
+    unsigned i = 0;
+    for (const VkBaseInStructure *node = info->pNext; ; node = node->pNext) {
+        const void **next = copyInstanceExtension(&copies[i++], node);
+        if (!next) return VK_ERROR_EXTENSION_NOT_PRESENT;
+        *link = &copies[i-1];
+        if (node == lastCallback) {
+            *next = node->pNext;
+            break;
+        }
+        link = next;
+    }
+    return create(&copy, allocator, instance);
 }
 static VkResult wrapCreateMessenger(VkInstance instance, const VkDebugUtilsMessengerCreateInfoEXT *info,
                                     const VkAllocationCallbacks *allocator, VkDebugUtilsMessengerEXT *messenger)
 {
-    if (!info) return gCreateMessenger(instance, info, allocator, messenger);
+    PFN_vkCreateDebugUtilsMessengerEXT create = __atomic_load_n(&gCreateMessenger, __ATOMIC_ACQUIRE);
+    if (!create) return VK_ERROR_INITIALIZATION_FAILED;
+    if (!info) return create(instance, info, allocator, messenger);
     VkDebugUtilsMessengerCreateInfoEXT copy = *info;
     if (copy.pfnUserCallback) copy.pfnUserCallback = (PFN_vkDebugUtilsMessengerCallbackEXT)NMB_SIGN(copy.pfnUserCallback);
-    return gCreateMessenger(instance, &copy, allocator, messenger);
+    return create(instance, &copy, allocator, messenger);
+}
+
+static VkResult wrapCreateDebugReport(VkInstance instance, const VkDebugReportCallbackCreateInfoEXT *info,
+                                      const VkAllocationCallbacks *allocator, VkDebugReportCallbackEXT *callback)
+{
+    PFN_vkCreateDebugReportCallbackEXT create = __atomic_load_n(&gCreateDebugReport, __ATOMIC_ACQUIRE);
+    if (!create) return VK_ERROR_INITIALIZATION_FAILED;
+    if (!info) return create(instance, info, allocator, callback);
+    VkDebugReportCallbackCreateInfoEXT copy = *info;
+    if (copy.pfnCallback) copy.pfnCallback = (PFN_vkDebugReportCallbackEXT)NMB_SIGN(copy.pfnCallback);
+    return create(instance, &copy, allocator, callback);
 }
 static PFN_vkVoidFunction wrapGetInstanceProcAddr(VkInstance instance, const char *name)
 {
     if (!name) return NULL;
     if (!strcmp(name, "vkGetInstanceProcAddr")) return (PFN_vkVoidFunction)wrapGetInstanceProcAddr;
-    PFN_vkVoidFunction real = gGetInstanceProcAddr(instance, name);
+    PFN_vkGetInstanceProcAddr get = __atomic_load_n(&gGetInstanceProcAddr, __ATOMIC_ACQUIRE);
+    if (!get) return NULL;
+    PFN_vkVoidFunction real = get(instance, name);
     if (!real) return NULL;
-    if (!strcmp(name, "vkCreateInstance")) {gCreateInstance = (PFN_vkCreateInstance)real; return (PFN_vkVoidFunction)wrapCreateInstance;}
+    if (!strcmp(name, "vkCreateInstance")) {
+        __atomic_store_n(&gCreateInstance, (PFN_vkCreateInstance)real, __ATOMIC_RELEASE);
+        return (PFN_vkVoidFunction)wrapCreateInstance;
+    }
     if (!strcmp(name, "vkCreateDebugUtilsMessengerEXT")) {
-        gCreateMessenger = (PFN_vkCreateDebugUtilsMessengerEXT)real;
+        __atomic_store_n(&gCreateMessenger, (PFN_vkCreateDebugUtilsMessengerEXT)real, __ATOMIC_RELEASE);
         return (PFN_vkVoidFunction)wrapCreateMessenger;
+    }
+    if (!strcmp(name, "vkCreateDebugReportCallbackEXT")) {
+        __atomic_store_n(&gCreateDebugReport, (PFN_vkCreateDebugReportCallbackEXT)real, __ATOMIC_RELEASE);
+        return (PFN_vkVoidFunction)wrapCreateDebugReport;
     }
     return real;
 }
@@ -123,7 +212,7 @@ void *nmb_pac_dlsym(void *handle, const char *name)
 {
     void *symbol = dlsym(handle, name);
     if (symbol && name && (!strcmp(name, "vkGetInstanceProcAddr") || !strcmp(name, "vk_icdGetInstanceProcAddr"))) {
-        gGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)symbol;
+        __atomic_store_n(&gGetInstanceProcAddr, (PFN_vkGetInstanceProcAddr)symbol, __ATOMIC_RELEASE);
         return (void *)wrapGetInstanceProcAddr;
     }
     return symbol;

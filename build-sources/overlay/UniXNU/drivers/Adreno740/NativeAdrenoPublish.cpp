@@ -390,7 +390,10 @@ void NativeAdrenoPoolView::free()
 
 class AGXDeviceUserClient : public IOUserClient {
     OSDeclareDefaultStructors(AGXDeviceUserClient)
-    bool live_=false;
+    bool live_=false,closing_=false;
+    bool active() const {
+        return __atomic_load_n(&live_,__ATOMIC_ACQUIRE) && !__atomic_load_n(&closing_,__ATOMIC_ACQUIRE);
+    }
     bool handoffOnly_=false;
     bool kernel_=false;
     NativeAdrenoUserClient *core_=nullptr;   /* own core; deleted in free(), so a call that raced the close sees live_ false, never freed memory */
@@ -510,7 +513,7 @@ bool AGXDeviceUserClient::mount(bool kernel)
             for(unsigned i=1;!server && row==4 && i<4;++i)if(!g.rows[i])row=i;
             if(row<4)g.rows[row]=true;
             core->setStatsSlot(row);
-            core_=core;core=nullptr;space_=space;space=nullptr;row_=row;kernel_=kernel;live_=true;ok=true;
+            core_=core;core=nullptr;space_=space;space=nullptr;row_=row;kernel_=kernel;__atomic_store_n(&live_,true,__ATOMIC_RELEASE);ok=true;
             if(kernel)g.kernel_client=true;
             ++g.opened;
             if(NativeAdrenoClientRecord *record=clientRecord(name_))record->slot=row;
@@ -582,6 +585,10 @@ bool AGXDeviceUserClient::growViews(uint32_t token)
 }
 IOReturn AGXDeviceUserClient::clientClose()
 {
+    IOLockLock(g.lock);
+    if(closing_){IOLockUnlock(g.lock);return kIOReturnBusy;}
+    __atomic_store_n(&closing_,true,__ATOMIC_RELEASE);
+    IOLockUnlock(g.lock);
     dropViews(0);
     IOLockLock(g.lock);
     IOReturn status=kIOReturnSuccess;
@@ -595,7 +602,7 @@ IOReturn AGXDeviceUserClient::clientClose()
         if(!status && space_) {status=g.context->destroyVm(space_);if(!status)space_=nullptr;}
         /* A failed teardown leaves the objects (and the address space) live: nothing is forced or reused. */
         if(!status) {
-            live_=false;
+            __atomic_store_n(&live_,false,__ATOMIC_RELEASE);
             if(kernel_)g.kernel_client=false;
             if(row_<4)g.rows[row_]=false;
             row_=4;
@@ -606,6 +613,7 @@ IOReturn AGXDeviceUserClient::clientClose()
             }
         }
     }
+    if(status)__atomic_store_n(&closing_,false,__ATOMIC_RELEASE);
     IOLockUnlock(g.lock);
     if(mailbox)mailbox->release();
     if(!status)terminate();
@@ -625,7 +633,7 @@ IOReturn AGXDeviceUserClient::clientMemoryForType(UInt32 type,IOOptionBits *opti
     if(!memory || !options)return kIOReturnBadArgument;
     IOReturn status=kIOReturnNotFound;
     if(type==NativeAdrenoScanoutType) {
-        if(!live_ && !handoffOnly_)return kIOReturnNotReady;
+        if(__atomic_load_n(&closing_,__ATOMIC_ACQUIRE) || (!active() && !handoffOnly_))return kIOReturnNotReady;
         IOMemoryDescriptor *scanout=native_gop_handoff_memory();
         if(!scanout)return kIOReturnNotReady;
         *memory=scanout;                        /* already retained for the caller */
@@ -633,23 +641,24 @@ IOReturn AGXDeviceUserClient::clientMemoryForType(UInt32 type,IOOptionBits *opti
         return kIOReturnSuccess;
     }
     if(type==NativeAdrenoMailboxType) {
-        if(live_ && gMailbox && gMailboxOwner==this) {
+        IOLockLock(g.lock);
+        if(active() && gMailbox && gMailboxOwner==this) {
             gMailbox->retain();
             *memory=gMailbox;
             *options=kIOMapAnywhere;   /* ordinary cached memory: both sides are CPUs, so it is coherent */
             native_adreno_metal_diag.mb_maps=native_adreno_metal_diag.mb_maps+1;
-            IOLockLock(g.lock);
-            if(gMailboxOwner==this) {gMailboxMapped=true;IOLockWakeup(g.lock,&gMailboxMapped,false);}
+            gMailboxMapped=true;IOLockWakeup(g.lock,&gMailboxMapped,false);
             IOLockUnlock(g.lock);
             return kIOReturnSuccess;
         }
+        IOLockUnlock(g.lock);
         return kIOReturnNotReady;
     }
     native_adreno_view_diag[0]=native_adreno_view_diag[0]+1;
     /* [5]: threads inside this function right now (a thread stuck here, on the gate or in a mapping, shows as a non-zero count that stays). */
     struct Inside {Inside() {__atomic_fetch_add(&native_adreno_view_diag[5],1,__ATOMIC_RELAXED);} ~Inside() {__atomic_fetch_sub(&native_adreno_view_diag[5],1,__ATOMIC_RELAXED);}} inside;
     IOLockLock(g.lock);
-    if(!growViews(type)) {IOLockUnlock(g.lock);return kIOReturnNoMemory;}
+    if(!active()){IOLockUnlock(g.lock);return kIOReturnNotReady;}
     View *v=viewSlot(type);
     if(v && v->descriptor && v->token==type) {
         v->descriptor->retain();*memory=v->descriptor;
@@ -658,7 +667,10 @@ IOReturn AGXDeviceUserClient::clientMemoryForType(UInt32 type,IOOptionBits *opti
         IOLockUnlock(g.lock);
         return kIOReturnSuccess;
     }
-    NativeAdrenoMemory *backing=live_?core_->memoryForToken(type):nullptr;
+    NativeAdrenoMemory *backing=core_->memoryForToken(type);
+    if(!backing){IOLockUnlock(g.lock);return kIOReturnNotFound;}
+    if(!growViews(type)){IOLockUnlock(g.lock);return kIOReturnNoMemory;}
+    v=viewSlot(type);
     if(backing && backing->system() && backing->descriptor() && v && !v->descriptor) {
         /* System memory: the view maps the BO's own descriptor, its VM object, as Metal's resources are mapped into their process. The
          * pages keep the object's attribute (no device-pager view sets them back, int-160) and live while the view does. */
@@ -780,7 +792,7 @@ static IOReturn runCore(AGXDeviceUserClient *connection,uint32_t method,const vo
     native_adreno_metal_diag.inflight=method+1;
     native_adreno_metal_diag.inflight_since_calls=native_adreno_metal_diag.calls;
     IOReturn status;
-    if(method==NativeAdrenoMethodWaitFence && connection->live_ && input && input_size==sizeof(NativeAdrenoAbiWaitFence) && g.clock.now_us) {
+    if(method==NativeAdrenoMethodWaitFence && connection->active() && input && input_size==sizeof(NativeAdrenoAbiWaitFence) && g.clock.now_us) {
         /* A fence wait sleeps outside the lock: under it every other thread's submit, map or allocation would wait for the GPU to
          * finish unrelated work. While the CP has not reached the fence the check reads the ring's fence word when the lock is free;
          * the core's own zero-timeout wait (retirement, statistics, the stall handler) runs under the lock once the fence has passed
@@ -810,7 +822,7 @@ static IOReturn runCore(AGXDeviceUserClient *connection,uint32_t method,const vo
             if(waited>=timeout_us || !fencePending(poll.fence)) {
                 /* The connection's own core while it is live; a close that ran between two polls ends the wait. */
                 lockTimed(lockWait);
-                status=connection->live_?connection->core_->dispatch(method,&poll,sizeof(poll),output,output_size,&g.clock):kIOReturnNotReady;
+                status=connection->active()?connection->core_->dispatch(method,&poll,sizeof(poll),output,output_size,&g.clock):kIOReturnNotReady;
                 unlockTimed(lockWait);
                 polled=true;
                 waited=g.clock.now_us(g.clock.cookie)-began;
@@ -833,7 +845,7 @@ static IOReturn runCore(AGXDeviceUserClient *connection,uint32_t method,const vo
             if(!g.clock.idle || g.clock.idle(g.clock.cookie)) {
                 if(!polled) {
                     lockTimed(lockWait);
-                    status=connection->live_?connection->core_->dispatch(method,&poll,sizeof(poll),output,output_size,&g.clock):kIOReturnNotReady;
+                    status=connection->active()?connection->core_->dispatch(method,&poll,sizeof(poll),output,output_size,&g.clock):kIOReturnNotReady;
                     unlockTimed(lockWait);
                     waited=g.clock.now_us(g.clock.cookie)-began;
                 }
@@ -863,8 +875,8 @@ static IOReturn runCore(AGXDeviceUserClient *connection,uint32_t method,const vo
             memcpy(&request,input,sizeof(request));
             began=mach_absolute_time();
             lockTimed(lockWait);
-            const uint64_t limit=connection->live_?connection->core_->boLimit():0;
-            const unsigned bits=connection->live_?connection->core_->outputBits():0;
+            const uint64_t limit=connection->active()?connection->core_->boLimit():0;
+            const unsigned bits=connection->active()?connection->core_->outputBits():0;
             unlockTimed(lockWait);
             limited=mach_absolute_time();
             /* Pool pages when the board registered some (zero-filled here), else the VM's. */
@@ -880,12 +892,12 @@ static IOReturn runCore(AGXDeviceUserClient *connection,uint32_t method,const vo
         locked=mach_absolute_time();
         spans=native_adreno_bo_memory[1];
         /* Offered for every BoAlloc, held or not: allocateSystem then knows it runs under the lock and leaves the pool alone. */
-        if(connection->live_)connection->core_->offerSystemPages(alloc?&pages:nullptr);
-        if(connection->live_ && freeing)connection->core_->collectFreedPages(&freed);
-        status=connection->live_?connection->core_->dispatch(method,input,input_size,output,output_size,&g.clock):kIOReturnNotReady;
-        if(connection->live_)connection->core_->offerSystemPages(nullptr);
-        if(connection->live_ && freeing)connection->core_->collectFreedPages(nullptr);
-        if(method==NativeAdrenoMethodBoMap && !status && connection->live_ && !connection->kernel_)
+        if(connection->active())connection->core_->offerSystemPages(alloc?&pages:nullptr);
+        if(connection->active() && freeing)connection->core_->collectFreedPages(&freed);
+        status=connection->active()?connection->core_->dispatch(method,input,input_size,output,output_size,&g.clock):kIOReturnNotReady;
+        if(connection->active())connection->core_->offerSystemPages(nullptr);
+        if(connection->active() && freeing)connection->core_->collectFreedPages(nullptr);
+        if(method==NativeAdrenoMethodBoMap && !status && connection->active() && !connection->kernel_)
             if(NativeAdrenoClientRecord *record=clientRecord(connection->name_))
                 if(connection->core_->windowPeak()>>20>record->peak_mib)record->peak_mib=uint32_t(connection->core_->windowPeak()>>20);
         spans=native_adreno_bo_memory[1]-spans;
@@ -983,7 +995,7 @@ IOReturn AGXDeviceUserClient::runTimed(uint32_t method,const void *input,size_t 
          * ones leave their mapping until it, or the client unmaps it itself (IOConnectUnmapMemory64 works on the cached view). */
         const uint32_t token=static_cast<const NativeAdrenoAbiBoCpuUnmap *>(input)->token;
         IOLockLock(g.lock);
-        const uint32_t leases=live_?core_->mappingLeases(token):0;
+        const uint32_t leases=active()?core_->mappingLeases(token):0;
         IOLockUnlock(g.lock);
         if(leases>1)native_adreno_view_kept=native_adreno_view_kept+1;
         else dropViews(token);
@@ -1014,7 +1026,7 @@ IOReturn AGXDeviceUserClient::runTimed(uint32_t method,const void *input,size_t 
         memcpy(&request,input,sizeof(request));
         if(request.foreground>5 || request.background>5)return kIOReturnBadArgument;
         lockTimed(lockWait);
-        const IOReturn status=live_?core_->setPriority(request.foreground,request.background):kIOReturnNotReady;
+        const IOReturn status=active()?core_->setPriority(request.foreground,request.background):kIOReturnNotReady;
         unlockTimed(lockWait);
         native_adreno_metal_diag.inflight=0;
         native_adreno_metal_diag.calls=native_adreno_metal_diag.calls+1;
@@ -1031,7 +1043,7 @@ IOReturn AGXDeviceUserClient::runTimed(uint32_t method,const void *input,size_t 
         NativeAdrenoAbiBoAllocReply reply{};
         native_adreno_metal_diag.inflight=method+1;
         lockTimed(lockWait);
-        const IOReturn status=live_?core_->importBo(&request,current_task(),&reply):kIOReturnNotReady;
+        const IOReturn status=active()?core_->importBo(&request,current_task(),&reply):kIOReturnNotReady;
         unlockTimed(lockWait);
         native_adreno_metal_diag.inflight=0;
         native_adreno_metal_diag.calls=native_adreno_metal_diag.calls+1;

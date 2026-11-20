@@ -8,6 +8,7 @@
 #import <Metal/Metal.h>
 #include <mach/mach_time.h>
 #include <memory>
+#include <utility>
 #include <stdint.h>
 #include <unistd.h>
 #include "GpuScanoutPresenter.h"

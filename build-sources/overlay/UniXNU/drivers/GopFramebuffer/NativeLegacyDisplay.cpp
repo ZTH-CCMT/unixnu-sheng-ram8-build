@@ -8,6 +8,7 @@
 #include "NativeGOPWire.h"
 #include "NativeHalfCodes.h"
 #include <IOKit/IOLib.h>
+#include <IOKit/IOLocks.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOWorkLoop.h>
 #include <IOKit/IOUserClient.h>
@@ -188,6 +189,19 @@ static constexpr uint64_t kDisplayColorID=100,kDisplayTimingID=1000;
 #endif
 class NativeLegacyDisplay;
 static NativeLegacyDisplay *gDirectDisplay=nullptr;
+static IOLock *gDirectDisplayLock=nullptr;
+
+static IOLock *directDisplayLock()
+{
+    IOLock *lock=__atomic_load_n(&gDirectDisplayLock,__ATOMIC_ACQUIRE);
+    if(lock)return lock;
+    IOLock *candidate=IOLockAlloc();
+    if(!candidate)return nullptr;
+    if(__atomic_compare_exchange_n(&gDirectDisplayLock,&lock,candidate,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE))
+        return candidate;
+    IOLockFree(candidate);
+    return lock;
+}
 extern "C" void native_legacy_direct_snapshot(void);
 class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     OSDeclareDefaultStructors(NativeLegacyDisplay)
@@ -308,7 +322,7 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     IOTimerEventSource *latchTimer=nullptr;
     const OriginalLegacySwapRequest *latchRequest=nullptr;
     uint64_t latchStart=0,directClock=0;
-    bool latchTimedOut=false;
+    bool latchTimedOut; // Set before arming each latch.
     int shownSlot=-1,pendingSlot=-1;
     uint32_t shownStride=0;
     // Keep the first successful fence snapshot for this request across pending and busy polls.
@@ -340,7 +354,10 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
             if(directPages){IOFreeData(directPages,kDirectPageBytes);directPages=nullptr;}
             return;
         }
-        directOn=true;gDirectDisplay=this;
+        directOn=true;
+        if(IOLock *lock=directDisplayLock()) {
+            IOLockLock(lock);gDirectDisplay=this;IOLockUnlock(lock);
+        }
     }
     // The diagnostic screenshot reads the boot memory, which the display no longer scans: draw the surface on screen into it (rows of the
     // visible width) so the picture shows what the panel shows.
@@ -614,16 +631,61 @@ public:
         };
         if(loop)loop->runAction(action,this,&args);else finishGpuSwap(status);
     }
-    void free() override {stopVsync();if(logicalPM){PMstop();logicalPM=false;}primary=false;OSSafeReleaseNULL(bootMapping);IOMobileFramebufferLegacy::free();}
+    void forgetDirectDisplay() {
+        if(IOLock *lock=__atomic_load_n(&gDirectDisplayLock,__ATOMIC_ACQUIRE)) {
+            IOLockLock(lock);
+            if(gDirectDisplay==this)gDirectDisplay=nullptr;
+            IOLockUnlock(lock);
+        }
+    }
+    void stopDirect() {
+        forgetDirectDisplay();
+        IOWorkLoop *loop=getWorkLoop();
+        auto shutdown=[](OSObject *,void *argument,void *,void *,void *)->IOReturn {
+            auto *display=static_cast<NativeLegacyDisplay *>(argument);
+            display->primary=false;
+            display->transferred=false;display->gpuRequest=nullptr;display->gpuRetired=false;
+            for(unsigned i=0;i<8;++i)if(display->validated[i])display->removeValidated(display->validated[i]);
+            display->directToBoot();
+            display->latchRequest=nullptr;display->pendingSlot=-1;
+            if(display->fenceTimer) {
+                display->fenceTimer->cancelTimeout();
+                if(IOWorkLoop *loop=display->getWorkLoop())loop->removeEventSource(display->fenceTimer);
+                OSSafeReleaseNULL(display->fenceTimer);
+            }
+            if(display->latchTimer) {
+                display->latchTimer->cancelTimeout();
+                if(IOWorkLoop *loop=display->getWorkLoop())loop->removeEventSource(display->latchTimer);
+                OSSafeReleaseNULL(display->latchTimer);
+            }
+            // Until the boot buffer is latched, either previously programmed slot can still be scanned.
+            if(display->directOn) {
+                for(unsigned polls=0;polls<100 && (display->mdp[kCtlFlush/4]&0x3);++polls)IODelay(500);
+                if(!(display->mdp[kCtlFlush/4]&0x3)) {
+                    for(auto &slot:display->directSlots) {
+                        if(slot.memory)slot.memory->complete();
+                        OSSafeReleaseNULL(slot.memory);OSSafeReleaseNULL(slot.surface);
+                        slot={};
+                    }
+                }
+            }
+            display->directOn=false;display->mdp=nullptr;
+            OSSafeReleaseNULL(display->mdpMap);
+            if(display->directPages) {
+                IOFreeData(display->directPages,kDirectPageBytes);display->directPages=nullptr;
+            }
+            if(display->shadow) {
+                IOFreeAligned(display->shadow,(vm_size_t)display->shadowBytes);
+                display->shadow=nullptr;display->shadowBytes=0;display->shadowValid=false;
+            }
+            return kIOReturnSuccess;
+        };
+        if(loop)loop->runAction(shutdown,this,this);else shutdown(this,this,nullptr,nullptr,nullptr);
+    }
+    void free() override {forgetDirectDisplay();stopVsync();if(logicalPM){PMstop();logicalPM=false;}primary=false;OSSafeReleaseNULL(bootMapping);IOMobileFramebufferLegacy::free();}
     void stop(IOService *provider) override {
         stopVsync();
-        transferred=false;for(auto &entry: validated)entry=nullptr;gpuRequest=nullptr;gpuRetired=false;
-        directToBoot();latchRequest=nullptr;pendingSlot=-1;
-        if(fenceTimer){fenceTimer->cancelTimeout();if(IOWorkLoop *loop=getWorkLoop())loop->removeEventSource(fenceTimer);OSSafeReleaseNULL(fenceTimer);}
-        if(latchTimer){latchTimer->cancelTimeout();if(IOWorkLoop *loop=getWorkLoop())loop->removeEventSource(latchTimer);OSSafeReleaseNULL(latchTimer);}
-        directOn=false;
-        if(directPages){IOFreeData(directPages,kDirectPageBytes);directPages=nullptr;}
-        for(auto &slot: directSlots)slot.pageCount=0;
+        stopDirect();
         if(logicalPM){PMstop();logicalPM=false;}
         primary=false;IOMobileFramebufferLegacy::stop(provider);OSSafeReleaseNULL(bootMapping);
     }
@@ -1369,6 +1431,21 @@ public:
 #undef LEAF
 };
 OSDefineMetaClassAndStructors(NativeLegacyDisplay,IOMobileFramebufferLegacy)
-extern "C" void native_legacy_direct_snapshot(void) {if(gDirectDisplay)gDirectDisplay->snapshot();}
+extern "C" void native_legacy_direct_snapshot(void)
+{
+    IOLock *lock=__atomic_load_n(&gDirectDisplayLock,__ATOMIC_ACQUIRE);
+    if(!lock)return;
+    IOLockLock(lock);
+    NativeLegacyDisplay *display=gDirectDisplay;
+    if(display)display->retain();
+    IOLockUnlock(lock);
+    if(!display)return;
+    auto snapshot=[](OSObject *,void *argument,void *,void *,void *)->IOReturn {
+        static_cast<NativeLegacyDisplay *>(argument)->snapshot();
+        return kIOReturnSuccess;
+    };
+    if(IOWorkLoop *loop=display->getWorkLoop())loop->runAction(snapshot,display,display);
+    display->release();
+}
 IOService *native_legacy_display_allocate(void) {return new NativeLegacyDisplay;}
 extern "C" void native_legacy_gpu_complete(void *display,int status) {if(display)static_cast<NativeLegacyDisplay *>(display)->gpuComplete(status);}

@@ -46,6 +46,8 @@ definitions:
         checkout UniXNU-sm8550-common UniXNU/UniXNU-sm8550-common 97665e28578483082b674e8375a8fa65f4cf49cf
         python3 "$CM_BUILD_DIR/ci/materialize.py" --top "$top"
         python3 -B -m unittest discover -s "$top/UniXNU/kits/XnuPrelink" -p 'test_*.py'
+        python3 "$CM_BUILD_DIR/ci/check_adreno_preemption.py" "$top/UniXNU/drivers/Adreno740"
+        python3 "$CM_BUILD_DIR/ci/check_metal_frontend.py" --top "$top"
         cd "$top"
         python3 device/scripts/check-bluetooth-platform.py
         python3 device/scripts/extract-files.py --section Keyboard

@@ -126,7 +126,11 @@ IOReturn NativeAdrenoPreempt::detach()
 /* Both rings' records as the CPU sees them: read pointer, write pointer, errno, info. */
 void NativeAdrenoPreempt::snapshot(volatile uint32_t *row,unsigned first) const
 {
+#if defined(__aarch64__) || defined(__arm64__)
     __asm__ volatile("dsb sy":::"memory");
+#else
+    __atomic_thread_fence(__ATOMIC_SEQ_CST); // Host tests use regular RAM for the record.
+#endif
     for(unsigned r=0;r<NativeAdrenoPreemptRingCount;++r) {
         const uint8_t *rec=rings_.record_cpu[r];
         row[first+r*4+0]=recordWord(rec,20);row[first+r*4+1]=recordWord(rec,24);

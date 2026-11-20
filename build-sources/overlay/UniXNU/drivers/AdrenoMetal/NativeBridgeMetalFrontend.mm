@@ -1113,7 +1113,7 @@ static void waitForResource(id resource);
 @interface NBTexture : NBObject
 @property(nonatomic) NmbTexture *handle;
 @property(nonatomic) uint32_t pvrtc;   // the PVRTC format the texture was asked for, decoded into its RGBA8 (0: none)
-- (void)replacePvrtcRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice withBytes:(const void *)bytes length:(size_t)length;
+- (BOOL)replacePvrtcRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice withBytes:(const void *)bytes length:(size_t)length;
 @property(nonatomic) NmbTextureDescriptor descriptor;
 @property(nonatomic,strong) NBBuffer *buffer;
 @property(nonatomic) IOSurfaceRef surface;
@@ -1328,9 +1328,8 @@ static uint32_t pvrtcMorton(uint32_t x,uint32_t y,uint32_t across,uint32_t down)
 // Decodes a level of width x height texels from `length` bytes of blocks into RGBA8 rows of width * 4 bytes.
 static void pvrtcDecode(const uint8_t *data,size_t length,uint32_t width,uint32_t height,bool twoBit,bool alpha,uint8_t *out) {
  const int bw=twoBit?8:4,bh=4;
- uint32_t across=1,down=1;
- while(across*bw<width)across<<=1;
- while(down*bh<height)down<<=1;
+ const uint32_t across=std::max(2u,width/(uint32_t)bw);
+ const uint32_t down=std::max(2u,height/(uint32_t)bh);
  std::vector<PvrtcColor> colorA(across*down),colorB(across*down);
  std::vector<uint32_t> modulation(across*down),mode(across*down);
  for(uint32_t y=0;y<down;y++)for(uint32_t x=0;x<across;x++) {
@@ -1373,11 +1372,27 @@ static void pvrtcDecode(const uint8_t *data,size_t length,uint32_t width,uint32_
   o[3]=!alpha?255:punch?0:(uint8_t)lrintf((a.a+(b.a-a.a)*w)*255.0f);
  }
 }
-static size_t pvrtcLevelBytes(uint32_t width,uint32_t height,bool twoBit) {
- uint32_t across=1,down=1;
- while(across*(twoBit?8u:4u)<width)across<<=1;
- while(down*4u<height)down<<=1;
- return (size_t)across*down*8;
+static bool pvrtcTwoBit(uint64_t format) {return format==160 || format==161 || format==164 || format==165;}
+static size_t pvrtcLevelBytes(uint64_t width,uint64_t height,bool twoBit) {
+ // PVRTC1 uses power-of-two mip dimensions and at least two words per axis.
+ if(!width || !height || (width&(width-1)) || (height&(height-1)) ||
+    width>16384 || height>16384)return 0;
+ return (size_t)(std::max<uint64_t>(2,width/(twoBit?8:4))*std::max<uint64_t>(2,height/4)*8);
+}
+static bool textureTransferLength(MTLSize size,uint64_t row,uint64_t image,uint64_t *length) {
+ uint64_t earlier,rows;
+ return size.depth && size.height &&
+    !__builtin_mul_overflow(image,size.depth-1,&earlier) &&
+    !__builtin_mul_overflow(row,size.height,&rows) &&
+    !__builtin_add_overflow(earlier,rows,length);
+}
+static NSUInteger textureSliceCount(id<MTLTexture> texture) {
+ const MTLTextureType type=texture.textureType;
+ if(type==MTLTextureTypeCube || type==MTLTextureTypeCubeArray) {
+  if(texture.arrayLength>NSUIntegerMax/6)return 0;
+  return texture.arrayLength*6;
+ }
+ return texture.arrayLength;
 }
 // All clients use one sample by default. The override also allows host qualification.
 static bool singleSample() {
@@ -1476,7 +1491,6 @@ NB_RESOURCE_SPI
 }
 - (void)replaceRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice withBytes:(const void *)bytes bytesPerRow:(NSUInteger)row bytesPerImage:(NSUInteger)image {
  const uint64_t region[6]={r.origin.x,r.origin.y,r.origin.z,r.size.width,r.size.height,r.size.depth};
- const uint64_t length=(r.size.depth>1?image*(r.size.depth-1):0)+row*r.size.height;
  if(gLogTextures && textureLogTurn())
   GLOG(@"native-metal: texture-log %llu replaceRegion origin %lu,%lu size %lux%lu level %lu slice %lu rows %lu | texture %llux%llu fmt %llu "
         @"options %llx surface %u",(unsigned long long)gTexturesLogged.load(),(unsigned long)r.origin.x,(unsigned long)r.origin.y,
@@ -1484,32 +1498,44 @@ NB_RESOURCE_SPI
         (unsigned long long)_descriptor.width,(unsigned long long)_descriptor.height,(unsigned long long)_descriptor.format,
         (unsigned long long)_descriptor.options,_surface?IOSurfaceGetID(_surface):0u);
  if(_pvrtc) {   // PVRTC blocks: decoded into the RGBA8 texture (the region taken as a whole level of its size)
-  [self replacePvrtcRegion:r mipmapLevel:level slice:slice withBytes:bytes length:pvrtcLevelBytes((uint32_t)r.size.width,(uint32_t)r.size.height,
-   _pvrtc==160 || _pvrtc==161 || _pvrtc==164 || _pvrtc==165)];
+  const size_t expected=pvrtcLevelBytes(r.size.width,r.size.height,pvrtcTwoBit(_pvrtc));
+  const uint64_t available=image?image:expected; // CPU PVRTC uploads use zero row pitch and a complete mip.
+  if(![self replacePvrtcRegion:r mipmapLevel:level slice:slice withBytes:bytes length:available])
+   NBLOG(@"native-metal: PVRTC replaceRegion refused");
   return;
  }
+ uint64_t length=0;
+ if(!textureTransferLength(r.size,row,image,&length))return;
  if(!nmb_texture_replace(_handle,region,level,slice,bytes,row,image,length))NBLOG(@"native-metal: replaceRegion refused: %@",lastError());
 }
-- (void)replacePvrtcRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice withBytes:(const void *)bytes length:(size_t)length {
- const bool twoBit=_pvrtc==160 || _pvrtc==161 || _pvrtc==164 || _pvrtc==165,alpha=_pvrtc>=164;
+- (BOOL)replacePvrtcRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice withBytes:(const void *)bytes length:(size_t)length {
+ const bool twoBit=pvrtcTwoBit(_pvrtc),alpha=_pvrtc>=164;
+ const size_t expected=pvrtcLevelBytes(r.size.width,r.size.height,twoBit);
+ if(!bytes || !expected || length<expected || level>=_descriptor.levels || level>=64 || slice>=textureSliceCount((id<MTLTexture>)self) ||
+    r.origin.x || r.origin.y || r.origin.z || r.size.depth!=1 ||
+    r.size.width!=std::max<uint64_t>(1,_descriptor.width>>level) ||
+    r.size.height!=std::max<uint64_t>(1,_descriptor.height>>level))return NO;
  const uint32_t width=(uint32_t)r.size.width,height=(uint32_t)r.size.height;
- if(!bytes || !width || !height)return;
  std::vector<uint8_t> rgba((size_t)width*height*4);
- pvrtcDecode((const uint8_t *)bytes,length,width,height,twoBit,alpha,rgba.data());
+ pvrtcDecode((const uint8_t *)bytes,expected,width,height,twoBit,alpha,rgba.data());
  const uint64_t region[6]={r.origin.x,r.origin.y,r.origin.z,width,height,1};
- if(!nmb_texture_replace(_handle,region,level,slice,rgba.data(),(uint64_t)width*4,(uint64_t)width*4*height,rgba.size()))
-  NBLOG(@"native-metal: PVRTC replaceRegion refused: %@",lastError());
+ return nmb_texture_replace(_handle,region,level,slice,rgba.data(),(uint64_t)width*4,(uint64_t)width*4*height,rgba.size());
 }
 - (void)replaceRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level withBytes:(const void *)bytes bytesPerRow:(NSUInteger)row {
- [self replaceRegion:r mipmapLevel:level slice:0 withBytes:bytes bytesPerRow:row bytesPerImage:row*r.size.height];
+ uint64_t image=0;
+ if(!_pvrtc && __builtin_mul_overflow(row,r.size.height,&image))return;
+ [self replaceRegion:r mipmapLevel:level slice:0 withBytes:bytes bytesPerRow:row bytesPerImage:image];
 }
 - (void)getBytes:(void *)bytes bytesPerRow:(NSUInteger)row bytesPerImage:(NSUInteger)image fromRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice {
  const uint64_t region[6]={r.origin.x,r.origin.y,r.origin.z,r.size.width,r.size.height,r.size.depth};
- const uint64_t length=(r.size.depth>1?image*(r.size.depth-1):0)+row*r.size.height;
+ uint64_t length=0;
+ if(!textureTransferLength(r.size,row,image,&length))return;
  if(!nmb_texture_get_bytes(_handle,bytes,row,image,length,region,level,slice))NBLOG(@"native-metal: getBytes refused: %@",lastError());
 }
 - (void)getBytes:(void *)bytes bytesPerRow:(NSUInteger)row fromRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level {
- [self getBytes:bytes bytesPerRow:row bytesPerImage:row*r.size.height fromRegion:r mipmapLevel:level slice:0];
+ uint64_t image=0;
+ if(__builtin_mul_overflow(row,r.size.height,&image))return;
+ [self getBytes:bytes bytesPerRow:row bytesPerImage:image fromRegion:r mipmapLevel:level slice:0];
 }
 @end
 // A command can use many independent imports/views of one IOSurface. Their
@@ -2902,9 +2928,9 @@ static uint64_t encodeCommandOf(id object) {
 - (void)copyFromTexture:(id<MTLTexture>)s sourceSlice:(NSUInteger)ss sourceLevel:(NSUInteger)sl toTexture:(id<MTLTexture>)d
  destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl sliceCount:(NSUInteger)ns levelCount:(NSUInteger)nl {
  if(![self textures:NB_OBJECTS(s,d) count:2])return;
- auto slices=[](id<MTLTexture> t)->NSUInteger {return t.arrayLength*((t.textureType==MTLTextureTypeCube || t.textureType==MTLTextureTypeCubeArray)?6:1);};
+ const NSUInteger sourceSlices=textureSliceCount(s),destinationSlices=textureSliceCount(d);
  if(sl>s.mipmapLevelCount || nl>s.mipmapLevelCount-sl || dl>d.mipmapLevelCount || nl>d.mipmapLevelCount-dl ||
-    ss>slices(s) || ns>slices(s)-ss || ds>slices(d) || ns>slices(d)-ds) {[self.commandBuffer refuse:@"texture copy range out of bounds"];return;}
+    ss>sourceSlices || ns>sourceSlices-ss || ds>destinationSlices || ns>destinationSlices-ds) {[self.commandBuffer refuse:@"texture copy range out of bounds"];return;}
  for(NSUInteger slice=0;slice<ns;slice++)for(NSUInteger level=0;level<nl;level++) {
   const NSUInteger mip=sl+level;
   MTLSize size=MTLSizeMake(MAX(s.width>>mip,(NSUInteger)1),MAX(s.height>>mip,(NSUInteger)1),MAX(s.depth>>mip,(NSUInteger)1));
@@ -2914,12 +2940,8 @@ static uint64_t encodeCommandOf(id object) {
 }
 - (void)copyFromTexture:(id<MTLTexture>)s toTexture:(id<MTLTexture>)d {
  if(![self textures:NB_OBJECTS(s,d) count:2])return;
- const NSUInteger levels=MIN(s.mipmapLevelCount,d.mipmapLevelCount),slices=MIN(s.arrayLength,d.arrayLength);
- for(NSUInteger slice=0;slice<slices;slice++)for(NSUInteger level=0;level<levels;level++) {
-  MTLSize size=MTLSizeMake(MAX(s.width>>level,(NSUInteger)1),MAX(s.height>>level,(NSUInteger)1),MAX(s.depth>>level,(NSUInteger)1));
-  [self copyFromTexture:s sourceSlice:slice sourceLevel:level sourceOrigin:MTLOriginMake(0,0,0) sourceSize:size toTexture:d destinationSlice:slice
-       destinationLevel:level destinationOrigin:MTLOriginMake(0,0,0)];
- }
+ [self copyFromTexture:s sourceSlice:0 sourceLevel:0 toTexture:d destinationSlice:0 destinationLevel:0
+      sliceCount:MIN(textureSliceCount(s),textureSliceCount(d)) levelCount:MIN(s.mipmapLevelCount,d.mipmapLevelCount)];
 }
 - (void)copyFromBuffer:(id<MTLBuffer>)s sourceOffset:(NSUInteger)o sourceBytesPerRow:(NSUInteger)row sourceBytesPerImage:(NSUInteger)image
             sourceSize:(MTLSize)z toTexture:(id<MTLTexture>)d destinationSlice:(NSUInteger)slice destinationLevel:(NSUInteger)level
@@ -2935,10 +2957,11 @@ static uint64_t encodeCommandOf(id object) {
  }
  if([(NBTexture *)d pvrtc]) {   // PVRTC blocks: decoded from the buffer's contents now, as the copy is encoded
   const uint8_t *contents=(const uint8_t *)[s contents];
-  if(!contents){[self.commandBuffer refuse:@"a PVRTC copy from a buffer with no CPU contents"];return;}
-  const uint32_t f=[(NBTexture *)d pvrtc];const bool twoBit=f==160 || f==161 || f==164 || f==165;
-  const size_t want=pvrtcLevelBytes((uint32_t)z.width,(uint32_t)z.height,twoBit),have=[s length]>o?[s length]-o:0;
-  [(NBTexture *)d replacePvrtcRegion:MTLRegionMake2D(dO.x,dO.y,z.width,z.height) mipmapLevel:level slice:slice withBytes:contents+o length:std::min(want,have)];
+  const NSUInteger length=[s length];
+  if(!contents || o>=length || z.depth!=1 || dO.z ||
+     ![(NBTexture *)d replacePvrtcRegion:MTLRegionMake2D(dO.x,dO.y,z.width,z.height) mipmapLevel:level
+         slice:slice withBytes:contents+o length:length-o])
+   [self.commandBuffer refuse:@"invalid PVRTC buffer-to-texture copy"];
   return;
  }
  const std::array<uint64_t,3> size={z.width,z.height,z.depth},b={dO.x,dO.y,dO.z};
@@ -3180,14 +3203,23 @@ static char kUserDictionaryKey;
  // nmb_command_buffer_commit returns, and Metal's status reads Scheduled inside them (as its wait returns after them); the frontend's
  // own `submitted` is only set after the call, so the runtime's status answers once scheduling has been delivered.
  if(self.committed && !self.submitted && !_schedulingDelivered)return MTLCommandBufferStatusCommitted;
+ std::lock_guard<std::mutex> guard(gRuntimeHandleLock);
+ if(!_handle)return MTLCommandBufferStatusError;
  return (MTLCommandBufferStatus)nmb_command_buffer_status(_handle);
 }
 - (NSError *)error {
  if(self.failedLocally)return nbError(self.encodeFailure);
  if(!self.submitted)return nil;
  if(self.status!=MTLCommandBufferStatusError)return nil;
- char text[512]={};nmb_command_buffer_error(_handle,text,sizeof text);
- uint64_t code=nmb_command_buffer_metal_error_code(_handle);
+ char text[512]={};
+ uint64_t code=0;
+ {
+  std::lock_guard<std::mutex> guard(gRuntimeHandleLock);
+  if(!_handle)return nbError(self.encodeFailure);
+  nmb_command_buffer_error(_handle,text,sizeof text);
+  code=nmb_command_buffer_metal_error_code(_handle);
+ }
+ NSString *message=([NSString stringWithUTF8String:text])?:@"GPU command failed";
 #if TARGET_OS_IPHONE
  // The runtime uses Metal's macOS code 11 for Vulkan DeviceLost. iOS has no
  // removable GPU: this is revoked access after the process's context fault,
@@ -3195,8 +3227,8 @@ static char kUserDictionaryKey;
  if(code==11)code=MTLCommandBufferErrorAccessRevoked;
 #endif
  if(code)return [NSError errorWithDomain:MTLCommandBufferErrorDomain code:(NSInteger)code
-                              userInfo:@{NSLocalizedDescriptionKey:[NSString stringWithUTF8String:text]}];
- return nbError([NSString stringWithUTF8String:text]);
+                              userInfo:@{NSLocalizedDescriptionKey:message}];
+ return nbError(message);
 }
 // Debug groups and cache hints name work for tools and the driver's caches; they change nothing the GPU computes here.
 - (void)pushDebugGroup:(NSString *)name {(void)name;}
@@ -3429,7 +3461,7 @@ static char kUserDictionaryKey;
  if(self.failedLocally) {
   std::lock_guard<std::mutex> guard(gRuntimeHandleLock);
   NmbCommandBuffer *handle=_handle;_handle=nullptr;
-  nmb_command_buffer_release(handle);
+  if(handle)nmb_command_buffer_release(handle);
  }
  NSArray *completedHandlers;
  @synchronized(self){

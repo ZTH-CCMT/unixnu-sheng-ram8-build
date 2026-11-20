@@ -505,7 +505,16 @@ IOReturn NativeAdrenoSubmit::setPreemption(NativeAdrenoRing *high,NativeAdrenoRi
 {
     if(!attached_ || poisoned_)return kIOReturnNotReady;
     if(outstanding())return kIOReturnBusy;
-    if(!on) {preempt_on_=false;ring_count_=1;rings_[1]=nullptr;return kIOReturnSuccess;}
+    if(!on) {
+        if(!preempt_on_)return kIOReturnSuccess;
+        // Dropping the second ring while the CP owns it would strand all later submissions.
+        if(preempt_.inFlight() || preempt_.loaded()!=0 || !ring(0)->current())return kIOReturnBusy;
+        const IOReturn status=preempt_.detach();
+        if(status)return status;
+        preempt_on_=false;ring_count_=1;rings_[1]=nullptr;
+        return kIOReturnSuccess;
+    }
+    if(preempt_on_)return kIOReturnBusy;
     if(!high || !low || high==low)return kIOReturnBadArgument;
     if(!high->preemption() || !low->preemption())return kIOReturnBadArgument;
     for(unsigned i=0;i<NativeAdrenoPreemptRingCount;++i)
@@ -520,7 +529,7 @@ IOReturn NativeAdrenoSubmit::setPreemption(NativeAdrenoRing *high,NativeAdrenoRi
         const uint64_t ttbr0=table_vm_->ttbr0();
         if(!NativeAdrenoPreempt::writeSmmuInfo(setup.pages.smmu_cpu[i],ttbr0,uint32_t(ttbr0>>48),0))return kIOReturnBadArgument;
         if(r->resetExecutedTable(ttbr0))return kIOReturnIOError;
-        (void)r->writePreemptRecord(setup.pages.record_cpu[i]);
+        if(r->writePreemptRecord(setup.pages.record_cpu[i]))return kIOReturnIOError;
     }
     rings_[0]=high;rings_[1]=low;ring_count_=2;
     gpuTraceEvent(GpuTraceConfig,0,2,setup.mode,table_mode_,PreemptSwitchTimeoutUs,PreemptAgingUs,PreemptAgingSliceUs);
@@ -564,9 +573,21 @@ IOReturn NativeAdrenoSubmit::detach()
 {
     if(poisoned_ || outstanding())return kIOReturnBusy;
     if(!attached_)return kIOReturnNotReady;
+    if(preempt_on_) {
+        const IOReturn status=setPreemption(nullptr,nullptr,{},false);
+        if(status)return status;
+    }
     if(failed_fences_)IODeleteData(failed_fences_,uint32_t,failed_capacity_);
-    failed_fences_=nullptr;failed_count_=failed_capacity_=0;
-    attached_=false;vm_=nullptr;ring_=nullptr;return kIOReturnSuccess;
+    if(fence_tag_)IOFree(fence_tag_,sizeof(*fence_tag_)*FenceMap);
+    if(fence_ring_)IOFree(fence_ring_,sizeof(*fence_ring_)*FenceMap);
+    for(size_t i=0;i<jobs_.count;++i)delete jobs_.items[i];
+    if(jobs_.items)IODeleteData(jobs_.items,Job *,jobs_.count);
+    jobs_={};failed_fences_=nullptr;failed_count_=failed_capacity_=0;
+    fence_tag_=nullptr;fence_ring_=nullptr;fence_issued_=0;
+    rings_[0]=rings_[1]=nullptr;ring_count_=0;
+    attached_=false;vm_=table_vm_=nullptr;ring_=nullptr;
+    table_mode_=0;write_table_=nullptr;table_cookie_=nullptr;
+    return kIOReturnSuccess;
 }
 bool NativeAdrenoSubmit::queueOutstanding(uint64_t queue) const
 {
