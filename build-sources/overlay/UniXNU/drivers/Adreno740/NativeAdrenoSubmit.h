@@ -82,7 +82,7 @@ public:
         NativeAdrenoPreemptRings pages{};
         uint64_t (*now)(void *)=nullptr;
         void *clock=nullptr;
-        unsigned mode=1;   /* 1: only the low and disabled queues (priority 2, 3) take the second ring; 2: the normal ones (1) too */
+        unsigned mode=1;   /* See nextPriority() for both routing policies. */
     };
 private:
     struct Job {
@@ -132,8 +132,8 @@ private:
     IOReturn useVm(NativeAdrenoVm *,const NativeAdrenoRingClock *,unsigned index=0);
     IOReturn useVmForReplay(NativeAdrenoVm *,const NativeAdrenoRingClock *,uint32_t restart_fence);
     NativeAdrenoRing *ring_=nullptr;
-    /* Ring 0 serves requested high priorities; ring 1 serves normal and low work in mode 2.
-     * Queue ordering is preserved across priority changes. Board policy enables preemption. */
+    /* Ring 0 is the primary ring. The board may enable preemption and route work
+     * to ring 1. Queue ordering is preserved across priority changes. */
     NativeAdrenoRing *rings_[2]={nullptr,nullptr};
     unsigned ring_count_=0;
     NativeAdrenoPreempt preempt_{};
@@ -153,7 +153,7 @@ private:
     bool reserveFailedFences(size_t extra);
     IOReturn recoverDual(NativeAdrenoRestart,void *,const NativeAdrenoRingClock *,NativeAdrenoRecovery *);
     PreemptSetup preempt_setup_{};
-    int32_t next_priority_=-1;    /* the Metal GPU priority of the next submission (-1: not given, the middle ring) */
+    int32_t next_priority_=-1;    /* the Metal GPU priority of the next submission (-1: not given) */
     int32_t next_role_=0;         /* the GPU role of the task submitting next (only logged) */
     bool last_stranded_=false;
     uint32_t recovery_info_[4]={};   /* the last recovery: the hung job's ring (9: none), each ring's newest fence, the ring the CP ran */
@@ -210,8 +210,12 @@ private:
 public:
     /* The process the next submission comes from, for the timeline (the user client sets it before each submit). */
     void nextOwner(int32_t pid) {next_owner_=pid;}
-    /* The Metal GPU priority of the next submission's queue (MTLGPUPriority: 0 high, 1 normal, 2 low, 3 disabled, 4 normal-high,
-     * 5 real-time; -1 not given). Only low and disabled (2, 3) go to ring 1; the rest, the unspecified included, stay on ring 0. */
+    /* The next queue's Metal priority: 0 high, 1 normal, 2 low, 3 disabled,
+     * 4 normal-high, 5 real-time, and -1 unspecified. With GPU table switching
+     * (table mode 2) and active dual-ring scheduling, preemption mode 1 routes
+     * priorities 2 and 3 to ring 1. Preemption mode 2 also sends 1 and -1 there.
+     * All other priorities use ring 0. A queue with outstanding work stays on
+     * its previously selected ring until that work retires. */
     void nextPriority(int32_t priority) {next_priority_=priority>=0 && priority<=5?priority:-1;}
     void nextRole(int32_t role) {next_role_=role;}
     bool lastRecoveryStranded() const {return last_stranded_;}

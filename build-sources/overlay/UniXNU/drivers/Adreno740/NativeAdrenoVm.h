@@ -224,7 +224,7 @@ public:
      * its device, its queued submissions run again and new ones are taken (msm instead makes the VM unusable, and the client then
      * reports its device lost; when that client was the render server, backboardd ended and SpringBoard's restart stalled, untagged-1f4ba0a24).
      * hangs() counts them; faults(), which a client turns into a lost device, stays for a VM whose table failed. */
-    void noteHang(bool) {++hangs_;}
+    void noteHang() {++hangs_;}
     uint64_t hangs() const {return hangs_;}
     uint64_t faults() const {return faults_;}
     bool unusable() const {return unusable_;}

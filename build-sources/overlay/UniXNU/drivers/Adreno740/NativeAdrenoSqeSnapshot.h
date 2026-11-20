@@ -76,7 +76,9 @@ struct NativeAdrenoSwitchEvidence {
     struct NativeAdrenoPreemptPages before,after;
     struct NativeAdrenoSqeSnapshot sqe;
 };
-enum { NativeAdrenoSwitchEvidenceWords=sizeof(struct NativeAdrenoSwitchEvidence)/sizeof(uint32_t) };
+/* Version 1 is exported verbatim in BootLog. Keep this count independent of
+ * C layout so that a padding change cannot silently change the wire format. */
+enum { NativeAdrenoSwitchEvidenceWords=359 };
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -85,7 +87,11 @@ extern "C" {
 uint32_t native_adreno_switch_evidence_copy(uint32_t index,uint32_t *out,size_t capacity_words);
 #ifdef __cplusplus
 }
-static_assert(sizeof(NativeAdrenoSwitchEvidence)==NativeAdrenoSwitchEvidenceWords*4,"evidence has padding");
+static_assert(sizeof(NativeAdrenoSwitchEvidence)==NativeAdrenoSwitchEvidenceWords*sizeof(uint32_t),"evidence v1 size");
+static_assert(offsetof(NativeAdrenoSwitchEvidence,published_tail)==41*sizeof(uint32_t) &&
+              offsetof(NativeAdrenoSwitchEvidence,before)==119*sizeof(uint32_t) &&
+              offsetof(NativeAdrenoSwitchEvidence,after)==167*sizeof(uint32_t) &&
+              offsetof(NativeAdrenoSwitchEvidence,sqe)==215*sizeof(uint32_t),"evidence v1 section offsets");
 static_assert(NativeAdrenoSwitchEvidenceWords<=512,"BootLog evidence budget");
 #endif
 #endif

@@ -317,12 +317,10 @@ NativeAdrenoRing *NativeAdrenoSubmit::ringOfFence(uint32_t fence) const
     if((int32_t)(fence-rings_[0]->lastSubmitted())<=0)return rings_[0];
     return ring_count_>1?rings_[1]:rings_[0];
 }
-/* The ring a submission of this priority goes to: high (0), normal-high (4) and real-time (5) to the first, the rest to the second.
- * A ring alone takes everything. */
+/* Preferred ring for a queue with no outstanding work. */
 unsigned NativeAdrenoSubmit::ringForPriority() const
 {
     if(!preemption() || single_ring_after_reset_ || preempt_dead_ || table_mode_!=2)return 0;
-    /* Mode 2 separates normal work from requested high priorities. */
     const int32_t p=next_priority_;
     return p==2 || p==3 || (preempt_setup_.mode>=2 && (p==1 || p<0))?1:0;
 }
@@ -1370,7 +1368,7 @@ IOReturn NativeAdrenoSubmit::recover(NativeAdrenoRestart restart,void *cookie,co
     if(guilty) {
         if(!reserveFailedFences(1))return kIOReturnNoMemory;
         NativeAdrenoVm *vm=guilty->vm?guilty->vm:vm_;
-        vm->noteHang(vm!=vm_);out->guilty=vm;
+        vm->noteHang();out->guilty=vm;
     }
     recovery_info_[0]=guilty?0:9;recovery_info_[1]=last;recovery_info_[2]=0;recovery_info_[3]=0;
     IOReturn status=restart(cookie,ring(0),hung);

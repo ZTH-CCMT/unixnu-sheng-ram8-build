@@ -1353,7 +1353,8 @@ int main(int argc,char **argv)
         CHECK(p.submit.wait(3,&ringclock,1000)==kIOReturnSuccess && p.submit.wait(2,&ringclock,1000)==kIOReturnSuccess);
         CHECK(p.submit.outstanding()==0);
         /* Completed recovery leaves the process usable. */
-        p.vm.noteHang(true);
+        p.vm.noteHang();
+        CHECK(p.vm.hangs()==2 && p.vm.faults()==0 && !p.vm.unusable());
         CHECK(p.submit.submit(&buffer,1,0,&fence)==kIOReturnSuccess);
         /* A restart that fails leaves the submit object poisoned. */
         CHECK(p.submit.recover([](void *,NativeAdrenoRing *,uint32_t)->IOReturn {return kIOReturnIOError;},nullptr,&ringclock,&result)==kIOReturnIOError);

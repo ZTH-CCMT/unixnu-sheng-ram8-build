@@ -210,6 +210,24 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     bool primary=false;
     bool logicalPM=false;
     bool transferred=false;
+    // Boot options are immutable. Initialize before startDisplay can make callbacks.
+    bool transferEnabled,earlyRetire,retireEnabled,diffEnabled,validateEnabled;
+    uint32_t halfOfferFormat;
+    void loadFrameOptions() {
+        const auto option=[](const char *name,unsigned fallback=0) {
+            unsigned value=fallback;
+            PE_parse_boot_argn(name,&value,sizeof(value));
+            return value;
+        };
+        transferEnabled=option("offline-legacy-transfer")==1;
+        earlyRetire=option("early-retire",1)==1;
+        const bool retire=option("offline-legacy-retire")==1;
+        const bool cpuPresent=option("offline-legacy-cpu-present")==1;
+        retireEnabled=retire || cpuPresent;
+        diffEnabled=option("fb-diff")==1;
+        validateEnabled=option("offline-legacy-validate")==1;
+        halfOfferFormat=option("fb-half",1)==2?NGP_RGBA16F_ENCODED:NGP_RGBA16F_LINEAR;
+    }
     // Every request the validator accepted and the family has not retired yet. A client may submit swap N+1 while swap N is still on the GPU
     // (int-131: swap 3 was validated during swap 2's GPU copy and one remembered pointer lost swap 2, which then never retired and left
     // every wait on it busy), so more than one can be pending.
@@ -296,11 +314,6 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     // swap releases the frame shown before it, whose copy has finished (transferred held this one back); the offered frame itself stays
     // in use until the next swap retires, so the compositor never writes a frame the GPU is still reading.
     bool gpuRetired=false;
-    // How a half-float surface is encoded (boot-arg fb-half=2: values already sRGB-encoded), as the GPU client converts it.
-    static uint32_t halfOfferFormat() {
-        unsigned mode=1;PE_parse_boot_argn("fb-half",&mode,sizeof(mode));
-        return mode==2?NGP_RGBA16F_ENCODED:NGP_RGBA16F_LINEAR;
-    }
     // The refresh tick runs on the family's work loop, the loop of the command gate that registers and removes the vsync clients, so the
     // client queue (kLegacyVsyncClients) never changes while the sender walks it.
     IOTimerEventSource *vsyncTimer=nullptr;
@@ -698,6 +711,7 @@ public:
         applyStateRequest(&request,false);
     }
     bool start(IOService *provider) override {
+        loadFrameOptions();
         if(!startDisplay(provider))return false;
         publishOneLayer();
         startVsync();startDirect();return true;
@@ -791,9 +805,8 @@ public:
         kicking=false;
     }
     void kickOnce() {
-        unsigned enabled=0;PE_parse_boot_argn("offline-legacy-transfer",&enabled,sizeof(enabled));
         stat(1);
-        if(enabled!=1 || !logicalPM || !bootMapping || !primary){stat(3);return;}
+        if(!transferEnabled || !logicalPM || !bootMapping || !primary){stat(3);return;}
         if(transferred || pendingSlot>=0){stat(2);return;}
         const OriginalLegacySwapRequest *request=pendingSwapRequest();
         if(!request || !isValidated(request)){stat(4);return;}
@@ -884,7 +897,7 @@ public:
         }
         directToBoot();
         stat(7);note(7,-1,request);
-        if(!gpuBypass && native_legacy_gpu_offer(this,memory,sourceStride,width,height,half?halfOfferFormat():NGP_BGRX8888)) {
+        if(!gpuBypass && native_legacy_gpu_offer(this,memory,sourceStride,width,height,half?halfOfferFormat:NGP_BGRX8888)) {
             // The GPU writes the scanout memory behind the CPU's back: the differential copy's picture of it is stale from now on.
             native_legacy_swap_stage(1);countFormat(half?7:6);
             shadowValid=false;gpuRequest=request;gpuTraceRequest=traceId(request);gpuLength=length;transferred=true;
@@ -892,8 +905,7 @@ public:
             // copy (int-243: about 4.4 ms render then about 3 ms copy per frame). Retire now: the presenter holds its own reference to this
             // frame's memory, the previous frame's copy has finished (transferred held this one back), and the next swap still waits for
             // the copy because transferred stays set until finishGpuSwap.
-            unsigned early=1;PE_parse_boot_argn("early-retire",&early,sizeof(early));
-            if(early==1 && retireSwap(request,true)) {
+            if(earlyRetire && retireSwap(request,true)) {
                 gpuRetired=true;native_legacy_early_retires=native_legacy_early_retires+1;
             }
             return;
@@ -935,10 +947,8 @@ public:
             // Differential copy is opt-in (fb-diff=1): on hardware it reads the whole source every frame and was not faster
             // than the plain copy (143-285 ms per swap either way), and the first boots with it were followed by an unresponsive
             // lock screen that disappeared with the plain copy (int-005).
-            static int diffOff=-1;
-            if(diffOff<0){unsigned v=0;PE_parse_boot_argn("fb-diff",&v,sizeof v);diffOff=(v!=1);}
-            if(!diffOff && !shadow && need<=(64ull<<20)){shadow=IOMallocAligned((vm_size_t)need,16384);if(shadow){shadowBytes=need;shadowValid=false;}}
-            if(!diffOff && shadow && shadowBytes>=need)
+            if(diffEnabled && !shadow && need<=(64ull<<20)){shadow=IOMallocAligned((vm_size_t)need,16384);if(shadow){shadowBytes=need;shadowValid=false;}}
+            if(diffEnabled && shadow && shadowBytes>=need)
                 stored=native_legacy_copy_diff(reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()),
                     bootMapping->getLength(),video.v_rowBytes,reinterpret_cast<const void *>(source->getVirtualAddress()),
                     source->getLength(),sourceStride,width,height,shadow,shadowValid);
@@ -981,10 +991,7 @@ public:
     }
     // Hands the pending head to the unchanged family's completion. Leaves transferred alone: the callers decide when the next frame may go.
     bool retireSwap(const OriginalLegacySwapRequest *request,bool force) {
-        unsigned retire=0,cpuPresent=0;
-        PE_parse_boot_argn("offline-legacy-retire",&retire,sizeof(retire));
-        PE_parse_boot_argn("offline-legacy-cpu-present",&cpuPresent,sizeof(cpuPresent));
-        if(!(retire==1 || cpuPresent==1 || force))return false;
+        if(!retireEnabled && !force)return false;
         if(!activateOnlyPendingSwap(request))return false;
         stat(11);note(6,-1,request);
         const uint64_t id=(&native_gpu_trace_enabled && native_gpu_trace_enabled())?traceId(request):0;
@@ -1111,8 +1118,7 @@ public:
         auto word=[&](unsigned offset){uint32_t value=0;memcpy(&value,bytes+offset,4);return value;};
         OSObject *surface=nullptr;unsigned reason=1;bool accepted=false,scanout=false;
         const uint32_t epoch=gpuResetEpoch();
-        unsigned enabled=0;PE_parse_boot_argn("offline-legacy-validate",&enabled,sizeof(enabled));
-        if(enabled==1 && logicalPM && primary && bootMapping && request) {
+        if(validateEnabled && logicalPM && primary && bootMapping && request) {
             reason=2;OSObject *surfaces[4]={};memcpy(surfaces,bytes+kRequestSurfaces,sizeof(surfaces));surface=surfaces[0];
             uint32_t width=0,height=0;getDisplayDimensions(&width,&height);
             if(surface && surface->metaCast("IOSurface") && !surfaces[1] && !surfaces[2] && !surfaces[3] &&
