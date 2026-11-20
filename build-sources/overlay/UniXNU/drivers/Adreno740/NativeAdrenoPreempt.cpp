@@ -89,7 +89,7 @@ IOReturn NativeAdrenoPreempt::attach(const NativeAdrenoPreemptIo *io,const Nativ
     uint32_t loaded,uint64_t (*now)(void *),void *clock)
 {
     if(attached_)return kIOReturnBusy;
-    if(!io || !io->write32 || !io->read32 || !io->barrier)return kIOReturnBadArgument;
+    if(!io || !io->write32 || !io->read32 || !io->barrier || !now)return kIOReturnBadArgument;
     if(loaded>=NativeAdrenoPreemptRingCount)return kIOReturnBadArgument;
     for(uint32_t i=0;i<NativeAdrenoPreemptRingCount;++i)
         if(!rings.record[i] || !rings.smmu_info[i])return kIOReturnBadArgument;
@@ -299,7 +299,7 @@ bool NativeAdrenoPreempt::complete(bool *read_error)
     if(cntl&CntlStop)return false;
     closeEvent(1);
     loaded_=next_;armed_=false;
-    if(trigger_us_ && now_us_) {
+    if(now_us_) {
         const uint64_t us=now_us_(clock_cookie_)-trigger_us_;
         stats_.last_us=uint32_t(us>UINT32_MAX?UINT32_MAX:us);
     }

@@ -22,6 +22,7 @@ IOReturn NativeAdrenoMaintainOwnedPages(void *mapping,size_t bytes,NativeAdrenoC
 {
     CHECK(mapping && bytes && !(((uintptr_t)mapping|bytes)&4095));
     CHECK(op==NativeAdrenoClean || op==NativeAdrenoCleanInvalidate || op==NativeAdrenoInvalidate);
+    fixture.cache_operations.push_back(op);
     ++fixture.cache_calls;
     return fixture.cache_calls==fixture.cache_fail_call?kIOReturnIOError:kIOReturnSuccess;
 }
@@ -1065,6 +1066,7 @@ int main(int argc,char **argv)
         mmio[(CB+0x618)/4]=0xffffffffu;
         CHECK(p.submit.submit(&buffer,1,0,&fence)==kIOReturnSuccess && fence==1);
         CHECK(fixture.cache_calls==cache_calls+1 && mmio[(CB+0x618)/4]==0xffffffffu);
+        CHECK(fixture.cache_operations.back()==NativeAdrenoCleanInvalidate);
         CHECK(native_adreno_coherence[0]==1 && native_adreno_coherence[1]==0x70970001u &&
             native_adreno_coherence[2]==~0u && native_adreno_coherence[3]==~0u);   /* no board DRAM reader installed */
         CHECK(cp.writes.back()==0x0807 && cp.regs[0x0807]==11+4+31);
@@ -1087,6 +1089,29 @@ int main(int argc,char **argv)
         fencemem[1]=2;
         CHECK(p.submit.wait(2,&ringclock,1000)==kIOReturnSuccess);
         CHECK(p.submit.detach()==kIOReturnSuccess);
+    }
+    {
+        const unsigned imports=fixture.imports_live;
+        Path p;CHECK(exposed(p)==kIOReturnSuccess);
+        NativeAdrenoMemory imported;
+        fixture.write_protected_imports=true;
+        CHECK(imported.importTask(reinterpret_cast<void *>(0x77),0x20000000,4096,40,4096)==kIOReturnSuccess);
+        fixture.write_protected_imports=false;
+        CHECK(imported.readOnly());
+        const unsigned mmioCalls=mf.calls;
+        uint64_t handle=0;
+        CHECK(p.vm.map(&imported,0,0x808000,ArmSmmu4KRead|ArmSmmu4KWrite,0,2,&handle)==kIOReturnBadArgument && !handle);
+        CHECK(mf.calls==mmioCalls && imported.deviceReferences()==0);
+        CHECK(p.vm.map(&p.object,0,0x808000,ArmSmmu4KRead|ArmSmmu4KWrite,1,3,&handle)==kIOReturnBadArgument && !handle);
+        CHECK(p.vm.map(&imported,0,0x808000,ArmSmmu4KRead,0,2,&handle)==kIOReturnSuccess && handle);
+        CHECK(p.vm.unmap(handle)==kIOReturnSuccess);
+        CHECK(imported.release()==kIOReturnSuccess && fixture.imports_live==imports);
+        CHECK(p.submit.detach()==kIOReturnSuccess);
+        CHECK(p.vm.unmap(p.handle)==kIOReturnSuccess);
+        CHECK(p.object.release()==kIOReturnSuccess);
+        CHECK(p.vm.detach()==kIOReturnSuccess);
+        CHECK(p.tables.release()==kIOReturnSuccess);
+        std::puts("PASS read-only GPU mappings and rejection of incompatible aliases");
     }
     /* Every retired job is timed by the driver's clock without the CP's stamps: from its submission, or from the retirement before it
      * on its ring, to its own; a job over 8 ms is named in the slow table and the longest stay in the long table. */

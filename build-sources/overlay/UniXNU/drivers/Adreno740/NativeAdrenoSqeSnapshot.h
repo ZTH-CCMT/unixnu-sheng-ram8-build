@@ -17,21 +17,21 @@ enum { NativeAdrenoSqeBanks=2, NativeAdrenoSqeBankWords=64,
        NativeAdrenoPublishedTailWords=64, NativeAdrenoEvidenceRegs=9,
        NativeAdrenoSwitchEvidenceSlots=2, NativeAdrenoSwitchEvidenceVersion=1 };
 struct NativeAdrenoSqeSnapshot {
-    uint32_t words[2][64];
-    uint32_t valid_mask[2][2];
-    uint32_t selector_saved[2];
-    int32_t selector_read_status[2];
-    int32_t selector_select_status[2];
-    int32_t read_status[2];
-    uint32_t first_failed_word[2];
-    int32_t selector_restore_status[2];
+    uint32_t words[NativeAdrenoSqeBanks][NativeAdrenoSqeBankWords];
+    uint32_t valid_mask[NativeAdrenoSqeBanks][(NativeAdrenoSqeBankWords+31)/32];
+    uint32_t selector_saved[NativeAdrenoSqeBanks];
+    int32_t selector_read_status[NativeAdrenoSqeBanks];
+    int32_t selector_select_status[NativeAdrenoSqeBanks];
+    int32_t read_status[NativeAdrenoSqeBanks];
+    uint32_t first_failed_word[NativeAdrenoSqeBanks];
+    int32_t selector_restore_status[NativeAdrenoSqeBanks];
 };
 static inline void NativeAdrenoSqeSnapshotInit(struct NativeAdrenoSqeSnapshot *out)
 {
     unsigned b,i;
-    for(b=0;b<2;++b) {
-        for(i=0;i<64;++i)out->words[b][i]=UINT32_MAX;
-        out->valid_mask[b][0]=out->valid_mask[b][1]=0;
+    for(b=0;b<NativeAdrenoSqeBanks;++b) {
+        for(i=0;i<NativeAdrenoSqeBankWords;++i)out->words[b][i]=UINT32_MAX;
+        for(i=0;i<sizeof out->valid_mask[b]/sizeof out->valid_mask[b][0];++i)out->valid_mask[b][i]=0;
         out->selector_saved[b]=out->first_failed_word[b]=UINT32_MAX;
         out->selector_read_status[b]=out->selector_select_status[b]=-1;
         out->read_status[b]=out->selector_restore_status[b]=-1;
@@ -49,7 +49,7 @@ struct NativeAdrenoPublishedTail {
     uint32_t valid_mask,first,count;
     int32_t barrier_status;
     uint32_t begin_us[2],end_us[2];
-    uint32_t words[64];
+    uint32_t words[NativeAdrenoPublishedTailWords];
 };
 /* CPU views of the first 64 record bytes and first 28 SMMU-info bytes. These
  * are already driver-owned coherent/uncached mappings. A successful barrier

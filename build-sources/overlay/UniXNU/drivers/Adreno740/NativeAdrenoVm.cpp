@@ -242,6 +242,7 @@ IOReturn NativeAdrenoVm::preflight(const NativeAdrenoMemory *memory,unsigned upp
 {
     if(!memory || upper>1 || !regions_[upper].arena || !memory->backed() || memory->quarantined() ||
         !memory->bytes() || !memory->spanCount() || !(permissions&ArmSmmu4KRead) || (permissions&~15u) ||
+        (memory->readOnly() && (permissions&ArmSmmu4KWrite)) ||
         writeback>1 || (shareability!=2 && shareability!=3))return kIOReturnBadArgument;
     const ArmSmmu4KLiveArena *a=regions_[upper].arena;
     if((iova&4095) || iova<a->iova || iova-a->iova>=a->bytes || memory->bytes()>a->bytes-(iova-a->iova))
@@ -291,7 +292,8 @@ IOReturn NativeAdrenoVm::preflight(const NativeAdrenoMemory *memory,unsigned upp
  * surface imports of 5000-6000 spans each, every one checked against every other range. */
 bool NativeAdrenoVm::exclusivePages(const NativeAdrenoMemory *memory,unsigned cls) const
 {
-    if(!memory || !memory->imported())return true;   /* preflight refuses a null one */
+    if(!memory)return true;   /* preflight refuses a null one */
+    if(!memory->imported())return memory->deviceReferences()==0;
     size_t imports=0;for(size_t k=0;k<16;++k)imports+=import_spans_[k];
     if(imports!=import_spans_[cls&15])return false;
     return !NativeAdrenoMemory::ownsAnyPage(memory->spans(),memory->spanCount());

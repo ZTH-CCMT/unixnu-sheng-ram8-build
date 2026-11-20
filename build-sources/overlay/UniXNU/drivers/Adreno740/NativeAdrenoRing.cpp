@@ -73,7 +73,10 @@ enum : uint32_t {
     RingRegToMem = 0x3e,      /* CP_REG_TO_MEM */
     RingAlwaysOnCounter = 0x0980,   /* CP_ALWAYS_ON_COUNTER, 64 bit */
     RingStampWords = 4,
-    RingStampOffset = 512,    /* the timeline slots in the fence page: 64 of 16 bytes */
+    RingStampOffset = 512,
+    RingStampSlots = 64,
+    RingStampStride = 16,
+    RingStampBytes = RingStampOffset+RingStampSlots*RingStampStride,
     RingFenceWords = 7,       /* kernel bring-up submissions: TYPE4 scratch + TYPE7 event */
     RingFramedFenceWords = 31,/* user submissions: scratch, BV timestamp, BR wait, ring timestamp */
     /* CP preemption between rings (a6xx_preempt.c, a6xx_gpu.c a6xx_emit_set_pseudo_reg): CP_SET_PSEUDO_REG (0x56) with the
@@ -125,11 +128,11 @@ IOReturn NativeAdrenoRing::writeWptr(uint32_t value)
         }
         if(tries==200) {
             native_adreno_wptr_fence[3]=native_adreno_wptr_fence[3]+1;
-            (void)io_.fence_status(io_.fence_cookie,1,&status);
+            if(io_.fence_status(io_.fence_cookie,1,&status))return poison();
             return kIOReturnSuccess;   /* the stall handler gives WPTR again later */
         }
         native_adreno_wptr_fence[2]=native_adreno_wptr_fence[2]+1;
-        (void)io_.fence_status(io_.fence_cookie,1,&status);
+        if(io_.fence_status(io_.fence_cookie,1,&status))return poison();
         if(io_.write32(io_.cookie,RingWptr,value))return poison();
     }
 }
@@ -235,7 +238,7 @@ static size_t packet(uint32_t *words,size_t at,uint32_t opcode,const uint32_t *p
 /* CP_REG_TO_MEM of the always-on counter into the timeline slot of this fence (second: the end half). */
 static size_t stamp(uint32_t *words,size_t at,uint64_t fence_iova,uint32_t seqno,bool end)
 {
-    const uint64_t to=fence_iova+RingStampOffset+(uint64_t)(seqno&63)*16+(end?8:0);
+    const uint64_t to=fence_iova+RingStampOffset+(uint64_t)(seqno%RingStampSlots)*RingStampStride+(end?8:0);
     const uint32_t payload[3]={RingAlwaysOnCounter|(2u<<18)|(1u<<30),(uint32_t)to,(uint32_t)(to>>32)};
     return packet(words,at,RingRegToMem,payload,3);
 }
@@ -505,16 +508,20 @@ IOReturn NativeAdrenoRing::restartSecondary(uint32_t completed)
     restore_wptr_=false;reset_pending_=true;table_pending_=false;
     return kIOReturnSuccess;
 }
+void NativeAdrenoRing::setTimeline(bool on)
+{
+    stamps_=on && attached_ && fence_bytes_>=RingStampBytes;
+}
 uint32_t NativeAdrenoRing::timeline(uint32_t fence,uint64_t *start,uint64_t *end)
 {
     /* status bits: 1 attached, 2 stamps on, 4 page big enough, 8 page acquired, 16 slot read */
     if(!start || !end)return 0;
     *start=*end=0;
-    uint32_t status=(attached_?1u:0u)|(stamps_?2u:0u)|(fence_bytes_>=RingStampOffset+64*16?4u:0u);
+    uint32_t status=(attached_?1u:0u)|(stamps_?2u:0u)|(fence_bytes_>=RingStampBytes?4u:0u);
     if(status!=7)return status;
     if(cache_.acquire(cache_.cookie,fence_,fence_bytes_))return status;
     status|=8;
-    const volatile uint32_t *slot=fence_+(RingStampOffset+(fence&63)*16)/4;
+    const volatile uint32_t *slot=fence_+(RingStampOffset+(fence%RingStampSlots)*RingStampStride)/4;
     *start=(uint64_t)slot[1]<<32|slot[0];*end=(uint64_t)slot[3]<<32|slot[2];
     return status|16;   /* the raw words: the caller judges them */
 }
@@ -596,14 +603,14 @@ IOReturn NativeAdrenoRing::detach()
     if(poisoned_)return kIOReturnBusy;
     if(!attached_)return kIOReturnNotReady;
     if(outstanding())return kIOReturnBusy;
-    attached_=false;ring_=nullptr;fence_=nullptr;ring_bytes_=fence_bytes_=0;
+    attached_=false;stamps_=false;ring_=nullptr;fence_=nullptr;ring_bytes_=fence_bytes_=0;
     ring_iova_=fence_iova_=0;next_=rptr_shadow_=seqno_=completed_=submissions_=0;
     return kIOReturnSuccess;
 }
 IOReturn NativeAdrenoRing::submit(const uint32_t *words,size_t word_count,uint32_t *fence)
 {
     if(!fence)return kIOReturnBadArgument;
-    return submitWords(words,word_count,seqno_+1,false,true,fence);
+    return submitWords(words,word_count,seqno_+1,false,current_,fence);
 }
 IOReturn NativeAdrenoRing::submitFramed(const uint32_t *words,size_t word_count,uint32_t *fence)
 {
@@ -620,6 +627,7 @@ IOReturn NativeAdrenoRing::submitWords(const uint32_t *words,size_t word_count,u
 {
     if(!fence)return kIOReturnBadArgument;*fence=0;
     if(!attached_ || poisoned_)return kIOReturnNotReady;
+    if(!number)return kIOReturnNoResources;  /* Fence zero is reserved. */
     if(!words || !word_count || word_count>SIZE_MAX/sizeof(uint32_t))return kIOReturnBadArgument;
     const uint32_t size_words=(uint32_t)(ring_bytes_/4),mask=size_words-1;
     const bool reset=framed && reset_pending_,table=reset && table_pending_;

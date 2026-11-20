@@ -245,7 +245,10 @@ public:
         if(!preemption())return false;
         if(dead)*dead=deadReason();
         if(rescues)*rescues=rescues_;
-        *stats=preempt_.stats();*loaded=preempt_.loaded();*in_flight=preempt_.inFlight();*cntl=preempt_.readCntl();
+        if(stats)*stats=preempt_.stats();
+        if(loaded)*loaded=preempt_.loaded();
+        if(in_flight)*in_flight=preempt_.inFlight();
+        if(cntl)*cntl=preempt_.readCntl();
         return true;
     }
     NativeAdrenoSubmit()=default;

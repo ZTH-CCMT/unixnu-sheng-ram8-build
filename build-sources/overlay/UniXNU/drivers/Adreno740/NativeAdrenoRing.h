@@ -26,8 +26,8 @@ struct NativeAdrenoRingIo {
     int (*barrier)(void *);
     /* Optional: the GMU's AHB fence status (bit 0: a write to a fenced GPU register was dropped while the GPU power domain was not
      * ready); with clear set, also clears it. Without it, WPTR writes are not checked. */
-    void *fence_cookie;
-    int (*fence_status)(void *,int clear,uint32_t *status);
+    void *fence_cookie=nullptr;
+    int (*fence_status)(void *,int clear,uint32_t *status)=nullptr;
 };
 struct NativeAdrenoRingCache {
     void *cookie;
@@ -40,7 +40,7 @@ struct NativeAdrenoRingClock {
     void *cookie;
     uint64_t (*now_us)(void *);
     /* Optional; may sleep. Never used before a successful submit. */
-    int (*idle)(void *);
+    int (*idle)(void *)=nullptr;
 };
 enum NativeAdrenoRingFence {
     NativeAdrenoRingFenceComplete = 0,
@@ -152,7 +152,7 @@ public:
      * timestamps and resource table cleared between thread syncs); a new user client requests it, as Linux does per context. */
     void requestContextReset() {reset_pending_=true;}
     /* Turns the timeline stamps on or off for the framed submissions after this call; off by default. */
-    void setTimeline(bool on) {stamps_=on;}
+    void setTimeline(bool on);
     /* The always-on counter ticks the CP read before and after the user buffers of a fence's submission (a status word: 1 attached, 2 stamps on, 4 page big enough, 8 page acquired, 16 slot read). Invalidates the fence page first. */
     uint32_t timeline(uint32_t fence,uint64_t *start,uint64_t *end);
     /* The client whose submission comes next. A change of client is a context switch: as a6xx_set_pagetable() does whenever the

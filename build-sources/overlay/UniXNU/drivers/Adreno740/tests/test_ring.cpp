@@ -44,13 +44,13 @@ static int barrier(void *cookie){CHECK(cookie==&peer);++peer.barriers;
     if(peer.log_order)peer.order.push_back("barrier");return 0;}
 static int publish(void *cookie,const volatile uint32_t *words,size_t bytes)
 {
-    CHECK(cookie==&peer && words && (bytes==32768 || bytes==4096));++peer.publish;
+    CHECK(cookie==&peer && words && (bytes==32768 || bytes==4096 || bytes==64));++peer.publish;
     if(peer.log_order)peer.order.push_back("publish");
     return peer.publish==peer.fail_publish;
 }
 static int acquire(void *cookie,volatile uint32_t *words,size_t bytes)
 {
-    CHECK(cookie==&peer && words && bytes==4096);++peer.acquire;
+    CHECK(cookie==&peer && words && (bytes==4096 || bytes==64));++peer.acquire;
     return peer.acquire==peer.fail_acquire;
 }
 static uint64_t now(void *cookie){CHECK(cookie==&peer);return clock_us;}
@@ -58,10 +58,11 @@ static int idle(void *cookie){CHECK(cookie==&peer);clock_us+=1000;return 0;}
 static uint32_t ring[8192];static uint32_t fence[1024];
 static NativeAdrenoRingIo io{&peer,write32,read32,barrier,nullptr,nullptr};
 /* The GMU's AHB fence: the next `dropped` WPTR writes are flagged as dropped; a clear resets the flag. */
-static unsigned dropped=0,fence_reads=0,fence_clears=0;static bool flagged=false;
+static unsigned dropped=0,fence_reads=0,fence_clears=0;static bool flagged=false,fail_fence_read=false,fail_fence_clear=false;
 static int fence_status(void *cookie,int clear,uint32_t *status)
 {
     CHECK(cookie==&peer && status);
+    if(clear?fail_fence_clear:fail_fence_read)return 1;
     if(clear){++fence_clears;flagged=false;return 0;}
     ++fence_reads;
     if(!flagged && dropped){--dropped;flagged=true;}
@@ -74,6 +75,8 @@ static NativeAdrenoRingClock clock_{&peer,now,idle};
 static void reset(void)
 {
     peer=Peer{};clock_us=0;
+    dropped=fence_reads=fence_clears=0;
+    flagged=fail_fence_read=fail_fence_clear=false;
     for(auto &v:ring)v=0xdeadbeef;
     for(auto &v:fence)v=0xa5a5a5a5;
 }
@@ -155,10 +158,52 @@ static void testDrainBus()
     }
     std::puts("PASS GBIF drain requires both acknowledgements, honours polling boundaries and clears temporary halt");
 }
+static void testRingBoundaries()
+{
+    const uint32_t word=0xabc;
+    uint32_t end=0;
+    {
+        reset();NativeAdrenoRing ringObject;
+        CHECK(ringObject.attach(&io,&cache,ring,sizeof(ring),0x100000,fence,64,0x108000)==kIOReturnSuccess);
+        ringObject.setTimeline(true);
+        CHECK(ringObject.submitFramed(&word,1,10,&end)==kIOReturnSuccess && end==10);
+        CHECK(peer.regs[0x0807]==11+1+31);  // Neither timeline packet fits this mapping.
+        uint64_t start=1,finish=1;
+        CHECK(ringObject.timeline(end,&start,&finish)==1 && !start && !finish);
+        const size_t writes=peer.writes.size();
+        CHECK(ringObject.submitFramed(&word,1,10,&end)==kIOReturnBadArgument && !end);
+        CHECK(ringObject.submitFramed(&word,1,9,&end)==kIOReturnBadArgument && !end);
+        CHECK(peer.writes.size()==writes);
+    }
+    {
+        reset();NativeAdrenoRing second;
+        CHECK(second.attachSecondary(&io,&cache,ring,sizeof(ring),0x100000,fence,sizeof(fence),0x108000)==kIOReturnSuccess);
+        CHECK(second.submit(&word,1,&end)==kIOReturnSuccess && end==1);
+        CHECK(peer.writes.empty() && second.restorePending());
+    }
+    {
+        reset();NativeAdrenoRing ringObject;
+        CHECK(attach(ringObject)==kIOReturnSuccess);
+        CHECK(ringObject.restart(UINT32_MAX)==kIOReturnSuccess);
+        const size_t writes=peer.writes.size();
+        CHECK(ringObject.submit(&word,1,&end)==kIOReturnNoResources && !end);
+        CHECK(peer.writes.size()==writes && ringObject.lastSubmitted()==UINT32_MAX);
+    }
+    for(unsigned mode=0;mode<2;++mode) {
+        reset();NativeAdrenoRing ringObject;
+        NativeAdrenoRingIo fenced=io;fenced.fence_cookie=&peer;fenced.fence_status=fence_status;
+        CHECK(ringObject.attach(&fenced,&cache,ring,sizeof(ring),0x100000,fence,sizeof(fence),0x108000)==kIOReturnSuccess);
+        fail_fence_read=mode==0;fail_fence_clear=mode==1;dropped=1;
+        CHECK(ringObject.submit(&word,1,&end)==kIOReturnIOError && !end && ringObject.poisoned());
+    }
+    std::puts("PASS short timeline mapping, fence IDs, inactive plain submit and WPTR status errors");
+}
+
 int main()
 {
     testDrainBus();
     testPublishedTail();
+    testRingBoundaries();
     /* Exact register programming and one complete submission. */
     {
         reset();NativeAdrenoRing r;
