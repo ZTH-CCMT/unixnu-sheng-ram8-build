@@ -385,7 +385,7 @@ void NativeAdrenoPoolView::free()
     grant_=nullptr;
     /* A tracked view's reference goes with the kernel's report, from this free (never mapped) or from the VM's last unmap later. */
     IOGeneralMemoryDescriptor::free();
-    if(!tracked)NativeAdrenoPoolRelease(grant);
+    if(grant && !tracked)NativeAdrenoPoolRelease(grant);
 }
 
 class AGXDeviceUserClient : public IOUserClient {
@@ -1410,6 +1410,7 @@ extern "C" IOReturn native_adreno_publish(NativeAdrenoVm *vm,NativeAdrenoSubmit 
     NativeAdrenoGpuPublished *service=new NativeAdrenoGpuPublished;
     if(!g.lock || !service || !service->init() || !service->attach(IOService::getPlatform())) {
         if(service)service->release();
+        if(g.lock){IOLockFree(g.lock);g.lock=nullptr;}
         return kIOReturnNoMemory;
     }
     /* The fence waiters' wake path. Without its lock or its thread call the waiters keep the board's pause. gpu-fence-wake=0 keeps

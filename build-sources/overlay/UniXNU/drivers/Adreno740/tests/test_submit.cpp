@@ -1006,6 +1006,8 @@ static void testCpuTableRecovery(bool complete)
     const IOReturn status=primary.submit.recover(restart,nullptr,&clock,&result);
     if(complete) {
         CHECK(status==kIOReturnSuccess && result.replayed==3);
+        CHECK(primary.submit.wait(1,&clock,0)==kIOReturnAborted);
+        CHECK(primary.submit.observeFence(1,&clock,0)==kIOReturnAborted);
         const std::vector<std::pair<uint64_t,uint32_t>> expected{
             {kernel_table,1},{process_table,1},{kernel_table,2},{process_table,3}};
         CHECK(replay.tables==expected && replay.pauses==6);
@@ -1112,6 +1114,21 @@ int main(int argc,char **argv)
         CHECK(p.vm.detach()==kIOReturnSuccess);
         CHECK(p.tables.release()==kIOReturnSuccess);
         std::puts("PASS read-only GPU mappings and rejection of incompatible aliases");
+    }
+    {
+        Path p;CHECK(exposed(p)==kIOReturnSuccess);
+        NativeAdrenoMemory buffer;
+        CHECK(buffer.allocate(4096,40,false,4096)==kIOReturnSuccess);
+        uint64_t handle=0;
+        fixture.cache_fail_call=fixture.cache_calls+1;
+        CHECK(p.vm.map(&buffer,0,0x808000,ArmSmmu4KRead|ArmSmmu4KWrite,0,2,&handle)==kIOReturnIOError);
+        CHECK(!handle && !buffer.deviceReferences() && !buffer.quarantined() && !p.vm.poisoned());
+        fixture.cache_fail_call=0;
+        CHECK(p.vm.map(&buffer,0,0x808000,ArmSmmu4KRead|ArmSmmu4KWrite,0,2,&handle)==0 && handle);
+        CHECK(p.vm.unmap(handle)==0 && buffer.release()==0);
+        CHECK(p.submit.detach()==0 && p.vm.unmap(p.handle)==0 && p.object.release()==0);
+        CHECK(p.vm.detach()==0 && p.tables.release()==0);
+        std::puts("PASS cache failure before GPU mapping drops its reference and allows retry");
     }
     /* Every retired job is timed by the driver's clock without the CP's stamps: from its submission, or from the retirement before it
      * on its ring, to its own; a job over 8 ms is named in the slow table and the longest stay in the long table. */

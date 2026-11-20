@@ -150,6 +150,7 @@ private:
     uint32_t *failed_fences_=nullptr;
     size_t failed_count_=0,failed_capacity_=0;
     bool failedFence(uint32_t fence) const;
+    bool reserveFailedFences(size_t extra);
     IOReturn recoverDual(NativeAdrenoRestart,void *,const NativeAdrenoRingClock *,NativeAdrenoRecovery *);
     PreemptSetup preempt_setup_{};
     int32_t next_priority_=-1;    /* the Metal GPU priority of the next submission (-1: not given, the middle ring) */

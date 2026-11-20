@@ -161,13 +161,18 @@ IOReturn NativeAdrenoVm::detach()
 {
     if(poisoned_ || objects_ || spanCount())return kIOReturnBusy;
     if(!attached_)return kIOReturnNotReady;
-    for(auto &r:regions_)if(r.arena) {r.arena->alias_scratch=nullptr;r.arena->alias_scratch_entries=0;}
     freeTables();
     attached_=false;regions_[0]={};regions_[1]={};context_=nullptr;streams_=nullptr;capacity_=mapping_capacity_=0;
     return kIOReturnSuccess;
 }
 void NativeAdrenoVm::freeTables()
 {
+    for(auto &region:regions_) {
+        if(region.arena && region.arena->alias_scratch==alias_scratch_) {
+            region.arena->alias_scratch=nullptr;
+            region.arena->alias_scratch_entries=0;
+        }
+    }
     if(changes_)IODeleteData(changes_,ArmSmmu4KRange,capacity_);
     if(alias_scratch_)IODeleteData(alias_scratch_,uint32_t,capacity_);
     if(mappings_)IODeleteData(mappings_,Mapping,mapping_capacity_);
@@ -353,23 +358,28 @@ IOReturn NativeAdrenoVm::map(NativeAdrenoMemory *memory,unsigned upper,uint64_t 
     ArmSmmu4KStatus status=observeCheap();if(status)return fail(status);
     clock.lap(0,1);
     if(!index_.reserve(objects_+1))return kIOReturnNoMemory;   /* the handle's index cell is had before anything changes */
-    checked=memory->holdForDevice();if(checked)return checked;
-    Mapping *record=nullptr;
-    for(;;) {
-        for(size_t i=free_hint_;i<mapping_capacity_;++i)if(!mappings_[i].memory) {
-            record=&mappings_[i];free_hint_=i+1;if(high_<i+1)high_=i+1;break;
-        }
-        if(record || !growMappings())break;
+    size_t slot=free_hint_;
+    while(true) {
+        while(slot<mapping_capacity_ && mappings_[slot].memory)++slot;
+        if(slot<mapping_capacity_)break;
+        if(!growMappings())return kIOReturnNoMemory;
     }
-    if(!record) {memory->quarantine();return fail(ArmSmmu4KStateMismatch);}
-    *record={memory,0,iova,memory->spanCount(),0,permissions,writeback,shareability,0,upper};++objects_;
+    checked=memory->holdForDevice();if(checked)return checked;
     if(coherentMapping(writeback))native_adreno_coherent_skips[0]=native_adreno_coherent_skips[0]+1;
     /* A synchronized buffer was cleaned by whoever stored into it: one more table that maps it finds no line to write back. */
     else if(memory->synchronized() && synchronizedTrusted())native_adreno_sync_skips[0]=native_adreno_sync_skips[0]+1;
     else {
         checked=memory->publishForDevice(0,memory->bytes(),permissions&ArmSmmu4KWrite,distrust_write_combined_);
-        if(checked)return fail(ArmSmmu4KIoError);
+        if(checked) {
+            // No page table entry has been published for this mapping.
+            if(memory->retireAfterQuiescence()!=kIOReturnSuccess)return fail(ArmSmmu4KStateMismatch);
+            return checked;
+        }
     }
+    Mapping *const record=&mappings_[slot];
+    free_hint_=slot+1;
+    if(high_<free_hint_)high_=free_hint_;
+    *record={memory,0,iova,memory->spanCount(),0,permissions,writeback,shareability,0,upper};++objects_;
     clock.lap(0,2);
     /* Every span in one table transaction (the scratch was grown to them). */
     const size_t spans=record->spans;

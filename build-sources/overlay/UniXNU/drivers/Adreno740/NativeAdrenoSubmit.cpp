@@ -1190,6 +1190,19 @@ extern "C" uint32_t native_adreno_reset_epoch()
     return __atomic_load_n(&adreno_reset_epoch,__ATOMIC_ACQUIRE);
 }
 
+bool NativeAdrenoSubmit::reserveFailedFences(size_t extra)
+{
+    if(failed_capacity_-failed_count_>=extra)return true;
+    if(extra>SIZE_MAX/sizeof(uint32_t)-failed_count_)return false;
+    const size_t count=failed_count_+extra;
+    uint32_t *ids=IONewData(uint32_t,count);
+    if(!ids)return false;
+    for(size_t i=0;i<failed_count_;++i)ids[i]=failed_fences_[i];
+    if(failed_fences_)IODeleteData(failed_fences_,uint32_t,failed_capacity_);
+    failed_fences_=ids;failed_capacity_=count;
+    return true;
+}
+
 IOReturn NativeAdrenoSubmit::recoverDual(NativeAdrenoRestart restart,void *cookie,
     const NativeAdrenoRingClock *clock,NativeAdrenoRecovery *out)
 {
@@ -1235,14 +1248,7 @@ IOReturn NativeAdrenoSubmit::recoverDual(NativeAdrenoRestart restart,void *cooki
         if(job.abort_on_reset)++aborted;
         else if(!replay_first || job.fence<replay_first)replay_first=job.fence;
     }
-    if(aborted && failed_capacity_-failed_count_<aborted) {
-        const size_t count=failed_count_+aborted;
-        uint32_t *ids=IONewData(uint32_t,count);
-        if(!ids)return poison();
-        for(size_t i=0;i<failed_count_;++i)ids[i]=failed_fences_[i];
-        if(failed_fences_)IODeleteData(failed_fences_,uint32_t,failed_capacity_);
-        failed_fences_=ids;failed_capacity_=count;
-    }
+    if(!reserveFailedFences(aborted))return poison();
 
     const uint32_t ring_last=last[0]>last[1]?last[0]:last[1];
     const uint32_t newest=ring_last>fence_issued_?ring_last:fence_issued_;
@@ -1335,6 +1341,7 @@ IOReturn NativeAdrenoSubmit::recover(NativeAdrenoRestart restart,void *cookie,co
     Job *guilty=fence<last?find(hung):nullptr;
     out->fence=hung;
     if(guilty) {
+        if(!reserveFailedFences(1))return kIOReturnNoMemory;
         NativeAdrenoVm *vm=guilty->vm?guilty->vm:vm_;
         vm->noteHang(vm!=vm_);out->guilty=vm;
     }
@@ -1343,7 +1350,10 @@ IOReturn NativeAdrenoSubmit::recover(NativeAdrenoRestart restart,void *cookie,co
     out->status=status;
     if(status) {native_adreno_recover_trace[0]=2;native_adreno_recover_trace[1]=uint32_t(status);return poison();}
     poisoned_=false;hang_[0].fence=hung;hang_[0].retries=0;
-    if(guilty) {status=release(*guilty);if(status)return status;}
+    if(guilty) {
+        failed_fences_[failed_count_++]=hung;
+        status=release(*guilty,false);if(status)return status;
+    }
     /* The GPU is idle after the restart's CP init: the CPU installs the kernel table, and each replayed job switches to its own. */
     if(table_mode_) {
         if(!write_table_) {native_adreno_recover_trace[0]=3;native_adreno_recover_trace[1]=0;return poison();}

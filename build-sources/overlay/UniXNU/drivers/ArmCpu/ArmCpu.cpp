@@ -220,19 +220,18 @@ static inline void ipiTaken (ArmCpuCoreStats &core, bool fromIdle)
   if (ticks > core.takenMost[which]) { core.takenMost[which] = ticks > 0xffffffffULL ? 0xffffffffU : static_cast<uint32_t> (ticks); }
 }
 
-// How long after its deadline this core takes the timer interrupt, awake or out of idle. CNTV_TVAL_EL0 is the deadline minus the
-// counter as a signed 32-bit value and goes on counting down after the timer fired, so here it is the delay, negated. The timer is
-// one per core and one-shot: the kernel writes each next deadline (ml_set_decrementer).
+// How long after its deadline this core takes the timer interrupt, awake or out of idle.
+// CVAL holds the full deadline. TVAL truncates that difference to 32 bits, which can wrap after a long stop.
 static inline void timerTaken (ArmCpuCoreStats &core, bool fromIdle)
 {
   if (!gStats) { return; }
-  uint64_t value;
-  __asm__ volatile ("mrs %0, cntv_tval_el0" : "=r" (value));
-  const int64_t left = static_cast<int32_t> (static_cast<uint32_t> (value));
-  const uint64_t ticks = left < 0 ? static_cast<uint64_t> (-left) : 0;
+  uint64_t deadline;
+  __asm__ volatile ("mrs %0, cntv_cval_el0" : "=r" (deadline));
+  const uint64_t now = counter ();
+  const uint64_t ticks = now > deadline ? now - deadline : 0;
   const unsigned which = fromIdle ? 1 : 0, slot = range (ticks, gCounterHz / 20000, gCounterHz / 5000, gCounterHz / 1000);
   core.timerLate[which][slot] = core.timerLate[which][slot] + 1;
-  if (ticks > core.timerLateMost[which]) { core.timerLateMost[which] = static_cast<uint32_t> (ticks); }
+  if (ticks > core.timerLateMost[which]) { core.timerLateMost[which] = ticks > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t> (ticks); }
 }
 
 // Polls until the bits clear. The limit counts polls as well as time: the counter runs on while the host has this vCPU's thread
@@ -585,8 +584,11 @@ bool ArmCpu::start (IOService *provider)
   gIdleLatencyNs = idleLatencyUs > 4000000U ? 4000000000U : idleLatencyUs * 1000U;
   uint32_t physical;
   OSData *reg = OSDynamicCast (OSData, provider->getProperty ("reg"));
+  if (!reg || reg->getLength () < sizeof (physical)) { return false; }
   memcpy (&physical, reg->getBytesNoCopy (), sizeof (physical));
-  logicalId = static_cast<uint32_t> (ml_get_cpu_number (physical));
+  const int id = ml_get_cpu_number (physical);
+  if (id < 0 || id >= ARMCPU_SMP_SLOTS) { return false; }
+  logicalId = static_cast<uint32_t> (id);
   secondary = logicalId != static_cast<uint32_t> (ml_get_boot_cpu_number ());
   if (secondary) {
     if (!IOCPU::start (provider)) { return false; }
@@ -596,8 +598,15 @@ bool ArmCpu::start (IOService *provider)
     cpuName = OSSymbol::withCStringNoCopy ("ARM architectural secondary CPU");
     if (cpuName == nullptr) { return false; }
     retain ();
-    __atomic_store_n (&gPending[logicalId], this, __ATOMIC_RELEASE);
-    if (gBootRegistered != 0) { drainPending (); }
+    // Publish before checking the boot core's flag. The boot core publishes
+    // its flag before scanning: sequential consistency prevents both missing each other.
+    ArmCpu *empty = nullptr;
+    if (!__atomic_compare_exchange_n (&gPending[logicalId], &empty, this, false,
+        __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+      release ();
+      return false;
+    }
+    if (__atomic_load_n (&gBootRegistered, __ATOMIC_SEQ_CST) != 0) { drainPending (); }
     return true;
   } else {
     uint64_t bootMpidr;
@@ -643,16 +652,18 @@ bool ArmCpu::start (IOService *provider)
   armcpu_registered = 1;
   if (!bootInitialized) { initCPU (true); }
   registerService ();
-  __atomic_store_n (&gBootRegistered, 1U, __ATOMIC_RELEASE);
+  __atomic_store_n (&gBootRegistered, 1U, __ATOMIC_SEQ_CST);
   drainPending ();
   return true;
 }
 
 void ArmCpu::drainPending (void)
 {
-  for (unsigned id = 1; id < ARMCPU_SMP_SLOTS; id++) {
-    ArmCpu *cpu = __atomic_exchange_n (&gPending[id], static_cast<ArmCpu *> (nullptr), __ATOMIC_ACQ_REL);
-    if (cpu != nullptr) { cpu->finishSecondary (); }
+  const auto bootId = static_cast<unsigned> (ml_get_boot_cpu_number ());
+  for (unsigned id = 0; id < ARMCPU_SMP_SLOTS; id++) {
+    if (id == bootId) { continue; }
+    ArmCpu *cpu = __atomic_exchange_n (&gPending[id], static_cast<ArmCpu *> (nullptr), __ATOMIC_SEQ_CST);
+    if (cpu && !cpu->finishSecondary ()) { cpu->release (); }
   }
 }
 
@@ -763,7 +774,7 @@ void ArmCpu::initCPU (bool boot)
     enableCPUTimeBase (true);
     setCPUState (kIOCPUStateRunning);
     armcpu_smp_step[logicalId] = 7;
-    armcpu_smp_running = armcpu_smp_running + 1;
+    __atomic_fetch_add (&armcpu_smp_running, 1, __ATOMIC_RELAXED);
     // XNU clears SIGPdisabled for a core the first time that core takes an IPI, and cpu_signal() silently skips a core until then; Apple's
     // CPU driver provokes it with a self-IPI from initCPU (osfmk/kern/machine.c, processor_up).
     if (gSelfIpi) { signalCPU (this); }
@@ -816,7 +827,6 @@ void ArmCpu::interrupt (void)
   unsigned drained = 0;
   unsigned repeats[ARMCPU_SPI_SLOTS] = {};
   ArmCpuCoreStats &core = gCore[logicalId & 7];
-  const bool fromIdle = core.wakeOpen != 0;
   while (drained < kIrqDrainBudget) {
     armcpu_irq_phase=1;
     uint64_t id;
@@ -825,27 +835,28 @@ void ArmCpu::interrupt (void)
     if ((id & 0xffffff) >= 1020) { break; }
     ++drained;
     unsigned spiSlot = ARMCPU_SPI_SLOTS;
+    const bool wokeFromIdle = core.wakeOpen != 0;
     if ((id & 0xffffff) == 27) {
-      armcpu_timer_interrupts = armcpu_timer_interrupts + 1;
+      __atomic_fetch_add (&armcpu_timer_interrupts, 1, __ATOMIC_RELAXED);
       armcpu_core_timer[logicalId & 7] = armcpu_core_timer[logicalId & 7] + 1;
-      timerTaken (core, core.wakeOpen != 0);
+      timerTaken (core, wokeFromIdle);
       wokenBy (core, 0);
       armcpu_irq_phase=2;
       rtclock_intr (0);
       armcpu_irq_phase=3;
     } else if ((id & 0xffffff) == 0) {
-      armcpu_ipi_interrupts = armcpu_ipi_interrupts + 1;
+      __atomic_fetch_add (&armcpu_ipi_interrupts, 1, __ATOMIC_RELAXED);
       armcpu_core_sgi[logicalId & 7] = armcpu_core_sgi[logicalId & 7] + 1;
       wokenBy (core, 1);
-      ipiTaken (core, fromIdle);
+      ipiTaken (core, wokeFromIdle);
       armcpu_irq_phase=4;
       if (ipi_handler != nullptr) { ipi_handler (); }
       armcpu_irq_phase=5;
     } else if (gSpiIpi && (id & 0xffffff) >= kIpiSpiBase && (id & 0xffffff) < kIpiSpiBase + 8) {
-      armcpu_ipi_interrupts = armcpu_ipi_interrupts + 1;
+      __atomic_fetch_add (&armcpu_ipi_interrupts, 1, __ATOMIC_RELAXED);
       armcpu_core_sgi[logicalId & 7] = armcpu_core_sgi[logicalId & 7] + 1;
       wokenBy (core, 1);
-      ipiTaken (core, fromIdle);
+      ipiTaken (core, wokeFromIdle);
       armcpu_irq_phase = 4;
       if (ipi_handler != nullptr) { ipi_handler (); }
       armcpu_irq_phase = 5;
@@ -857,7 +868,7 @@ void ArmCpu::interrupt (void)
       spiSlot = spiDispatch (intid);
       if (spiSlot == ARMCPU_SPI_SLOTS) {
         if (intid < 32 || gDist == 0) { panic ("ArmCpu: unexpected architectural IRQ %llu", id); }
-        armcpu_spi_unhandled = armcpu_spi_unhandled + 1;
+        __atomic_fetch_add (&armcpu_spi_unhandled, 1, __ATOMIC_RELAXED);
         armcpu_spi_unhandled_id = intid;
         spiSetEnabled (intid, false);
       }
@@ -869,8 +880,10 @@ void ArmCpu::interrupt (void)
   }
   armcpu_irq_phase = 0;
   if (drained == kIrqDrainBudget) { __atomic_fetch_add (&armcpu_irq_budget_exits, 1, __ATOMIC_RELAXED); }
-  if (drained > 128) { armcpu_irq_long_drains = armcpu_irq_long_drains + 1; }
-  if (drained > armcpu_irq_drain_most) { armcpu_irq_drain_most = drained; }
+  if (drained > 128) { __atomic_fetch_add (&armcpu_irq_long_drains, 1, __ATOMIC_RELAXED); }
+  auto most = __atomic_load_n (&armcpu_irq_drain_most, __ATOMIC_RELAXED);
+  while (drained > most && !__atomic_compare_exchange_n (&armcpu_irq_drain_most, &most, drained,
+      true, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
 }
 
 void ArmCpu::signalCPU (IOCPU *target)
