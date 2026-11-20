@@ -1759,7 +1759,8 @@ void gpuStart() {
     gpuHwInit();
     // 4. Ring 0 (MSM_GPU_RB_CNTL_DEFAULT: 32 KiB, block 32; hw_apriv uses the hardware rptr shadow at memptrs+0).
     c[0] = 4;
-    const NativeAdrenoRingCache cache{nullptr, ringPublish, ringAcquire};
+    // ringPublish already completes the write-combined stores before MMIO.
+    const NativeAdrenoRingCache cache{nullptr, ringPublish, ringAcquire, /*publish_orders_mmio=*/true};
     native_adreno_fence_phys = gGpuBuffers[2].physical;   // the page the CP writes its timestamps to, for the UFS log
     const IOReturn attached = gRing.attach(&kShengRingIo, &cache, const_cast<uint8_t *>(gGpuCpu[1]), gGpuBuffers[1].bytes,
         gGpuBuffers[1].iova, const_cast<uint8_t *>(gGpuCpu[2]), gGpuBuffers[2].bytes, gGpuBuffers[2].iova);

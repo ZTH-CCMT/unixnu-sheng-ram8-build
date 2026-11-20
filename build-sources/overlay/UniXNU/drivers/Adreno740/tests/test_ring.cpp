@@ -2,6 +2,7 @@
 /* Real ring/fence code over a software CP register peer. No GPU access. */
 #include "XnuMemoryFixture.h"
 #include "NativeAdrenoRing.h"
+#include "NativeAdrenoRingLog.h"
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -201,6 +202,45 @@ static void testResetBusHalt()
     }
     std::puts("PASS reset halt uses bounded acknowledgements and releases attempted halts on failure");
 }
+static void testOrderedPublication()
+{
+    reset();
+    const NativeAdrenoRingCache ordered_cache{&peer,publish,acquire,true};
+    NativeAdrenoRingIo fenced=io;
+    fenced.fence_cookie=&peer;fenced.fence_status=fence_status;
+    NativeAdrenoRing r;
+    peer.log_order=true;
+    CHECK(r.attach(&fenced,&ordered_cache,ring,sizeof(ring),0x100000,
+        fence,sizeof(fence),0x108000)==kIOReturnSuccess);
+    CHECK(peer.publish==1 && !peer.barriers && peer.order.size()>1 &&
+        !std::strcmp(peer.order[0],"publish") && !std::strcmp(peer.order[1],"write"));
+
+    const uint32_t word=0xabc;
+    uint32_t issued=0;
+    auto checkDoorbellOrder=[&](unsigned reads) {
+        CHECK(peer.order.size()==3 && !std::strcmp(peer.order[0],"publish") &&
+            !std::strcmp(peer.order[1],"write") && !std::strcmp(peer.order[2],"barrier"));
+        CHECK(fence_reads==reads && peer.barriers==reads);
+        peer.order.clear();
+    };
+    peer.order.clear();
+    CHECK(r.submitUnfenced(&word,1)==kIOReturnSuccess);
+    checkDoorbellOrder(1);
+    CHECK(r.setPreempt(0x200000,0x600000,0x108008)==kIOReturnSuccess);
+    CHECK(r.resetExecutedTable(0x300000)==kIOReturnSuccess);
+    CHECK(peer.order.size()==2 && !std::strcmp(peer.order[0],"publish") &&
+        !std::strcmp(peer.order[1],"publish"));
+    peer.order.clear();
+    CHECK(r.submitFramed(&word,1,&issued)==kIOReturnSuccess && issued==1);
+    checkDoorbellOrder(2);
+
+    const size_t writes=peer.writes.size();
+    peer.fail_publish=peer.publish+1;
+    CHECK(r.submitFramed(&word,1,&issued)==kIOReturnIOError && !issued && r.poisoned());
+    CHECK(peer.writes.size()==writes && peer.barriers==2);
+    std::puts("PASS ordered publication omits only the duplicate pre-MMIO barrier; AHB check still follows WPTR");
+}
+
 static void testRingBoundaries()
 {
     const uint32_t word=0xabc;
@@ -266,12 +306,24 @@ static void testRingBoundaries()
     std::puts("PASS short timeline mapping, fence IDs, inactive ring guards and fence page publication");
 }
 
+static void checkLatestRingLog(uint32_t fenceNumber,uint32_t start,uint32_t end)
+{
+    NativeAdrenoRingLogRow row[1];
+    CHECK(native_adreno_ring_log_copy(row,1)==1);
+    constexpr size_t mask=sizeof(ring)/sizeof(*ring)-1;
+    const size_t count=(end-start)&mask;
+    CHECK(row[0][0]==fenceNumber && row[0][1]==start && row[0][2]==end && row[0][3]==count);
+    for(size_t i=0;i<NativeAdrenoRingLogPrefixWords;++i)
+        CHECK(row[0][NativeAdrenoRingLogHeaderWords+i]==(i<count?ring[(start+i)&mask]:0));
+}
+
 int main()
 {
     testDrainBus();
     testResetBusHalt();
     testPublishedTail();
     testRingBoundaries();
+    testOrderedPublication();
     /* Exact register programming and one complete submission. */
     {
         reset();NativeAdrenoRing r;
@@ -459,6 +511,7 @@ int main()
         CHECK(r.submitFramed(words,sizeof(words)/sizeof(words[0]),&end)==kIOReturnSuccess);
         /* Consume the whole submission, then a second one wraps past the end. */
         CHECK(end==1 && peer.writes.back().second==8181);
+        checkLatestRingLog(1,0,8181);
         peer.regs[0x0806]=8181;
         CHECK(r.submitFramed(words,4,&end)==kIOReturnSuccess);
         CHECK(peer.writes.back().first==0x0807 && peer.writes.back().second==35);
@@ -466,6 +519,8 @@ int main()
         CHECK(ring[0]==words[0] && ring[1]==words[1] && ring[2]==words[2] && ring[3]==words[3]);
         CHECK((ring[4]>>8&0x3ffffu)==0x885 && ring[5]==2);
         CHECK(ring[28]==0x108004 && ring[30]==2 && ring[34]==0x100);
+        checkLatestRingLog(2,8181,35);
+        std::puts("PASS ring diagnostic captures the emitted prefix across wrap and zeroes its unused tail");
         CHECK(r.detach()==kIOReturnBusy); /* unobserved submissions */
     }
     /* Argument refusals never touch registers or memory. */

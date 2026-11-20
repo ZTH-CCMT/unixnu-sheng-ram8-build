@@ -2211,6 +2211,7 @@ static void dumpSurfacesOnce(NSSet *textures,NSSet *owners) {
 - (void)watchTexture:(NBTexture *)texture;
 @property(nonatomic,strong) dispatch_group_t handlers,schedulingHandlers;
 @property(nonatomic,strong) dispatch_group_t gpuCompletion,gpuScheduling,runtimeCommit;
+@property(nonatomic,strong) dispatch_group_t resourceEncoding;  // only the wallpaper-freeze diagnostic parks an encoded command
 @property(atomic) BOOL schedulingDelivered;
 // NATIVE_METAL_DUMP_CB: the textures this command buffer wrote, met while it was encoded (dumpTargets), the render pass's attachments
 // waiting for their encoder (dumpPending), how many passes and kernels it encoded so far, and whether it is the plugin's own readback.
@@ -2352,7 +2353,7 @@ static void dumpNote(NBCommandBuffer *commandBuffer,NSMutableArray *into,id text
 // goes on once it has recorded the call. The render server's display thread spent most of a frame in the runtime (a home-screen drag:
 // about 60% of a thread busy 90% of the time); split, CoreAnimation's own encoding and the runtime's run on two cores at once (the
 // display thread at 34%, the drag 10% faster on as many cycles a frame). What reads a command buffer's state back -- a wait, its status,
-// the in-flight use of a resource -- first lets the thread catch up (encodeDrain). Other processes keep each call on the caller's
+// the in-flight use of a resource -- waits for the relevant command's encoding or runtime commit. Other processes keep each call on the caller's
 // thread: where the runtime is nearly all a thread's work the split only adds its cost (GFXBench's Driver Overhead 2: 12% fewer frames
 // on 40% more CPU a frame). Switches read when a process starts: /private/var/ngpu/debug/encode-thread puts every process on one,
 // no-encode-thread none.
@@ -2405,10 +2406,10 @@ public:
 };
 struct EncodeThread {
  std::mutex lock;
- std::condition_variable work,idle;
+ std::condition_variable work;
  std::deque<EncodeBatch *> batches;
  std::vector<EncodeBatch *> spare;
- uint64_t queued=0,done=0;
+ uint64_t queued=0;
 };
 static thread_local bool tOnEncodeThread;
 static thread_local EncodeBatch *tBatch;
@@ -2431,7 +2432,7 @@ static EncodeThread &encodeThread() {
     batchStage(batch->serial,2,batch->enqueuedUs,tasks,depth);
     @autoreleasepool {NBMetalOriginScope origin(batch->origin);batch->run();}
     batchStage(batch->serial,3,batch->enqueuedUs,tasks,depth);tEncodeBatchId=0;
-    lock.lock();t.spare.push_back(batch);t.done++;t.idle.notify_all();
+    lock.lock();t.spare.push_back(batch);
    }
    return nullptr;
   },t);
@@ -2467,14 +2468,6 @@ template<class F> static void encodeLaterRaw(F &&work) {
  tBatch->add(std::forward<F>(work));
  if(tBatch->count>=64)encodeFlush();
 }
-static void encodeDrain() {
- if(!gEncodeThread || onEncodeQueue())return;
- encodeFlush();
- EncodeThread &t=encodeThread();
- std::unique_lock<std::mutex> lock(t.lock);
- const uint64_t target=t.queued;
- t.idle.wait(lock,[&]{return t.done>=target;});
-}
 template<class F> struct TracedEncodeCall {
  std::optional<F> work;const char *label;uint32_t line;uint64_t id,command,parent,queued;
  void operator()() {
@@ -2499,10 +2492,20 @@ template<class F> static void encodeLater(F &&work,const char *label,uint32_t li
 // Held while a resource wait reads an in-flight command buffer's runtime handle and while a locally refused command buffer frees it.
 static std::mutex gRuntimeHandleLock;
 static void waitForResource(id resource) {
- encodeDrain();   // every committed command buffer's uses recorded
  const uint64_t began=nowUs();
+ // The snapshot retains commits already published across producers. Each
+ // commit flushes its own submit batch, including one still being enqueued.
  NSArray *pending=inFlightSnapshot();
+ const bool onWorker=onEncodeQueue();
  for(NBCommandBuffer *commandBuffer in pending) {
+  if(!commandBuffer.submitted) {
+   // Unsubmitted commands cannot use the GPU yet, and making the worker wait
+   // for one of its own future submissions would prevent it from progressing.
+   if(onWorker)continue;
+   dispatch_group_t ready=commandBuffer.resourceEncoding?:commandBuffer.runtimeCommit;
+   dispatch_group_wait(ready,DISPATCH_TIME_FOREVER);
+  }
+  if(commandBuffer.failedLocally)continue;
   int dependency=-1;
   {
    std::lock_guard<std::mutex> guard(gRuntimeHandleLock);
@@ -3283,6 +3286,7 @@ static char kUserDictionaryKey;
   _surfaces=[NSMutableSet set];_resourceOwners=[NSMutableSet set];
   _handlers=dispatch_group_create();_schedulingHandlers=dispatch_group_create();
   _gpuCompletion=dispatch_group_create();_gpuScheduling=dispatch_group_create();_runtimeCommit=dispatch_group_create();
+  if(freezeWallpaperOn())_resourceEncoding=dispatch_group_create();
  }
  if(self){traceNumber=++gFrameNumber;createdUs=nowUs();createCpu=threadCpuUs();createTid=threadIdLow();earlyEligible=onRenderServerThread();if(earlyEligible)traceThread(1);frontStage(traceNumber,0,1);}
  return self;
@@ -3663,6 +3667,7 @@ static char kUserDictionaryKey;
   if(self.committed){NBLOG(@"native-metal: commit twice");return;}
   dispatch_group_enter(_handlers);dispatch_group_enter(_schedulingHandlers);
   dispatch_group_enter(_gpuCompletion);dispatch_group_enter(_gpuScheduling);dispatch_group_enter(_runtimeCommit);
+  if(_resourceEncoding)dispatch_group_enter(_resourceEncoding);
   diagnosticOrigin=tMetalOrigin;
   self.committedUs=nowUs();
   self.committed=YES;
@@ -3688,6 +3693,9 @@ static char kUserDictionaryKey;
 }
 // The runtime's half of a commit, on the encoding thread after the command buffer's encoders.
 - (void)submit {
+ // Every encoder use is now recorded even if the wallpaper diagnostic
+ // parks this command before handing it to the GPU runtime.
+ if(_resourceEncoding)dispatch_group_leave(_resourceEncoding);
  DetailCommandScope commandScope(traceNumber);
  frontStage(traceNumber,self.commitIndex,3);
  std::unique_lock<std::recursive_mutex> wallpaperLock(gWallpaperLock,std::defer_lock);

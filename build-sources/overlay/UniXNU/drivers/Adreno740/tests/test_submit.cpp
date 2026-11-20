@@ -2,6 +2,7 @@
 /* Real VM, ring and execbuf code over two software register peers. */
 #include "XnuMemoryFixture.h"
 #include "NativeAdrenoSubmit.h"
+#include "NativeAdrenoRingLog.h"
 #include "AdrenoPM4.h"
 #include <cstdio>
 #include <cstring>
@@ -16,7 +17,6 @@ extern "C" volatile uint32_t native_adreno_unstick[15];
 extern "C" volatile uint64_t native_adreno_stall_log[32][8];
 extern "C" volatile uint32_t native_adreno_stall_log_count;
 extern "C" bool native_adreno_stall_pointers_copy(uint32_t index,uint32_t out[6]);
-extern "C" uint32_t native_adreno_ring_log_copy(uint32_t (*out)[116],uint32_t capacity);
 extern "C" bool native_adreno_timeline_range(uint64_t *generation,uint64_t *first,uint64_t *end);
 extern "C" bool native_adreno_timeline_copy(uint64_t generation,uint64_t index,uint64_t out[8]);
 
@@ -150,7 +150,6 @@ static void attachProcess(Path &process,ArmSmmu4KContextConfig &config)
 void NativeAdrenoNotePhase(unsigned,size_t) {}
 extern "C" {extern volatile uint32_t native_adreno_submit_ibs[4],native_adreno_diag,native_adreno_ib_log[4][4+28],native_adreno_ib_log_count;
     extern volatile uint64_t native_adreno_submit_us[8];
-    extern volatile uint32_t native_adreno_ring_log[4][116],native_adreno_ring_log_count;
     extern volatile uint32_t native_adreno_switch_timeouts;}
 
 struct DualRingPath : Path {
@@ -820,7 +819,7 @@ static void testInterleavedDiagnosticFences()
         const uint32_t fence=p.enqueue(index,index?7:8);
         CHECK(fence==i+1);
         const volatile uint32_t *ib=native_adreno_ib_log[(native_adreno_ib_log_count-1)&3];
-        uint32_t snapshot[1][116]={};
+        NativeAdrenoRingLogRow snapshot[1]={};
         CHECK(native_adreno_ring_log_copy(snapshot,1)==1);
         const uint32_t *log=snapshot[0];
         CHECK(ib[0]==fence && log[0]==fence);

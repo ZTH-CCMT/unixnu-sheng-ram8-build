@@ -245,7 +245,7 @@ run(trace_cmd,cwd=pr['directory'])
 # UFS diagnostic log writer (log=1) and the guarded fastboot reset (autoreset=<seconds>).
 log_source=ROOT/'kits/sheng/BootLog.c'
 log_obj=OUT/'BootLog.o'
-run([str(log_source) if arg==str(process_source) else str(log_obj) if arg==str(process_obj) else arg for arg in process_cmd]+['-I',str(ROOT/'kits/sheng')],cwd=pr['directory'])
+run([str(log_source) if arg==str(process_source) else str(log_obj) if arg==str(process_obj) else arg for arg in process_cmd]+['-I',str(ROOT/'kits/sheng'),'-I',str(ROOT/'drivers/Adreno740')],cwd=pr['directory'])
 reset_source=ROOT/'kits/sheng/BootReset.c'
 reset_obj=OUT/'BootReset.o'
 run([str(reset_source) if arg==str(process_source) else str(reset_obj) if arg==str(process_obj) else arg for arg in process_cmd]+['-I',str(ROOT/'kits/sheng')],cwd=pr['directory'])

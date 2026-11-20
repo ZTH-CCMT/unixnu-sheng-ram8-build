@@ -35,6 +35,8 @@ struct NativeAdrenoRingCache {
     int (*publish)(void *,const volatile uint32_t *words,size_t bytes);
     /* Make all cache lines overlapping the given byte range visible before CPU reads. */
     int (*acquire)(void *,volatile uint32_t *words,size_t bytes);
+    /* Successful publish also orders the stores before subsequent MMIO writes. */
+    bool publish_orders_mmio=false;
 };
 struct NativeAdrenoRingClock {
     void *cookie;
@@ -79,12 +81,13 @@ class NativeAdrenoRing final {
     void initPreemptPage();
     uint32_t control_=0;
     IOReturn poison();
+    bool publishBeforeMmio(const volatile uint32_t *,size_t);
     IOReturn writeWptr(uint32_t value);
     IOReturn readRptr(uint32_t *);
-    IOReturn emitPrologue(uint32_t at,bool reset,bool table,uint32_t *end,uint32_t number);
-    IOReturn emitFence(uint32_t at,uint32_t seqno,uint32_t *end);
-    IOReturn emitFramedFence(uint32_t at,uint32_t seqno,uint32_t *end);
-    IOReturn emitFramedFence(uint32_t at,uint32_t seqno,uint32_t *end,bool yield);
+    struct SubmitWriter;
+    IOReturn emitPrologue(SubmitWriter &,bool reset,bool table,uint32_t number);
+    IOReturn emitFence(SubmitWriter &,uint32_t seqno);
+    IOReturn emitFramedFence(SubmitWriter &,uint32_t seqno,bool yield);
     /* The one submission path: `number` is the fence this submission issues (the ring's next, or the caller's). */
     IOReturn submitWords(const uint32_t *words,size_t word_count,uint32_t number,bool framed,bool give_wptr,uint32_t *issued);
     IOReturn program();

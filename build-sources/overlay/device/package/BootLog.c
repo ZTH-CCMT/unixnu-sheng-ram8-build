@@ -14,6 +14,8 @@
 // The header is written last in each round, so a reader never trusts a slot or an export the header does not count yet.
 #include <kern/startup.h>
 #include "BootLatencyFiles.h"
+#define NATIVE_ADRENO_RING_LOG_OPTIONAL
+#include "NativeAdrenoRingLog.h"
 #include <kern/thread.h>
 #include <kern/clock.h>
 #include <string.h>
@@ -354,7 +356,6 @@ extern volatile uint32_t native_cpufreq_throttle[9] __attribute__((weak_import))
 extern volatile uint64_t native_adreno_fence_phys __attribute__((weak_import));
 extern int (*native_adreno_dram_read32)(uint64_t, uint32_t *) __attribute__((weak_import));
 extern int (*native_adreno_cached_read32)(uint64_t, uint32_t *) __attribute__((weak_import));
-extern uint32_t native_adreno_ring_log_copy(uint32_t (*out)[4 + 112], uint32_t capacity) __attribute__((weak_import));
 extern volatile uint32_t native_adreno_ib_log[4][4 + 28] __attribute__((weak_import));
 extern volatile uint32_t native_adreno_ib_log_count __attribute__((weak_import));
 extern unsigned native_legacy_properties_now(char *, unsigned) __attribute__((weak_import));
@@ -1008,20 +1009,19 @@ static size_t compose(char *out, size_t cap, uint32_t slot, unsigned now) {
     if (n) {char head[64]; snprintf(head, sizeof head, "[hot] kernel slide=%lx", (unsigned long)vm_kernel_slide); at = put(out, at, cap, head, sizeof head);}
     for (unsigned i = 0; i < n; ++i) at = put(out, at, cap, hot[i], 120);
   }
-  // The four newest ring submissions (fence, ring range, then the words the CP reads) and the first words of their IBs: all that the
-  // logs keep, so a stalled fence behind newer submissions is still shown.
+  // The newest ring submissions and their IB prefixes, for diagnosing a stalled fence behind newer submissions.
   if (log_gpu_on && &native_adreno_ring_log_copy) {
-    uint32_t ring_rows[4][4 + 112];
-    const uint32_t count = native_adreno_ring_log_copy(ring_rows, 4);
+    NativeAdrenoRingLogRow ring_rows[NativeAdrenoRingLogRows];
+    const uint32_t count = native_adreno_ring_log_copy(ring_rows, NativeAdrenoRingLogRows);
     for (uint32_t back = 0; back < count; ++back) {
       const uint32_t *r = ring_rows[back];
       char row[130];
       snprintf(row, sizeof row, "[ring] fence=%u ring %x..%x words=%u", r[0], r[1], r[2], r[3]);
       at = put(out, at, cap, row, sizeof row);
-      const uint32_t words = r[3] < 112 ? r[3] : 112;
+      const uint32_t words = r[3] < NativeAdrenoRingLogPrefixWords ? r[3] : NativeAdrenoRingLogPrefixWords;
       for (uint32_t i = 0; i < words; i += 8) {
         int n = snprintf(row, sizeof row, "R%03x", i);
-        for (uint32_t k = i; k < i + 8 && k < words && n > 0 && n < 110; ++k) n += snprintf(row + n, sizeof row - n, " %08x", r[4 + k]);
+        for (uint32_t k = i; k < i + 8 && k < words && n > 0 && n < 110; ++k) n += snprintf(row + n, sizeof row - n, " %08x", r[NativeAdrenoRingLogHeaderWords + k]);
         at = put(out, at, cap, row, sizeof row);
       }
     }

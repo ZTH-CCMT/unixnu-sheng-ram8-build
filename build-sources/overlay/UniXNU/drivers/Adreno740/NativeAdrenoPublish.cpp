@@ -29,6 +29,7 @@
 #include "NativeGpuTrace.inc"
 
 extern "C" void proc_selfname(char *, int);
+extern "C" void native_legacy_gpu_fence_progress(void) __attribute__((weak_import));
 /* The system's render server, the process that composes the display: backboardd on iPadOS, WindowServer on macOS. It gets the
  * reserved row 0 and its mailbox page, the cache export and its own report line. */
 #if defined(XNU_TARGET_OS_OSX) && XNU_TARGET_OS_OSX
@@ -241,6 +242,7 @@ void fencePass(bool periodic)
     native_adreno_fence_wake[7]=native_adreno_fence_wake[7]+(after.triggers-before.triggers)+(after.completed-before.completed);
     IOLockUnlock(g.wake_lock);
     IOLockUnlock(g.lock);
+    if(!periodic && &native_legacy_gpu_fence_progress)native_legacy_gpu_fence_progress();
 }
 void fenceCall(thread_call_param_t,thread_call_param_t) {fencePass(false);}
 }

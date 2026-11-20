@@ -37,6 +37,7 @@ diagnostics = (
 blank = fragment('        if(!accepted && reason==2 && !surface', '        if(accepted && !addValidated')
 cpu_read = fragment('    struct CpuReadMapping {', '    void *shadow=')
 half_conversion = fragment('static uint64_t visibleRowSpan(', '#if defined(NATIVE_LEGACY_MACOS)')
+fence_progress = fragment('extern "C" void native_legacy_gpu_fence_progress(', 'IOService *native_legacy_display_allocate')
 held_swap = fragment('    struct SwapInfo {', "    // The client's async result").replace(' override', '')
 methods = []
 # The cancellation method ends at its closing brace: it answers differently on macOS inside its own conditional block.
@@ -45,7 +46,7 @@ for start, end, keep in [('    bool isValidated(', '    uint64_t traceRequestIds
                          ('    bool addValidated(', '    const OriginalLegacySwapRequest *gpuRequest=', ''),
                          ('    static void sortScanoutPages(', '    int directSlot(', ''),
                          ('    bool gpuWrote(', '    static void fenceFired(', ''),
-                         ('    void fenceTick()', '    static void latchFired(', ''),
+                         ('    void fenceTick(', '    static void latchFired(', ''),
                          ('    void latchTick()', '    bool vsyncWanted()', ''),
                          ('    void startTransferEvents()', '    void forgetDirectDisplay()', ''),
                          ('    void finishGpuSwap(', '    // Hands the pending head', ''),
@@ -177,6 +178,7 @@ struct Display : OSObject {
     IOWorkLoop *getWorkLoop() {return &loop;}
     IOLock *gpuCompletionLock=nullptr;
     IOInterruptEventSource *gpuCompletionSource=nullptr;
+    bool fenceWakeArmed=false,fenceWakePending=false;
     bool gpuCopyOutstanding=false,gpuResultReady=false,gpuBypass=false;
     uint64_t gpuLength=0;
     int gpuResult=0,refs=1;
@@ -245,6 +247,11 @@ struct Display : OSObject {
 #include "methods.inc"
 #include "cpu-read.inc"
 };
+using NativeLegacyDisplay=Display;
+static IOLock directDisplayLock;
+static IOLock *gDirectDisplayLock=&directDisplayLock;
+static Display *gDirectDisplay=nullptr;
+#include "fence-progress.inc"
 static uint8_t halfColors[32768];
 static const uint8_t *halfTable() {return halfColors;}
 #include "half-conversion.inc"
@@ -692,6 +699,70 @@ static void testPendingFenceTimer() {
     std::puts("PASS: fence timer polls only its held target, backs off slow waits and kicks exactly once on completion");
 }
 
+static void testFenceProgress() {
+    const OriginalLegacySwapRequest a,b;
+    Display display;
+    display.startTransferEvents();
+    const auto *event=display.gpuCompletionSource;
+    assert(event && !event->pending);
+    gDirectDisplay=&display;
+    native_legacy_gpu_fence_progress();
+    assert(!event->pending && display.refs==1);
+    display.addValidated(&a,resetEpoch);
+    display.head=&a;
+    display.kickBody=[](Display &d) {
+        int slot=-1;
+        assert(d.prepareDirectSwap(d.head,nullptr,nullptr,slot));
+        assert(slot==2 && d.traceGpuComplete);
+    };
+    const uint64_t submittedAt=clockNow;
+    query(true,189,188);
+    assert(!display.gpuWrote(&a) && display.timer.delay==200);
+    clockNow=submittedAt+50000;
+    query(true,190,189);
+    const unsigned before=queryCalls;
+    native_legacy_gpu_fence_progress();
+    native_legacy_gpu_fence_progress();
+    assert(display.refs==1 && event->pending==1 && queryCalls==before && !display.kicks);
+    display.gpuCompletionSource->run(&display);
+    assert(queryCalls==before+1 && display.kicks==1 && display.directMaps==1 && !display.timer.delay);
+    assert(!display.fenceWakeArmed && !display.fenceWakePending && !display.fenceFor);
+    native_legacy_gpu_fence_progress();
+    assert(!event->pending);
+    const unsigned earlierUs=200-unsigned((clockNow-submittedAt)/1000);
+
+    display.addValidated(&b,resetEpoch);
+    display.head=&b;
+    query(true,191,190);
+    assert(!display.gpuWrote(&b));
+    native_legacy_gpu_fence_progress();
+    assert(event->pending==1);
+    const unsigned oldPollCount=display.timer.polls;
+    display.gpuCompletionSource->run(&display);
+    assert(display.kicks==1 && display.fenceWakeArmed && display.timer.delay==200 && display.timer.polls==oldPollCount);
+    native_legacy_gpu_fence_progress();
+    assert(event->pending==1);
+    assert(display.cancelSwapsAfterTimeout());
+    display.gpuCompletionSource->run(&display);
+    assert(display.kicks==1 && !display.fenceWakeArmed && !display.timer.delay);
+
+    // Notification is optional. Stopping the shared event source leaves
+    // the already armed timer able to finish an outstanding direct swap.
+    display.addValidated(&a,resetEpoch);
+    display.head=&a;
+    assert(!display.gpuWrote(&a));
+    native_legacy_gpu_fence_progress();
+    assert(event->pending==1);
+    display.stopTransferEvents();
+    native_legacy_gpu_fence_progress();
+    assert(display.refs==1 && !display.gpuCompletionSource && !display.fenceWakePending);
+    query(true,191,191);
+    display.fenceTick();
+    assert(display.kicks==2 && !display.fenceFor);
+    gDirectDisplay=nullptr;
+    std::printf("PASS: GPU progress wakes gated display %u simulated microseconds before poll; coalescing, incomplete fences, cancellation and timer fallback\n",earlierUs);
+}
+
 static void testRetirement() {
     Display d;
     OriginalLegacySwapRequest a,b;
@@ -948,6 +1019,7 @@ int main() {
     testBlankValidation();
     testLatch();
     testPendingFenceTimer();
+    testFenceProgress();
     testRetirement();
     testGpuHandoff();
     OriginalLegacySwapRequest a,b;
@@ -1061,6 +1133,7 @@ with tempfile.TemporaryDirectory(prefix='gop-fence-wait-') as directory:
     (root / 'held-swap.inc').write_text(held_swap)
     (root / 'cpu-read.inc').write_text(cpu_read)
     (root / 'half-conversion.inc').write_text(half_conversion)
+    (root / 'fence-progress.inc').write_text(fence_progress)
     (root / 'test.cpp').write_text(harness)
     subprocess.run([os.environ.get('CXX', 'c++'), '-std=c++17', '-Wall', '-Wextra', '-Werror',
                     f'-DTEST_ADRENO={int(bool(gpu_methods))}',

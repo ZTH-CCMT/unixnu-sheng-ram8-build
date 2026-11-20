@@ -478,6 +478,8 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     // gpuCompletionLock serializes the producer with detaching the source. The family gate owns the frame state.
     IOLock *gpuCompletionLock=nullptr;
     IOInterruptEventSource *gpuCompletionSource=nullptr;
+    bool fenceWakeArmed=false; // Atomic: the gated display wants GPU progress notifications.
+    bool fenceWakePending=false; // Protected by gpuCompletionLock.
     bool gpuCopyOutstanding=false;
     bool gpuResultReady;
     int gpuResult;
@@ -642,7 +644,7 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     // A provider's failed query is not completion. Poll without blocking the display work loop;
     // a slow GPU leaves the previous frame on screen until completion or family cancellation.
     bool traceGpuComplete=false;
-    bool gpuWrote(const OriginalLegacySwapRequest *request,const uint64_t *pages=nullptr,unsigned count=0) {
+    bool gpuWrote(const OriginalLegacySwapRequest *request,const uint64_t *pages=nullptr,unsigned count=0,bool armTimer=true) {
         traceGpuComplete=false;
         if(fenceReady==request) {
             // The timer already observed this head's fixed target. The
@@ -692,8 +694,10 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         if(complete) {
             traceGpuComplete=true;
             gpuTraceEvent(GpuTraceDisplayFence,0,traceId(request),1,fenceTarget,submitted,retired,0,detail[0],detail[1],detail[2]);
-            if(fenceSince)note(3,-1,request);
             if(fenceSince) {
+                __atomic_store_n(&fenceWakeArmed,false,__ATOMIC_RELEASE);
+                fenceTimer->cancelTimeout();
+                note(3,-1,request);
                 uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time()-fenceSince,&ns);
                 const uint32_t us=uint32_t(ns/1000);
                 native_legacy_direct[10]=native_legacy_direct[10]+us;
@@ -712,13 +716,17 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         }
         gpuTraceEvent(GpuTraceDisplayFence,0,traceId(request),known?3:4,fenceTarget,submitted,retired,ns,detail[0],detail[1],detail[2]);
         transferred=true;
+        __atomic_store_n(&fenceWakeArmed,true,__ATOMIC_RELEASE);
         // Keep the short interval for the first frame. A persistent wait
         // needs fewer work-loop wakeups while keeping its original target.
         const unsigned delay=ns<17000000ull?200:ns<50000000ull?1000:ns<250000000ull?4000:8000;
-        fenceTimer->setTimeoutUS(delay);
+        // A progress event can come from an unrelated GPU job. Keep the
+        // existing deadline when that event did not finish our target.
+        if(armTimer)fenceTimer->setTimeoutUS(delay);
         return false;
     }
     void clearFenceWait() {
+        __atomic_store_n(&fenceWakeArmed,false,__ATOMIC_RELEASE);
         if(fenceTimer)fenceTimer->cancelTimeout();
         fenceFor=nullptr;fenceReady=nullptr;fencePages=nullptr;fencePageCount=0;fenceTarget=0;
         fenceSince=0;fenceCaptured=false;fenceSlow=false;traceGpuComplete=false;scanoutCaptured=false;
@@ -758,7 +766,7 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         return !discardResetSwap(request);
     }
     static void fenceFired(OSObject *owner,IOTimerEventSource *) {static_cast<NativeLegacyDisplay *>(owner)->fenceTick();}
-    void fenceTick() {
+    void fenceTick(bool armTimer=true) {
         const OriginalLegacySwapRequest *request=fenceFor;
         if(!request)return;   // A queued callback after cancellation cannot unblock a newer transfer.
         if(!isValidated(request) || pendingSwapRequest()!=request) {
@@ -767,7 +775,7 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
             kickSwapQueue();
             return;
         }
-        if(!gpuWrote(request,fencePages,fencePageCount)) {
+        if(!gpuWrote(request,fencePages,fencePageCount,armTimer)) {
             if(!fenceFor && rekick)kickSwapQueue();   // A reset or failed fence retired this head.
             return;
         }
@@ -881,7 +889,7 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
             if(!gpuCompletionLock)return;
             gpuResultReady=false;
         }
-        IOInterruptEventSource *source=IOInterruptEventSource::interruptEventSource(this,&NativeLegacyDisplay::gpuCopyReady);
+        IOInterruptEventSource *source=IOInterruptEventSource::interruptEventSource(this,&NativeLegacyDisplay::transferEventReady);
         if(!source)return;
         if(loop->addEventSource(source)!=kIOReturnSuccess){source->release();return;}
         source->enable();
@@ -901,6 +909,7 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         IOLockLock(gpuCompletionLock);
         IOInterruptEventSource *source=gpuCompletionSource;
         gpuCompletionSource=nullptr;
+        fenceWakePending=false;
         const bool queued=gpuResultReady;
         if(queued){
             gpuResultReady=false;
@@ -933,21 +942,34 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         release();
         return false;
     }
-    static void gpuCopyReady(OSObject *owner,IOInterruptEventSource *,int) {
+    static void transferEventReady(OSObject *owner,IOInterruptEventSource *,int) {
         auto *display=static_cast<NativeLegacyDisplay *>(owner);
         IOLockLock(display->gpuCompletionLock);
-        if(!display->gpuResultReady) {
-            IOLockUnlock(display->gpuCompletionLock);
-            return;
+        const bool fenceReady=display->fenceWakePending;
+        display->fenceWakePending=false;
+        const bool copyReady=display->gpuResultReady;
+        const int status=copyReady?display->gpuResult:0;
+        if(copyReady) {
+            display->gpuResultReady=false;
+            __atomic_store_n(&display->gpuCopyOutstanding,false,__ATOMIC_RELEASE);
         }
-        const int status=display->gpuResult;
-        display->gpuResultReady=false;
-        __atomic_store_n(&display->gpuCopyOutstanding,false,__ATOMIC_RELEASE);
         IOLockUnlock(display->gpuCompletionLock);
-        display->finishGpuSwap(status);
-        display->release();
+        if(fenceReady)display->fenceTick(false);
+        if(copyReady) {
+            display->finishGpuSwap(status);
+            display->release();
+        }
     }
 public:
+    void signalFenceProgress() {
+        if(!__atomic_load_n(&fenceWakeArmed,__ATOMIC_ACQUIRE) || !gpuCompletionLock)return;
+        IOLockLock(gpuCompletionLock);
+        if(gpuCompletionSource && !fenceWakePending) {
+            fenceWakePending=true;
+            gpuCompletionSource->interruptOccurred(nullptr,nullptr,0);
+        }
+        IOLockUnlock(gpuCompletionLock);
+    }
     // Called without the family gate. Signal the preallocated work source and return to the presenter.
     void gpuComplete(int status) {
         if(!gpuCompletionLock)return;
@@ -1804,6 +1826,19 @@ extern "C" void native_legacy_direct_snapshot(void)
         return kIOReturnSuccess;
     };
     if(IOWorkLoop *loop=display->getWorkLoop())loop->runAction(snapshot,display,display);
+    display->release();
+}
+// The Adreno completion worker calls after dropping its own locks.
+extern "C" void native_legacy_gpu_fence_progress(void)
+{
+    IOLock *lock=__atomic_load_n(&gDirectDisplayLock,__ATOMIC_ACQUIRE);
+    if(!lock)return;
+    IOLockLock(lock);
+    NativeLegacyDisplay *display=gDirectDisplay;
+    if(display)display->retain();
+    IOLockUnlock(lock);
+    if(!display)return;
+    display->signalFenceProgress();
     display->release();
 }
 IOService *native_legacy_display_allocate(void) {return new NativeLegacyDisplay;}
