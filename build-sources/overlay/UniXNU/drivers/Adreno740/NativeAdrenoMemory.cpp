@@ -132,8 +132,8 @@ bool NativeAdrenoMemory::ownsAnyPage(const NativeAdrenoPhysicalSpan *spans,size_
     if(!bits)return true;
     for(size_t i=0;i<count;++i)for(uint64_t page=spans[i].physical;page<spans[i].physical+spans[i].bytes;page+=4096) {
         uint64_t at=0;
-        if(!ownedIndex(page,&at))continue;
-        if(__atomic_load_n(&bits[at/64],__ATOMIC_RELAXED)>>(at%64)&1)return true;
+        // Unknown physical ranges must take the full alias check.
+        if(!ownedIndex(page,&at) || (__atomic_load_n(&bits[at/64],__ATOMIC_RELAXED)>>(at%64)&1))return true;
     }
     return false;
 }

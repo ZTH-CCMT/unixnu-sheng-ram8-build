@@ -13,6 +13,8 @@
     } \
 } while (0)
 
+using SwitchState=NativeAdrenoSwitchState;
+
 struct Peer {
  uint32_t cntl=0, registers[0x9000]={};
  uint64_t now=0;
@@ -88,21 +90,53 @@ static void testEvidence()
  CHECK(out.registers[0]==0x341 && out.registers[8]==0x341 && a.inFlight());
  keep=out;CHECK(!a.captureTimeoutEvidence(2,&out) && !std::memcmp(&out,&keep,sizeof out));
  CHECK(a.noteTimeout(nullptr));CHECK(!a.captureTimeoutEvidence(2,&out));
- p.failed_read=UINT32_MAX;p.cntl&=~1u;CHECK(a.complete() && a.releaseKeepalive());
+ p.failed_read=UINT32_MAX;p.cntl&=~1u;CHECK(a.complete()==SwitchState::Completed && a.releaseKeepalive());
  CHECK(!a.restart(0));CHECK(!std::memcmp(&out,&keep,sizeof out));
  CHECK(a.trigger(1,true));CHECK(!a.captureTimeoutEvidence(2,&out));
- p.cntl&=~1u;CHECK(a.complete() && a.releaseKeepalive() && !a.detach());
+ p.cntl&=~1u;CHECK(a.complete()==SwitchState::Completed && a.releaseKeepalive() && !a.detach());
  std::puts("PASS timeout SQE even at equal ring pointers, explicit read validity, capture interval, pre-reset pages and one capture per switch");
+}
+static void testSwitchStates()
+{
+ Peer p;NativeAdrenoPreempt a;
+ NativeAdrenoPreemptIo io{&p,write,read,barrier,&p,nullptr};
+ alignas(4) uint8_t r0[64]{},r1[64]{},s0[32]{},s1[32]{};
+ NativeAdrenoPreemptRings rings{{0x10000,0x20000},{0x30000,0x40000},{r0,r1},{s0,s1}};
+ CHECK(a.attach(&io,rings,0,now,&p)==kIOReturnBadArgument && p.order.empty());
+ CHECK(a.restart(0)==kIOReturnNotReady && a.complete()==SwitchState::Idle);
+ io.gmu_write32=gmu;
+ CHECK(a.attach(&io,rings,0,now,&p)==kIOReturnSuccess);
+ CHECK(a.complete()==SwitchState::Idle && a.restart(2)==kIOReturnBadArgument);
+ bool ready=true;
+ p.now=101;
+ CHECK(a.trigger(1,true,nullptr,nullptr,&ready) && !ready);
+ CHECK(a.complete()==SwitchState::Pending);
+ p.failed_read=0x08a0;
+ p.cntl&=~1u;
+ CHECK(a.complete()==SwitchState::ReadError && a.inFlight() && a.loaded()==0);
+ CHECK(a.readCntl()==UINT32_MAX);
+ const uint32_t slot=(native_adreno_switch_count-1)&(NativeAdrenoSwitchLogRows-1);
+ volatile const uint32_t *const row=native_adreno_switch_log[slot];
+ CHECK(row[5]==(1u<<8) && row[3]==0);
+ p.now=121;
+ p.failed_read=UINT32_MAX;
+ CHECK(a.restart(0)==kIOReturnSuccess && !a.inFlight());
+ CHECK(row[5]==((1u<<8)|(4u<<16)) && row[3]==121);
+ CHECK(row[7]==UINT32_MAX && row[20]==UINT32_MAX);
+ CHECK(a.stats().faulted==1 && a.stats().completed==0 && a.complete()==SwitchState::Idle);
+ CHECK(a.detach()==kIOReturnSuccess);
+ std::puts("PASS missing keepalive, all completion results, and in-flight reset closes the original event");
 }
 int main() {
  testEvidence();
+ testSwitchStates();
  Peer p;NativeAdrenoPreempt a;NativeAdrenoPreemptIo io{&p,write,read,barrier,&p,gmu};
  alignas(4) uint8_t r0[64]{},r1[64]{},s0[32]{},s1[32]{};
  NativeAdrenoPreemptRings rings{{0x10000,0x20000},{0x30000,0x40000},{r0,r1},{s0,s1}};
  CHECK(!a.attach(&io,rings,0,now,&p));p.order.clear();
  CHECK(a.trigger(1,true) && p.order.front()==0xaabb && p.cntl==0x341);
- CHECK(!a.complete() && a.stats().faulted==0);p.now=40000;CHECK(!a.timedOut(1000000));
- p.cntl=0x340;CHECK(a.complete() && a.loaded()==1 && p.order.back()!=0xccdd);
+ CHECK(a.complete()==SwitchState::Pending && a.stats().faulted==0);p.now=40000;CHECK(!a.timedOut(1000000));
+ p.cntl=0x340;CHECK(a.complete()==SwitchState::Completed && a.loaded()==1 && p.order.back()!=0xccdd);
  CHECK(a.releaseKeepalive() && p.order.back()==0xccdd);
  uint32_t frozen[NativeAdrenoSwitchLogWords],untouched[NativeAdrenoSwitchLogWords];
  for(auto &word:frozen)word=0xdeadbeef;
@@ -118,8 +152,9 @@ int main() {
  std::memcpy(untouched,frozen,sizeof(frozen));
  CHECK(!a.noteTimeout(nullptr,frozen) && a.stats().faulted==1);
  CHECK(!std::memcmp(frozen,untouched,sizeof(frozen)));
- // A late STOP-clear still completes normally, without reopening the timed-out event.
- p.cntl&=~1u;CHECK(a.complete() && a.loaded()==0 && a.releaseKeepalive());
+ // A late STOP-clear completes exactly once, leaving the frozen timeout record.
+ p.cntl&=~1u;CHECK(a.complete()==SwitchState::Completed && a.loaded()==0 && a.releaseKeepalive());
+ CHECK(a.stats().completed==2 && a.stats().faulted==0 && a.complete()==SwitchState::Idle);
  CHECK(!a.noteTimeout(nullptr,frozen) && !std::memcmp(frozen,untouched,sizeof(frozen)));
  p.order.clear();
  CHECK(a.restart(1)==kIOReturnSuccess && !a.inFlight() && a.loaded()==1);
@@ -128,17 +163,17 @@ int main() {
  // Exercise more than the circular log capacity before checking the copied event.
  for(unsigned i=0;i<20;++i) {
      CHECK(a.trigger(a.loaded()^1u,true));p.cntl&=~1u;
-     CHECK(a.complete() && a.releaseKeepalive());
+     CHECK(a.complete()==SwitchState::Completed && a.releaseKeepalive());
  }
  CHECK(!a.noteTimeout(nullptr,frozen) && !std::memcmp(frozen,untouched,sizeof(frozen)));
  p.fail=true;p.failClear=true;
- CHECK(!a.trigger(0,true) && p.order.back()==0xccdd && a.stats().faulted==2);
+ CHECK(!a.trigger(0,true) && p.order.back()==0xccdd && a.stats().faulted==1);
  p.fail=false;p.order.clear();
  CHECK(!a.trigger(0,true) && p.order==std::vector<uint32_t>{0xccdd});
  p.failClear=false;p.order.clear();
  CHECK(a.trigger(0,true) && p.order[0]==0xccdd && p.order[1]==0xaabb);
  p.cntl&=~1u;
- CHECK(a.complete() && a.releaseKeepalive());
+ CHECK(a.complete()==SwitchState::Completed && a.releaseKeepalive());
  r0[60]=0x67;r0[61]=0x45;r0[62]=0x23;r0[63]=1;
  CHECK(NativeAdrenoPreempt::recordWord(r0,60)==0x01234567);
  CHECK(!NativeAdrenoPreempt::recordWord(r0,61) && !NativeAdrenoPreempt::recordWord(r0,63));

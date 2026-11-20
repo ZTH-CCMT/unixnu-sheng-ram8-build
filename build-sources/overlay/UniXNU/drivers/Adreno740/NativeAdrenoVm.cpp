@@ -39,8 +39,9 @@ static bool maintainAll()
 static bool synchronizedTrusted() {return !maintainAll() && !native_adreno_sync_audit[4];}
 static void noteKind(unsigned kind,size_t bytes)
 {
-    native_adreno_maint_kind[kind][0]=native_adreno_maint_kind[kind][0]+1;
-    native_adreno_maint_kind[kind][1]=native_adreno_maint_kind[kind][1]+((bytes+1023)>>10);
+    // These counters are exported while the VM is active. Keep their scalar ABI.
+    __atomic_fetch_add(&native_adreno_maint_kind[kind][0],1,__ATOMIC_RELAXED);
+    __atomic_fetch_add(&native_adreno_maint_kind[kind][1],(bytes+1023)>>10,__ATOMIC_RELAXED);
 }
 static unsigned kindOf(const NativeAdrenoMemory *memory,unsigned permissions)
 {
@@ -76,14 +77,20 @@ struct PhaseClock {
     uint64_t last=native_adreno_vm_now_us?native_adreno_vm_now_us():0,began=last;
     void lap(unsigned row,unsigned slot) {
         if(!native_adreno_vm_now_us)return;
-        const uint64_t now=native_adreno_vm_now_us();native_adreno_vm_phase_us[row][slot]+=now-last;last=now;
+        const uint64_t now=native_adreno_vm_now_us();
+        __atomic_fetch_add(&native_adreno_vm_phase_us[row][slot],now-last,__ATOMIC_RELAXED);
+        last=now;
     }
     uint64_t elapsed() const {return native_adreno_vm_now_us?native_adreno_vm_now_us()-began:0;}
     void done(unsigned row,uint64_t bytes) {
         if(!native_adreno_vm_now_us)return;
         const uint64_t total=native_adreno_vm_now_us()-began;
-        native_adreno_vm_phase_us[row][0]+=1;native_adreno_vm_phase_us[row][7]+=bytes;
-        if(total>native_adreno_vm_phase_us[row][6])native_adreno_vm_phase_us[row][6]=total;
+        __atomic_fetch_add(&native_adreno_vm_phase_us[row][0],1,__ATOMIC_RELAXED);
+        __atomic_fetch_add(&native_adreno_vm_phase_us[row][7],bytes,__ATOMIC_RELAXED);
+        volatile uint64_t *peak=&native_adreno_vm_phase_us[row][6];
+        uint64_t previous=__atomic_load_n(peak,__ATOMIC_RELAXED);
+        while(total>previous &&
+              !__atomic_compare_exchange_n(peak,&previous,total,true,__ATOMIC_RELAXED,__ATOMIC_RELAXED)) {}
     }
 };
 }
@@ -273,8 +280,8 @@ IOReturn NativeAdrenoVm::preflight(const NativeAdrenoMemory *memory,unsigned upp
      * not needed. i568: this pass and the table transaction's walked every one of about 50000 ranges on each map, 0.6 ms of its 0.66. */
     if(exclusive)return kIOReturnSuccess;
     /* Only another cache/shareability/privilege class can conflict. The new spans are indexed by physical address in the scratch (the
-     * caller grew it to them) and every mapped span of another class is looked up in O(log n). Pages of this driver's own buffers are
-     * all in its ownership map: an import none of whose pages is there can only alias another import. */
+     * caller grew it to them) and every mapped span of another class is looked up in O(log n). An import can skip driver buffers only
+     * when its pages are indexed and none is marked as driver-owned. */
     const unsigned mine=aliasClass(permissions,writeback,shareability);
     if(spanCount()==class_spans_[mine&15])return kIOReturnSuccess;
     if(!alias_scratch_ || memory->spanCount()>capacity_)return kIOReturnNoResources;
@@ -365,7 +372,7 @@ IOReturn NativeAdrenoVm::map(NativeAdrenoMemory *memory,unsigned upper,uint64_t 
         if(!growMappings())return kIOReturnNoMemory;
     }
     checked=memory->holdForDevice();if(checked)return checked;
-    if(coherentMapping(writeback))native_adreno_coherent_skips[0]=native_adreno_coherent_skips[0]+1;
+    if(coherentMapping(writeback))__atomic_fetch_add(&native_adreno_coherent_skips[0],1,__ATOMIC_RELAXED);
     /* A synchronized buffer was cleaned by whoever stored into it: one more table that maps it finds no line to write back. */
     else if(memory->synchronized() && synchronizedTrusted())native_adreno_sync_skips[0]=native_adreno_sync_skips[0]+1;
     else {
@@ -411,9 +418,9 @@ IOReturn NativeAdrenoVm::map(NativeAdrenoMemory *memory,unsigned upper,uint64_t 
     clock.lap(0,4);clock.done(0,memory->bytes());
     {
         const unsigned kind=!memory->imported()?0:exclusive?1:2;
-        native_adreno_vm_kind_us[kind][0]=native_adreno_vm_kind_us[kind][0]+1;
-        native_adreno_vm_kind_us[kind][1]=native_adreno_vm_kind_us[kind][1]+clock.elapsed();
-        native_adreno_vm_kind_us[kind][2]=native_adreno_vm_kind_us[kind][2]+spans;
+        __atomic_fetch_add(&native_adreno_vm_kind_us[kind][0],1,__ATOMIC_RELAXED);
+        __atomic_fetch_add(&native_adreno_vm_kind_us[kind][1],clock.elapsed(),__ATOMIC_RELAXED);
+        __atomic_fetch_add(&native_adreno_vm_kind_us[kind][2],spans,__ATOMIC_RELAXED);
     }
     record->handle=next_handle_++;*handle=record->handle;index_.insert(record->handle,(uint32_t)(record-mappings_));
     result_.complete=true;return kIOReturnSuccess;
@@ -430,7 +437,7 @@ IOReturn NativeAdrenoVm::unmap(uint64_t handle)
     if(status)return fail(status);
     clock.lap(1,1);
     const unsigned upper=record->upper;
-    if(coherentMapping(record->writeback))native_adreno_coherent_skips[1]=native_adreno_coherent_skips[1]+1;
+    if(coherentMapping(record->writeback))__atomic_fetch_add(&native_adreno_coherent_skips[1],1,__ATOMIC_RELAXED);
     /* Whoever reads what the GPU wrote into a synchronized buffer invalidates first, or reads through a non-cacheable view. */
     else if(record->memory->synchronized() && synchronizedTrusted()) {
         if(record->permissions&ArmSmmu4KWrite)native_adreno_sync_skips[1]=native_adreno_sync_skips[1]+1;
@@ -466,9 +473,9 @@ IOReturn NativeAdrenoVm::unmap(uint64_t handle)
     if(record->memory->imported())import_spans_[aliasClass(record->permissions,record->writeback,record->shareability)&15]-=spans;
     {
         const unsigned kind=record->memory->bytes()<=(size_t)ArmSmmu4KTlbPageLimit*4096?3:4;   /* page TLBIs, else the ASID */
-        native_adreno_vm_kind_us[kind][0]=native_adreno_vm_kind_us[kind][0]+1;
-        native_adreno_vm_kind_us[kind][1]=native_adreno_vm_kind_us[kind][1]+clock.elapsed();
-        native_adreno_vm_kind_us[kind][2]=native_adreno_vm_kind_us[kind][2]+spans;
+        __atomic_fetch_add(&native_adreno_vm_kind_us[kind][0],1,__ATOMIC_RELAXED);
+        __atomic_fetch_add(&native_adreno_vm_kind_us[kind][1],clock.elapsed(),__ATOMIC_RELAXED);
+        __atomic_fetch_add(&native_adreno_vm_kind_us[kind][2],spans,__ATOMIC_RELAXED);
     }
     index_.erase(record->handle);
     const size_t slot=(size_t)(record-mappings_);if(slot<free_hint_)free_hint_=slot;
@@ -572,31 +579,31 @@ void NativeAdrenoVm::sync()
     care_count_=0;memset(kind_count_,0,sizeof(kind_count_));memset(kind_work_,0,sizeof(kind_work_));
     submit_skips_=complete_skips_=0;
     for(size_t i=0;mappings_ && i<high_;++i)if(mappings_[i].memory && mappings_[i].mapped_spans)enlist(&mappings_[i]);
-    native_adreno_maint_walk[5]=native_adreno_maint_walk[5]+1;
+    __atomic_fetch_add(&native_adreno_maint_walk[5],1,__ATOMIC_RELAXED);
 }
 IOReturn NativeAdrenoVm::publishMapped()
 {
     if(!attached_ || poisoned_)return kIOReturnNotReady;
     sync();
-    native_adreno_maint_walk[0]=native_adreno_maint_walk[0]+1;
-    native_adreno_maint_walk[2]=native_adreno_maint_walk[2]+objects_;
+    __atomic_fetch_add(&native_adreno_maint_walk[0],1,__ATOMIC_RELAXED);
+    __atomic_fetch_add(&native_adreno_maint_walk[2],objects_,__ATOMIC_RELAXED);
     if(maintainAll()) {
         /* gpu-maint-all: every mapping is visited. */
-        native_adreno_maint_walk[1]=native_adreno_maint_walk[1]+high_;
+        __atomic_fetch_add(&native_adreno_maint_walk[1],high_,__ATOMIC_RELAXED);
         for(size_t i=0;i<high_;++i) {
             const Mapping &m=mappings_[i];
             if(!m.memory)continue;
             if(coherentMapping(m.writeback) || importedUntouched(m.memory)) {
-                native_adreno_coherent_skips[2]=native_adreno_coherent_skips[2]+1;
-                native_adreno_maint_kind[m.kind][2]=native_adreno_maint_kind[m.kind][2]+1;continue;
+                __atomic_fetch_add(&native_adreno_coherent_skips[2],1,__ATOMIC_RELAXED);
+                __atomic_fetch_add(&native_adreno_maint_kind[m.kind][2],1,__ATOMIC_RELAXED);continue;
             }
-            if(!m.memory->holdsCpuLines(distrust_write_combined_)) {native_adreno_maint_kind[m.kind][2]=native_adreno_maint_kind[m.kind][2]+1;continue;}
+            if(!m.memory->holdsCpuLines(distrust_write_combined_)) {__atomic_fetch_add(&native_adreno_maint_kind[m.kind][2],1,__ATOMIC_RELAXED);continue;}
             if(m.memory->publishForDevice(0,m.memory->bytes(),true,distrust_write_combined_,NativeAdrenoPhaseSubmit))return fail(ArmSmmu4KIoError);
             noteKind(m.kind,m.memory->bytes());
         }
         return kIOReturnSuccess;
     }
-    native_adreno_maint_walk[1]=native_adreno_maint_walk[1]+care_count_;
+    __atomic_fetch_add(&native_adreno_maint_walk[1],care_count_,__ATOMIC_RELAXED);
     for(size_t i=0;i<care_count_;++i) {
         const Mapping &m=mappings_[care_[i]];
         if(!(m.work&WorkSubmit))continue;
@@ -604,33 +611,33 @@ IOReturn NativeAdrenoVm::publishMapped()
         noteKind(m.kind,m.memory->bytes());
     }
     /* What the pass left alone, counted without a visit. */
-    native_adreno_coherent_skips[2]=native_adreno_coherent_skips[2]+(uint32_t)submit_skips_;
+    __atomic_fetch_add(&native_adreno_coherent_skips[2],(uint32_t)submit_skips_,__ATOMIC_RELAXED);
     for(unsigned k=0;k<NativeAdrenoKindCount;++k)
-        native_adreno_maint_kind[k][2]=native_adreno_maint_kind[k][2]+(kind_count_[k]-kind_work_[k]);
+        __atomic_fetch_add(&native_adreno_maint_kind[k][2],(kind_count_[k]-kind_work_[k]),__ATOMIC_RELAXED);
     return kIOReturnSuccess;
 }
 IOReturn NativeAdrenoVm::acquireImported()
 {
     if(!attached_ || poisoned_)return kIOReturnNotReady;
     sync();
-    native_adreno_maint_walk[3]=native_adreno_maint_walk[3]+1;
+    __atomic_fetch_add(&native_adreno_maint_walk[3],1,__ATOMIC_RELAXED);
     if(maintainAll()) {
-        native_adreno_maint_walk[4]=native_adreno_maint_walk[4]+high_;
+        __atomic_fetch_add(&native_adreno_maint_walk[4],high_,__ATOMIC_RELAXED);
         for(size_t i=0;i<high_;++i) {
             const Mapping &m=mappings_[i];
             if(!m.memory || !m.memory->imported() || !(m.permissions&ArmSmmu4KWrite))continue;
-            if(coherentMapping(m.writeback) || importedUntouched(m.memory)) {native_adreno_coherent_skips[3]=native_adreno_coherent_skips[3]+1;continue;}
+            if(coherentMapping(m.writeback) || importedUntouched(m.memory)) {__atomic_fetch_add(&native_adreno_coherent_skips[3],1,__ATOMIC_RELAXED);continue;}
             if(m.memory->acquireDeviceWrites(0,m.memory->bytes(),NativeAdrenoPhaseComplete))return fail(ArmSmmu4KIoError);
         }
         return kIOReturnSuccess;
     }
-    native_adreno_maint_walk[4]=native_adreno_maint_walk[4]+care_count_;
+    __atomic_fetch_add(&native_adreno_maint_walk[4],care_count_,__ATOMIC_RELAXED);
     for(size_t i=0;i<care_count_;++i) {
         const Mapping &m=mappings_[care_[i]];
         if(!(m.work&WorkComplete))continue;
         if(m.memory->acquireDeviceWrites(0,m.memory->bytes(),NativeAdrenoPhaseComplete))return fail(ArmSmmu4KIoError);
     }
-    native_adreno_coherent_skips[3]=native_adreno_coherent_skips[3]+(uint32_t)complete_skips_;
+    __atomic_fetch_add(&native_adreno_coherent_skips[3],(uint32_t)complete_skips_,__ATOMIC_RELAXED);
     return kIOReturnSuccess;
 }
 IOReturn NativeAdrenoVm::sampleWord(uint64_t iova,uint32_t *cached,uint32_t *dram) const
@@ -665,7 +672,7 @@ IOReturn NativeAdrenoVm::reassertWriteCombined(uint32_t *reset) const
     if(!reset)return kIOReturnBadArgument;
     if(!attached_ || poisoned_)return kIOReturnNotReady;
     if(maintainAll()) {
-        native_adreno_maint_walk[6]=native_adreno_maint_walk[6]+high_;
+        __atomic_fetch_add(&native_adreno_maint_walk[6],high_,__ATOMIC_RELAXED);
         for(size_t i=0;i<high_;++i) {
             const Mapping &m=mappings_[i];
             if(!m.memory)continue;
@@ -675,7 +682,7 @@ IOReturn NativeAdrenoVm::reassertWriteCombined(uint32_t *reset) const
         return kIOReturnSuccess;
     }
     /* Whether a mapping's pages can lose the attribute does not depend on the mode: every such mapping is in the list. */
-    native_adreno_maint_walk[6]=native_adreno_maint_walk[6]+care_count_;
+    __atomic_fetch_add(&native_adreno_maint_walk[6],care_count_,__ATOMIC_RELAXED);
     for(size_t i=0;i<care_count_;++i) {
         const Mapping &m=mappings_[care_[i]];
         if(!(m.work&WorkReassert))continue;

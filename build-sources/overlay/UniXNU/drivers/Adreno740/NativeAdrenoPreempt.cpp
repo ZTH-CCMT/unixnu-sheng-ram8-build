@@ -31,6 +31,7 @@ enum : uint32_t {
 };
 extern "C" {volatile uint32_t native_adreno_switch_log[NativeAdrenoSwitchLogRows][NativeAdrenoSwitchLogWords];volatile uint32_t native_adreno_switch_count;}
 enum : uint32_t {RegRbbmStatus=0x0210,RegRbbmInt0Status=0x0201,RegCpHwFault=0x0821,RegCpRbRptr=0x0806,RegCpRbWptr=0x0807};
+enum : uint32_t {SwitchCompleted=1,SwitchTimedOut=2,SwitchRefused=3,SwitchReset=4};
 static void put32(uint8_t *at,uint32_t value)
 {
     at[0]=(uint8_t)value;at[1]=(uint8_t)(value>>8);at[2]=(uint8_t)(value>>16);at[3]=(uint8_t)(value>>24);
@@ -89,11 +90,11 @@ IOReturn NativeAdrenoPreempt::attach(const NativeAdrenoPreemptIo *io,const Nativ
     uint32_t loaded,uint64_t (*now)(void *),void *clock)
 {
     if(attached_)return kIOReturnBusy;
-    if(!io || !io->write32 || !io->read32 || !io->barrier || !now)return kIOReturnBadArgument;
+    if(!io || !io->write32 || !io->read32 || !io->barrier || !io->gmu_write32 || !now)return kIOReturnBadArgument;
     if(loaded>=NativeAdrenoPreemptRingCount)return kIOReturnBadArgument;
     for(uint32_t i=0;i<NativeAdrenoPreemptRingCount;++i)
         if(!rings.record[i] || !rings.smmu_info[i])return kIOReturnBadArgument;
-    io_=*io;rings_=rings;loaded_=loaded;next_=loaded;armed_=false;
+    io_=*io;rings_=rings;loaded_=loaded;next_=loaded;armed_=false;timed_out_=false;
     now_us_=now;clock_cookie_=clock;
     const IOReturn status=programSwitchRegisters();
     if(status)return status;
@@ -112,7 +113,14 @@ IOReturn NativeAdrenoPreempt::programSwitchRegisters()
 
 IOReturn NativeAdrenoPreempt::restart(uint32_t ring)
 {
-    loaded_=ring;next_=ring;armed_=false;event_=nullptr;evidence_valid_=false;
+    if(!attached_)return kIOReturnNotReady;
+    if(ring>=NativeAdrenoPreemptRingCount)return kIOReturnBadArgument;
+    if(event_) {
+        // The hardware is already reset. Keep the pre-reset row and leave its end registers unavailable.
+        ++stats_.faulted;
+        closeEvent(SwitchReset,false);
+    }
+    loaded_=ring;next_=ring;armed_=false;timed_out_=false;
     if(!releaseKeepalive())return kIOReturnIOError;
     return programSwitchRegisters();
 }
@@ -149,23 +157,28 @@ volatile uint32_t *NativeAdrenoPreempt::openEvent(uint32_t to)
     native_adreno_switch_count=n+1;
     return row;
 }
-void NativeAdrenoPreempt::closeEvent(uint32_t outcome)
+void NativeAdrenoPreempt::closeEvent(uint32_t outcome,bool sampleEnd)
 {
     volatile uint32_t *row=event_;
     if(!row)return;
     const uint64_t now=now_us_?now_us_(clock_cookie_):0;
     row[3]=uint32_t(now);row[4]=uint32_t(now>>32);
     row[5]=(row[5]&0xffffu)|outcome<<16;
-    uint32_t v=0xffffffffu;
-    row[7]=readCntl();
-    row[8]=io_.read32(io_.cookie,RegRbbmStatus,&v)?0xffffffffu:v;v=0xffffffffu;
-    row[9]=io_.read32(io_.cookie,RegRbbmInt0Status,&v)?0xffffffffu:v;v=0xffffffffu;
-    row[10]=io_.read32(io_.cookie,RegCpHwFault,&v)?0xffffffffu:v;
-    uint32_t rptr=0xffff,wptr=0xffff;
-    if(!io_.read32(io_.cookie,RegCpRbRptr,&v))rptr=v&0xffff;
-    if(!io_.read32(io_.cookie,RegCpRbWptr,&v))wptr=v&0xffff;
-    row[11]=rptr|wptr<<16;
-    snapshot(row,20);
+    if(sampleEnd) {
+        uint32_t v=UINT32_MAX;
+        row[7]=readCntl();
+        row[8]=io_.read32(io_.cookie,RegRbbmStatus,&v)?UINT32_MAX:v;
+        row[9]=io_.read32(io_.cookie,RegRbbmInt0Status,&v)?UINT32_MAX:v;
+        row[10]=io_.read32(io_.cookie,RegCpHwFault,&v)?UINT32_MAX:v;
+        uint32_t rptr=0xffff,wptr=0xffff;
+        if(!io_.read32(io_.cookie,RegCpRbRptr,&v))rptr=v&0xffff;
+        if(!io_.read32(io_.cookie,RegCpRbWptr,&v))wptr=v&0xffff;
+        row[11]=rptr|wptr<<16;
+        snapshot(row,20);
+    } else {
+        for(unsigned i=7;i<12;++i)row[i]=UINT32_MAX;
+        for(unsigned i=20;i<28;++i)row[i]=UINT32_MAX;
+    }
     event_=nullptr;evidence_valid_=false;
 }
 static void evidenceTime(uint32_t out[2],uint64_t value)
@@ -244,20 +257,22 @@ bool NativeAdrenoPreempt::noteTimeout(const uint32_t progress[6],uint32_t *event
     if(!armed_ || !event_)return false;
     const volatile uint32_t *const closed=event_;
     if(progress)for(unsigned i=0;i<6;++i)event_[28+i]=progress[i];
-    stats_.faulted++;
-    closeEvent(2);
+    timed_out_=true;
+    ++stats_.faulted;
+    closeEvent(SwitchTimedOut);
     if(event_out)for(unsigned i=0;i<NativeAdrenoSwitchLogWords;++i)event_out[i]=closed[i];
     return true;
 }
 bool NativeAdrenoPreempt::trigger(uint32_t ring,bool uses_gmem,
-    void (*capture_tail)(void *,NativeAdrenoPublishedTail *),void *tail_cookie)
+    void (*capture_tail)(void *,NativeAdrenoPublishedTail *),void *tail_cookie,bool *ready)
 {
+    if(ready)*ready=false;
     if(!attached_ || armed_ || ring>=NativeAdrenoPreemptRingCount || ring==loaded_)return false;
     // A failed rollback can leave a vote on the GMU. Retry clearing it
     // before programming another switch, and remember an uncertain set.
     if(!releaseKeepalive())return false;
-    keepalive_=io_.gmu_write32!=nullptr;
-    if(keepalive_ && io_.gmu_write32(io_.gmu_cookie,GmuPreemptKeepalive,1)) {
+    keepalive_=true;
+    if(io_.gmu_write32(io_.gmu_cookie,GmuPreemptKeepalive,1)) {
         releaseKeepalive();
         return false;
     }
@@ -277,15 +292,22 @@ bool NativeAdrenoPreempt::trigger(uint32_t ring,bool uses_gmem,
         io_.write32(io_.cookie,PreemptSmmuInfo+1,(uint32_t)(info>>32)) ||
         io_.write32(io_.cookie,PreemptRestoreAddr,(uint32_t)record) ||
         io_.write32(io_.cookie,PreemptRestoreAddr+1,(uint32_t)(record>>32)))
-        {stats_.faulted++;closeEvent(3);releaseKeepalive();return false;}
-    if(io_.barrier(io_.cookie)) {stats_.faulted++;closeEvent(3);releaseKeepalive();return false;}
+        {++stats_.faulted;closeEvent(SwitchRefused);releaseKeepalive();return false;}
+    if(io_.barrier(io_.cookie)) {++stats_.faulted;closeEvent(SwitchRefused);releaseKeepalive();return false;}
     const uint32_t cntl=CntlStop|CntlLevel1|CntlSkipSaveRestore|(uses_gmem?CntlUsesGmem:0);
-    if(io_.write32(io_.cookie,PreemptCntl,cntl)) {stats_.faulted++;closeEvent(3);releaseKeepalive();return false;}
-    event_[6]=readCntl();
+    // Submit and completion are serialized by the caller's lock. Record the new switch before ringing the doorbell.
     next_=ring;armed_=true;
-    trigger_us_=now_us_?now_us_(clock_cookie_):0;
+    trigger_us_=now_us_(clock_cookie_);
     if(evidence_valid_)evidenceTime(evidence_.trigger_us,trigger_us_);
-    stats_.triggers=stats_.triggers+1;
+    if(io_.write32(io_.cookie,PreemptCntl,cntl)) {
+        armed_=false;next_=loaded_;
+        ++stats_.faulted;closeEvent(SwitchRefused);releaseKeepalive();
+        return false;
+    }
+    const uint32_t observed=readCntl();
+    event_[6]=observed;
+    if(ready)*ready=!(observed&CntlStop);
+    ++stats_.triggers;
     return true;
 }
 bool NativeAdrenoPreempt::timedOut(uint32_t limit_us) const
@@ -295,30 +317,32 @@ bool NativeAdrenoPreempt::timedOut(uint32_t limit_us) const
 }
 uint32_t NativeAdrenoPreempt::readCntl() const
 {
-    uint32_t value=0xffffffffu;
-    if(attached_ && io_.read32)(void)io_.read32(io_.cookie,PreemptCntl,&value);
+    uint32_t value=UINT32_MAX;
+    if(!attached_ || io_.read32(io_.cookie,PreemptCntl,&value))return UINT32_MAX;
     return value;
 }
-bool NativeAdrenoPreempt::complete(bool *read_error)
+NativeAdrenoSwitchState NativeAdrenoPreempt::complete()
 {
-    if(read_error)*read_error=false;
-    if(!attached_ || !armed_)return false;
+    if(!attached_ || !armed_)return NativeAdrenoSwitchState::Idle;
     uint32_t cntl=0;
-    if(io_.read32(io_.cookie,PreemptCntl,&cntl)) {if(read_error)*read_error=true;return false;}
-    if(cntl&CntlStop)return false;
-    closeEvent(1);
+    if(io_.read32(io_.cookie,PreemptCntl,&cntl))return NativeAdrenoSwitchState::ReadError;
+    if(cntl&CntlStop)return NativeAdrenoSwitchState::Pending;
+    closeEvent(SwitchCompleted);
     loaded_=next_;armed_=false;
-    if(now_us_) {
-        const uint64_t us=now_us_(clock_cookie_)-trigger_us_;
-        stats_.last_us=uint32_t(us>UINT32_MAX?UINT32_MAX:us);
+    if(timed_out_) {
+        // The diagnostic row stays frozen, but this resolved switch contributes only to completed.
+        --stats_.faulted;
+        timed_out_=false;
     }
-    stats_.completed=stats_.completed+1;
-    return true;
+    const uint64_t us=now_us_(clock_cookie_)-trigger_us_;
+    stats_.last_us=uint32_t(us>UINT32_MAX?UINT32_MAX:us);
+    ++stats_.completed;
+    return NativeAdrenoSwitchState::Completed;
 }
 
 bool NativeAdrenoPreempt::releaseKeepalive()
 {
     if(!keepalive_)return true;
-    if(io_.gmu_write32 && io_.gmu_write32(io_.gmu_cookie,GmuPreemptKeepalive,0))return false;
+    if(io_.gmu_write32(io_.gmu_cookie,GmuPreemptKeepalive,0))return false;
     keepalive_=false;return true;
 }

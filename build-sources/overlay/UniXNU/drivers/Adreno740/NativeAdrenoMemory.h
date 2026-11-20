@@ -104,7 +104,7 @@ public:
     /* Memory pressure: the system could not give a user BO its memory (allocateSystem failed); cleared by the next one that succeeds.
      * Clients read it in Query and give their cached BOs back. */
     static bool memoryPressure();
-    /* Whether any page of the spans belongs to a BO this driver allocated (allocate, allocateSystem) and has not released. */
+    /* True if the spans may include a driver-owned page. An unindexed span requires the full alias check. */
     static bool ownsAnyPage(const NativeAdrenoPhysicalSpan *,size_t count);
     static bool mayOwnScanoutPages(const uint64_t *pages,size_t count);
     bool indexedOwnedPages() const {return owned_;}

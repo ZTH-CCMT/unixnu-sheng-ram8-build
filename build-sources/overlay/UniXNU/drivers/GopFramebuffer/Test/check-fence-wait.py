@@ -26,6 +26,15 @@ if adreno.is_dir():
             break
         at = body.index(first)
         gpu_methods.append(body[at:body.index(end, at)])
+def fragment(first, last):
+    start = text.index(first)
+    return text[start:text.index(last, start)]
+
+diagnostics = (
+    fragment('extern "C" {volatile uint64_t (*native_legacy_ring)', '// What the compositor presents') +
+    fragment('// The boot-log writer enables', 'extern "C" void native_legacy_gpu_fallback_observed')
+)
+blank = fragment('        if(!accepted && reason==2 && !surface', '        if(accepted && !addValidated')
 methods = []
 # The cancellation method ends at its closing brace: it answers differently on macOS inside its own conditional block.
 for start, end, keep in [('    bool isValidated(', '    uint64_t traceRequestIds[8]', ''),
@@ -42,20 +51,32 @@ for start, end, keep in [('    bool isValidated(', '    uint64_t traceRequestIds
     methods.append(text[at:text.index(end, at)].replace(' override', '') + keep)
 
 harness = r'''
+#include <atomic>
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <mutex>
+#include <thread>
 #include <vector>
 using IOReturn=int;
 enum {kIOReturnSuccess,kIOReturnUnsupported,kIOReturnBusy,kIOReturnNotReady,kIOReturnTimeout,kIOReturnAborted};
 struct OriginalLegacySwapRequest {};
-struct OSObject {};
+struct OSObject {
+    unsigned holds=1;
+    void retain() {assert(holds);++holds;}
+    void release() {assert(holds>1);--holds;}
+};
 struct IOMemoryDescriptor {};
-struct IOLock {bool locked=false;};
+using IOLock=std::mutex;
 static IOLock *IOLockAlloc() {return new IOLock;}
-static void IOLockLock(IOLock *lock) {assert(!lock->locked);lock->locked=true;}
-static void IOLockUnlock(IOLock *lock) {assert(lock->locked);lock->locked=false;}
+static void IOLockFree(IOLock *lock) {delete lock;}
+static void IOLockLock(IOLock *lock) {lock->lock();}
+static void IOLockUnlock(IOLock *lock) {lock->unlock();}
+static void *IOMallocZero(size_t bytes) {return std::calloc(1,bytes);}
+volatile uint32_t native_legacy_surfaces[14];
+#include "diagnostics.inc"
 #define OSSafeReleaseNULL(source) do {if(source){source->release();source=nullptr;}} while(0)
 static bool takeGpuOffer=true;
 static bool native_legacy_gpu_offer(void *,IOMemoryDescriptor *,uint64_t,unsigned,unsigned,unsigned) {return takeGpuOffer;}
@@ -542,7 +563,109 @@ static void testGpuHandoff() {
     std::puts("PASS: GPU completion is deferred and balances the display reference across refusals, cancellation and stop");
 }
 
+static void testSwapRing() {
+    uint64_t row[2]{};
+    assert(!native_legacy_copy_swap_row(0,row));
+    std::thread first(startLegacyTrace), second(startLegacyTrace);
+    first.join();
+    second.join();
+    constexpr uint64_t check=UINT64_C(0xdada56560c0c9898);
+    recordLegacyTrace(0,check);
+    recordLegacyTrace(1,1^check);
+    captureLegacyTrace();
+    assert(native_legacy_snap_count==1 && native_legacy_snap[1][1]==(1^check) && !native_legacy_snap[2][1]);
+    constexpr unsigned perWriter=24000,writers=4,events=writers*perWriter;
+    std::atomic<bool> stop=false;
+    std::thread consumer([&]{
+        while(!stop.load()) {
+            const uint32_t count=__atomic_load_n(&native_legacy_ring_count,__ATOMIC_ACQUIRE);
+            if(count && native_legacy_copy_swap_row(count-1,row))assert(row[1]==(row[0]^check));
+        }
+    });
+    std::vector<std::thread> producers;
+    for(unsigned t=0;t<writers;++t)producers.emplace_back([=]{
+        for(unsigned i=0;i<perWriter;++i) {
+            const uint64_t value=2+t*perWriter+i;
+            recordLegacyTrace(value,value^check);
+        }
+    });
+    for(auto &producer:producers)producer.join();
+    stop=true;
+    consumer.join();
+    assert(native_legacy_ring_count==events+2);
+    const uint32_t firstKept=native_legacy_ring_count-native_legacy_ring_cap;
+    assert(!native_legacy_copy_swap_row(firstKept-1,row));
+    std::vector<bool> seen(events+2);
+    for(uint32_t i=firstKept;i<native_legacy_ring_count;++i) {
+        assert(native_legacy_copy_swap_row(i,row) && row[1]==(row[0]^check));
+        assert(row[0]<seen.size() && !seen[row[0]]);
+        seen[row[0]]=true;
+    }
+    captureLegacyTrace();
+    assert(native_legacy_snap[1][1]==(1^check));
+    std::puts("PASS: concurrent writers publish complete swap rows, wrapped rows reject stale indices and the snapshot is immutable");
+}
+static const int sampleOwner=1,nextOwner=2;
+static void testSurfaceSamples() {
+    OSObject surfaces[4];
+    uint32_t values[14]{};
+    noteSurface(&sampleOwner,&surfaces[0],12288);
+    assert(surfaces[0].holds==1);
+    assert(!native_legacy_copy_surface_stats(values));
+    noteSurface(&sampleOwner,&surfaces[0],12288);
+    assert(native_legacy_copy_surface_stats(values) && values[0]==1 && values[2]==12288 && !values[3]);
+    noteSurface(&sampleOwner,&surfaces[0],12288,2,8);
+    noteSurface(&nextOwner,&surfaces[3],8192);
+    assert(surfaces[0].holds==2 && surfaces[3].holds==1);
+    assert(native_legacy_copy_surface_stats(values) && values[0]==1 && values[1]==3);
+    assert(values[2]==12288 && values[3]==2 && values[4]==8);
+    for(unsigned i=1;i<4;++i)noteSurface(&sampleOwner,&surfaces[i],4096);
+    for(const auto &surface:surfaces)assert(surface.holds==1);
+    noteSurface(&sampleOwner,&surfaces[0],12288,4,4);
+    assert(native_legacy_copy_surface_stats(values) && values[0]==4 && values[3]==2);
+    stopSurfaceSamples(&sampleOwner);
+    noteSurface(&nextOwner,&surfaces[0],16384);
+    assert(native_legacy_copy_surface_stats(values) && values[0]==1 && values[2]==16384);
+    stopSurfaceSamples(&nextOwner);
+    assert(surfaces[0].holds==1 && !native_legacy_copy_surface_stats(values) && !values[0]);
+    std::puts("PASS: surface dedup retains live identities, accepts existing scanout segment data and releases samples at capacity or stop");
+}
+enum {kRequestMasks=0,kRequestOptions=12,kRequestDims=24,kRequestSurfaces=32};
+static bool native_legacy_blank_state(uint32_t first,uint32_t second,uint32_t third) {
+    return !first && !second && !third;
+}
+struct BlankValidation {
+    bool validateEnabled=true;
+    void getDisplayDimensions(uint32_t *width,uint32_t *height) {*width=100;*height=200;}
+    bool accepts(const unsigned char *bytes,unsigned reason,OSObject *surface) {
+        bool accepted=false;
+        auto word=[&](unsigned offset){uint32_t value=0;memcpy(&value,bytes+offset,4);return value;};
+#include "blank.inc"
+        return accepted && reason==5;
+    }
+};
+static void testBlankValidation() {
+    BlankValidation validator;
+    unsigned char request[kRequestSurfaces+4*sizeof(OSObject *)]={};
+    const uint32_t dimensions[2]={100,200};
+    memcpy(request+kRequestDims,dimensions,sizeof(dimensions));
+    assert(validator.accepts(request,2,nullptr) && !validator.accepts(request,1,nullptr));
+    validator.validateEnabled=false;
+    assert(!validator.accepts(request,2,nullptr));
+    validator.validateEnabled=true;
+    request[kRequestOptions]=1;
+    assert(!validator.accepts(request,2,nullptr));
+    request[kRequestOptions]=0;
+    OSObject other;
+    OSObject *present=&other;
+    memcpy(request+kRequestSurfaces+sizeof(present),&present,sizeof(present));
+    assert(!validator.accepts(request,2,nullptr));
+    std::puts("PASS: blank swap branch obeys the cached validation option and rejects unexpected layers and options");
+}
 int main() {
+    testSwapRing();
+    testSurfaceSamples();
+    testBlankValidation();
     testLatch();
     testRetirement();
     testGpuHandoff();
@@ -651,6 +774,8 @@ with tempfile.TemporaryDirectory(prefix='gop-fence-wait-') as directory:
     root = Path(directory)
     (root / 'methods.inc').write_text('\n'.join(methods))
     (root / 'gpu.inc').write_text('\n'.join(gpu_methods))
+    (root / 'diagnostics.inc').write_text(diagnostics)
+    (root / 'blank.inc').write_text(blank)
     (root / 'test.cpp').write_text(harness)
     subprocess.run([os.environ.get('CXX', 'c++'), '-std=c++17', '-Wall', '-Wextra', '-Werror',
                     f'-DTEST_ADRENO={int(bool(gpu_methods))}',

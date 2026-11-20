@@ -725,7 +725,9 @@ static void *runBlock(void *block) {@autoreleasepool {((__bridge void (^)(void))
 static void onLargeStack(void (^body)(void)) {
  pthread_attr_t attr;pthread_t thread;
  if(pthread_attr_init(&attr)){body();return;}
- const bool made=!pthread_attr_setstacksize(&attr,16u<<20) && !pthread_create(&thread,&attr,runBlock,(__bridge void *)body);
+ const uint32_t diagnosticOrigin=tMetalOrigin;
+ __attribute__((objc_precise_lifetime)) void (^scopedBody)(void)=^{NBMetalOriginScope origin(diagnosticOrigin);body();};
+ const bool made=!pthread_attr_setstacksize(&attr,16u<<20) && !pthread_create(&thread,&attr,runBlock,(__bridge void *)scopedBody);
  pthread_attr_destroy(&attr);
  if(made)pthread_join(thread,nullptr);else body();
 }
@@ -2011,7 +2013,7 @@ static void notified(void *context,uint64_t value);
 - (void)notifyListener:(MTLSharedEventListener *)listener atValue:(uint64_t)value block:(MTLSharedEventNotificationBlock)block {
  if(!block)return;
  dispatch_queue_t queue=listener.dispatchQueue?:dispatch_get_global_queue(QOS_CLASS_DEFAULT,0);
- NSArray *job=@[self,queue,[block copy]];
+ NSArray *job=@[self,queue,[block copy],@(tMetalOrigin)];
  if(!nmb_shared_event_notify(self.handle,value,notified,(__bridge_retained void *)job)) {
   (void)(__bridge_transfer NSArray *)(__bridge void *)job;
   NBLOG(@"native-metal: notifyListener refused: %@",lastError());
@@ -2026,7 +2028,8 @@ static void notified(void *context,uint64_t value);
 static void notified(void *context,uint64_t value) {
  NSArray *job=(__bridge_transfer NSArray *)context;
  id<MTLSharedEvent> event=job[0];MTLSharedEventNotificationBlock block=job[2];
- dispatch_async(job[1],^{block(event,value);});
+ const uint32_t diagnosticOrigin=[job[3] unsignedIntValue];
+ dispatch_async(job[1],^{NBMetalOriginScope origin(diagnosticOrigin);block(event,value);});
 }
 @interface NBFence : NBObject
 @property(nonatomic) NmbFence *handle;
@@ -2115,6 +2118,7 @@ static void dumpSurfacesOnce(NSSet *textures,NSSet *owners) {
  EncodedWork encodedWork;   // the command buffer's single encoder thread, not global counter deltas
  uint64_t createdUs;
  uint64_t traceNumber;
+ uint32_t diagnosticOrigin;   // captured at commit, then shared by its callbacks
  uint32_t createCpu,createTid,commitCpu,commitTid;
  BOOL earlyEligible;   // made by the render server's thread: its completed handlers may run at submission (see fireEarly)
  std::vector<WatchedSource> watched;
@@ -2301,6 +2305,7 @@ class EncodeBatch {
  size_t at=0;
 public:
  uint64_t serial=0,enqueuedUs=0;
+ uint32_t origin=NBOriginClient;
  size_t count=0;
  template<class F> void add(F &&work) {
   using Closure=std::decay_t<F>;
@@ -2356,7 +2361,7 @@ static EncodeThread &encodeThread() {
     const uint32_t depth=(uint32_t)t.batches.size(),tasks=(uint32_t)batch->count;
     lock.unlock();tEncodeBatchId=batch->serial;
     batchStage(batch->serial,2,batch->enqueuedUs,tasks,depth);
-    @autoreleasepool {batch->run();}
+    @autoreleasepool {NBMetalOriginScope origin(batch->origin);batch->run();}
     batchStage(batch->serial,3,batch->enqueuedUs,tasks,depth);tEncodeBatchId=0;
     lock.lock();t.spare.push_back(batch);t.done++;t.idle.notify_all();
    }
@@ -2383,10 +2388,13 @@ static void encodeFlush() {
 // A closure takes what it uses by value (C arrays as std::array) or strongly (the objects whose handles it passes), as the call made it.
 template<class F> static void encodeLaterRaw(F &&work) {
  if(!gEncodeThread || onEncodeQueue()){work();return;}
+ // Keep the normal client batch layout and put a boundary at a change of origin.
+ if(tBatch && tBatch->origin!=tMetalOrigin)encodeFlush();
  if(!tBatch) {
   EncodeThread &t=encodeThread();
   {std::lock_guard<std::mutex> lock(t.lock);if(!t.spare.empty()){tBatch=t.spare.back();t.spare.pop_back();}}
   if(!tBatch)tBatch=new EncodeBatch;
+  tBatch->origin=tMetalOrigin;
  }
  tBatch->add(std::forward<F>(work));
  if(tBatch->count>=64)encodeFlush();
@@ -3456,6 +3464,7 @@ static char kUserDictionaryKey;
  // A scheduled handler can submit or wait for GPU work. Return to the
  // runtime first so submissions and completions can continue.
  dispatch_async(_queue.handlerQueue,^{
+  NBMetalOriginScope origin(self->diagnosticOrigin);
   CommandHandlerScope callback((__bridge const void *)self);
   @try {
    for(MTLCommandBufferHandler block in handlers)block((id<MTLCommandBuffer>)self);
@@ -3466,6 +3475,7 @@ static char kUserDictionaryKey;
 }
 // After completion (or a refusal): invalidate the CPU's view of imported surfaces, then completed handlers, once.
 - (void)finish {
+ NBMetalOriginScope origin(diagnosticOrigin);
  // A frontend refusal never calls completed(). Keep its terminal record too,
  // before the runtime handle is released, without manufacturing a GPU completion.
  if(metalChainOn() && self.failedLocally){
@@ -3533,6 +3543,7 @@ static char kUserDictionaryKey;
   dispatch_group_leave(_handlers);
  } else {
   void (^run)(void)=^{
+   NBMetalOriginScope callbackOrigin(self->diagnosticOrigin);
    frontStage(self->traceNumber,self.commitIndex,12);
    DetailCommandScope commandScope(self->traceNumber);
    CommandHandlerScope callback;
@@ -3558,6 +3569,7 @@ static char kUserDictionaryKey;
   if(self.committed){NBLOG(@"native-metal: commit twice");return;}
   dispatch_group_enter(_handlers);dispatch_group_enter(_schedulingHandlers);
   dispatch_group_enter(_gpuCompletion);dispatch_group_enter(_gpuScheduling);dispatch_group_enter(_runtimeCommit);
+  diagnosticOrigin=tMetalOrigin;
   self.committedUs=nowUs();
   self.committed=YES;
  }
@@ -3628,7 +3640,24 @@ static char kUserDictionaryKey;
  @synchronized(self){handlers=[_completedHandlers copy];[_completedHandlers removeAllObjects];}
  if(!handlers.count)return;
  dispatch_queue_t queue=_queue.completionQueue?:dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE,0);
- dispatch_async(queue,^{for(MTLCommandBufferHandler block in handlers)block((id<MTLCommandBuffer>)self);});
+ dispatch_async(queue,^{
+  NBMetalOriginScope origin(self->diagnosticOrigin);
+  for(MTLCommandBufferHandler block in handlers)block((id<MTLCommandBuffer>)self);
+ });
+}
+// Frontend self-tests need a deadline for the commit, runtime and handler phases.
+- (BOOL)nbWaitUntilCompletedForDiagnosticMilliseconds:(uint32_t)milliseconds {
+ if(!self.committed || !milliseconds)return NO;
+ const uint64_t expires=nowUs()+uint64_t(milliseconds)*1000;
+ const dispatch_time_t deadline=dispatch_time(DISPATCH_TIME_NOW,int64_t(milliseconds)*NSEC_PER_MSEC);
+ if(!self.submitted && dispatch_group_wait(_runtimeCommit,deadline))return NO;
+ if(!self.failedLocally) {
+  const uint64_t now=nowUs();
+  if(now>=expires || nmb_command_buffer_wait(_handle,(expires-now+999)/1000)!=0)return NO;
+ }
+ if(dispatch_group_wait(tInCommandHandler?_gpuCompletion:_handlers,deadline))return NO;
+ if(tScheduledCommand==(__bridge const void *)self)tScheduledCommand=nullptr;
+ return YES;
 }
 - (void)waitUntilCompleted {
  if(!self.committed)return;
@@ -3679,6 +3708,7 @@ static void scheduled(void *context) {[(__bridge NBCommandBuffer *)context didSc
 static void completed(void *context) {
  gCompleted++;
  NBCommandBuffer *commandBuffer=(__bridge_transfer NBCommandBuffer *)context;
+ NBMetalOriginScope origin(commandBuffer->diagnosticOrigin);
  if(metalChainOn()){
   TraceRec r{};r.type=46;r.t0=nowUs();r.t1=commandBuffer->traceNumber;r.t2=commandBuffer.commitIndex;
   r.t3=commandBuffer.committedUs;r.a=commandBuffer.failedLocally?1:0;
@@ -4788,7 +4818,9 @@ static void reportUnreadableLibrary(NSString *path) {
  return library;
 }
 - (void)newLibraryWithSource:(NSString *)source options:(MTLCompileOptions *)options completionHandler:(MTLNewLibraryCompletionHandler)handler {
+ const uint32_t diagnosticOrigin=tMetalOrigin;
  dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0),^{
+  NBMetalOriginScope origin(diagnosticOrigin);
   NSError *error=nil;
   id<MTLLibrary> library=[(id<MTLDevice>)self newLibraryWithSource:source options:options error:&error];
   if(handler)handler(library,error);
@@ -4835,7 +4867,9 @@ static void reportUnreadableLibrary(NSString *path) {
  (void)archive;return [(id<MTLDevice>)self newLibraryWithStitchedDescriptor:d error:error];
 }
 - (void)newLibraryWithStitchedDescriptor:(MTLStitchedLibraryDescriptor *)d completionHandler:(MTLNewLibraryCompletionHandler)handler {
+ const uint32_t diagnosticOrigin=tMetalOrigin;
  dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0),^{
+  NBMetalOriginScope origin(diagnosticOrigin);
   NSError *error=nil;
   id<MTLLibrary> library=[(id<MTLDevice>)self newLibraryWithStitchedDescriptor:d error:&error];
   if(handler)handler(library,error);

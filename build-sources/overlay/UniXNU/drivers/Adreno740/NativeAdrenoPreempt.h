@@ -22,6 +22,7 @@
  * ring and fence pages), fills a record through writeRecord() and an SMMU info page through writeSmmuInfo(), and gives the
  * write pointer again after a switch, because only it knows which ring the CP now runs. */
 enum : uint32_t {NativeAdrenoPreemptRingCount = 2};
+enum class NativeAdrenoSwitchState {Idle,Pending,ReadError,Completed};
 
 /* The GPU addresses of the per-ring state. */
 struct NativeAdrenoPreemptRings {
@@ -37,8 +38,7 @@ struct NativeAdrenoPreemptIo {
     int (*write32)(void *, uint32_t reg, uint32_t value);
     int (*read32)(void *, uint32_t reg, uint32_t *value);
     int (*barrier)(void *);
-    /* The GMU's window: the preemption keepalive vote lives there, not in the GPU's register window. Its register is a dword index,
-     * as a6xx_gmu.xml writes it (0x1f8c4). */
+    /* Required GMU write: the preemption keepalive vote lives in the GMU window at dword index 0x1f8c4. */
     void *gmu_cookie;
     int (*gmu_write32)(void *, uint32_t dword_offset, uint32_t value);
     /* Optional bounded, IRQ-safe indexed SQE read; cookie is the GPU cookie.
@@ -50,15 +50,16 @@ struct NativeAdrenoPreemptStats {
     uint32_t triggers;        /* switches the CPU asked for */
     uint32_t completed;       /* switches whose STOP bit had cleared when the interrupt came */
     uint32_t skipped;         /* a higher-priority ring was waiting and no switch was possible */
-    uint32_t faulted;         /* a switch that did not finish */
+    uint32_t faulted;         /* refused, reset, or timed out and still unresolved */
     uint32_t disjoint_skips;  /* switches not taken because the rings' buffers overlap */
     uint32_t restored_wptr;   /* write pointers given again after a switch */
     uint32_t last_us;         /* how long the last completed switch took */
 };
 
 /* The newest 16 switches, one row each (words): [0] sequence, [1..2] trigger time (us), [3..4] end time (us, 0 pending), [5] from | to << 8 |
- * outcome << 16 (0 pending, 1 done, 2 timed out, 3 a register write refused), [6] CP_CONTEXT_SWITCH_CNTL read right after the trigger,
- * [7] the same at the end, [8] RBBM_STATUS, [9] RBBM_INT_0_STATUS and [10] CP_HW_FAULT at the end, [11] CP_RB_RPTR | CP_RB_WPTR << 16 at the
+ * outcome << 16 (0 pending, 1 done, 2 timed out, 3 a register write refused, 4 reset before completion), [6] CP_CONTEXT_SWITCH_CNTL
+ * read right after the trigger. A timeout row remains diagnostic evidence even if STOP later clears.
+ * [7] CNTL at the end, [8] RBBM_STATUS, [9] RBBM_INT_0_STATUS and [10] CP_HW_FAULT at the end, [11] CP_RB_RPTR | CP_RB_WPTR << 16 at the
  * end, [12..15] ring 0's record before the trigger and [16..19] ring 1's (read pointer, write pointer, errno, info), [20..27] both again at the
  * end, [28..33] the CP's IB state when a switch timed out (NativeAdrenoRing::progressState). native_adreno_switch_count is the total. */
 enum : uint32_t {NativeAdrenoSwitchLogRows=16,NativeAdrenoSwitchLogWords=34};
@@ -71,6 +72,7 @@ class NativeAdrenoPreempt final {
     uint32_t loaded_=0;   /* the ring the CP runs */
     uint32_t next_=0;     /* the ring a switch in flight goes to */
     bool armed_=false;    /* a switch was triggered and its STOP bit not yet seen cleared */
+    bool timed_out_=false;   /* still armed, with a timeout already counted */
     bool attached_=false,keepalive_=false;
     uint64_t (*now_us_)(void *)=nullptr;
     void *clock_cookie_=nullptr;
@@ -84,15 +86,14 @@ class NativeAdrenoPreempt final {
     IOReturn programSwitchRegisters();
     void snapshot(volatile uint32_t *row,unsigned first) const;
     volatile uint32_t *openEvent(uint32_t to);
-    void closeEvent(uint32_t outcome);
+    void closeEvent(uint32_t outcome,bool sampleEnd=true);
 public:
     NativeAdrenoPreempt()=default;
     ~NativeAdrenoPreempt()=default;
     NativeAdrenoPreempt(const NativeAdrenoPreempt &)=delete;
     NativeAdrenoPreempt &operator=(const NativeAdrenoPreempt &)=delete;
     /* Programmes RB_CONTEXT_SWITCH_GMEM_SAVE_RESTORE_ENABLE and clears CP_CONTEXT_SWITCH_SMMU_INFO, as a6xx_preempt_hw_init
-     * does, with `loaded` the ring the CP runs. The caller must already own a powered GPU with that ring up. `now` times the
-     * switches (optional). */
+     * does, with `loaded` the ring the CP runs. The caller must already own a powered GPU with that ring up and supply a clock. */
     IOReturn attach(const NativeAdrenoPreemptIo *,const NativeAdrenoPreemptRings &,uint32_t loaded,uint64_t (*now)(void *),void *clock);
     IOReturn detach();
     bool attached() const {return attached_;}
@@ -108,16 +109,15 @@ public:
     static bool setRecordWptr(uint8_t *record,uint32_t wptr);
     static uint32_t recordWord(const uint8_t *record,uint32_t byte_offset);
     /* Switch the CP to `ring`, which must not be the loaded one: its SMMU info and record go out first, then the control word
-     * with STOP. `uses_gmem` asks for the GMEM save and restore. False where a switch is still in flight or a register refused. */
+     * with STOP. `uses_gmem` asks for GMEM save and restore. `ready` reports a successful readback with STOP already clear. */
     bool trigger(uint32_t ring,bool uses_gmem,
-        void (*capture_tail)(void *,NativeAdrenoPublishedTail *)=nullptr,void *tail_cookie=nullptr);
+        void (*capture_tail)(void *,NativeAdrenoPublishedTail *)=nullptr,void *tail_cookie=nullptr,bool *ready=nullptr);
     /* Read-only diagnostics, called under the submission lock before noteTimeout
      * and before any reset. At most once for the active trigger; false leaves
      * out untouched. No scheduling, completion or poison changes. */
     bool captureTimeoutEvidence(uint32_t reason,NativeAdrenoSwitchEvidence *out);
-    /* The interrupt's side: read CP_CONTEXT_SWITCH_CNTL; a cleared STOP bit completes the switch and makes its ring the loaded
-     * one, a set one is still pending. False where nothing was in flight. */
-    bool complete(bool *read_error=nullptr);
+    /* Read CP_CONTEXT_SWITCH_CNTL. A cleared STOP bit completes the switch and makes the incoming ring current in this state. */
+    NativeAdrenoSwitchState complete();
     /* Release the power vote after the incoming ring's WPTR is restored. */
     bool releaseKeepalive();
     bool inFlight() const {return armed_;}

@@ -165,10 +165,26 @@ static void importTotals()
     CHECK(native_adreno_import_persistent[0]==descriptors+1);
     std::puts("PASS: live GPU imports decrement while lifetime descriptor totals are retained");
 }
+static void ownershipCoverage()
+{
+    reset();
+    NativeAdrenoMemory memory;
+    const NativeAdrenoPhysicalSpan tracked{0,fixture.next_physical,4096};
+    const NativeAdrenoPhysicalSpan untracked{0,gPhysBase+gPhysSize,4096};
+    const NativeAdrenoPhysicalSpan crossesEnd{0,untracked.physical-4096,8192};
+    CHECK(!NativeAdrenoMemory::ownsAnyPage(&tracked,1));
+    CHECK(memory.allocate(4096,32,true,4096)==kIOReturnSuccess);
+    CHECK(NativeAdrenoMemory::ownsAnyPage(&tracked,1));
+    CHECK(memory.release()==kIOReturnSuccess);
+    CHECK(!NativeAdrenoMemory::ownsAnyPage(&tracked,1));
+    CHECK(NativeAdrenoMemory::ownsAnyPage(&untracked,1));
+    CHECK(NativeAdrenoMemory::ownsAnyPage(&crossesEnd,1));
+    std::puts("PASS: untracked pages require the full alias check while known ownership tracks allocation and release");
+}
 int main()
 {
     auto profiles=successes(),failure_controls=failures(),argument_controls=arguments();
-    systemAndRunFailures();importTotals();reset();
+    systemAndRunFailures();importTotals();ownershipCoverage();reset();
     std::printf("PASS: %u allocation profiles, %u allocation/cache/lifetime failure controls, %u argument/CPU refusal controls\n",profiles,failure_controls,argument_controls);
     std::puts("Host IOKit doubles only; no real kernel allocation, physical provenance, cache/DMA, SMMU, GPU or fence qualification");
 }

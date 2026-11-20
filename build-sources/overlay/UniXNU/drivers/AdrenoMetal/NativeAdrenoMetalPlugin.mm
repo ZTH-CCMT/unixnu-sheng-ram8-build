@@ -9,6 +9,9 @@
 // own GPU plugin.
 #import <Foundation/Foundation.h>
 #include <string>
+#include <atomic>
+#include <memory>
+#include <mutex>
 #include <sys/stat.h>
 #include <dirent.h>
 #include <fcntl.h>
@@ -85,10 +88,34 @@ static bool requested() {
     char path[1024];
     return requestedPath("NativeAdrenoMetal.publish", path, sizeof path);
 }
-static Gpu *makeGpu(unsigned port) {
-    void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW | RTLD_LOCAL);
+static void *ioKitLibrary() {
+    static std::mutex lock;
+    static void *library;
+    std::lock_guard<std::mutex> guard(lock);
+    if (!library) library = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW | RTLD_LOCAL);
+    return library;
+}
+class AcceleratorReference {
+    unsigned port;
+    int (*drop)(unsigned) = nullptr;
+public:
+    explicit AcceleratorReference(unsigned service) : port(service) {
+        if (void *iokit = ioKitLibrary()) {
+            auto retain = reinterpret_cast<int (*)(unsigned)>(dlsym(iokit, "IOObjectRetain"));
+            auto release = reinterpret_cast<int (*)(unsigned)>(dlsym(iokit, "IOObjectRelease"));
+            if (retain && release && retain(port) == 0) drop = release;
+        }
+    }
+    AcceleratorReference(const AcceleratorReference &) = delete;
+    AcceleratorReference &operator=(const AcceleratorReference &) = delete;
+    ~AcceleratorReference() {if (drop) drop(port);}
+    bool held() const {return drop != nullptr;}
+    void keep() {drop = nullptr;}  // the published device can report against this port for its process lifetime
+};
+static std::unique_ptr<Gpu> makeGpu(unsigned port) {
+    void *iokit = ioKitLibrary();
     if (!iokit) return nullptr;
-    Gpu *gpu = new Gpu;
+    auto gpu = std::make_unique<Gpu>();
     gpu->call = (CallFn)dlsym(iokit, "IOConnectCallStructMethod");
     gpu->map = (MapFn)dlsym(iokit, "IOConnectMapMemory64");
     gpu->unmap = (UnmapFn)dlsym(iokit, "IOConnectUnmapMemory64");
@@ -309,7 +336,7 @@ static void *streamTelemetry(void *arg) {
 }
 static unsigned gClientPort;
 static void clientFailure(unsigned port, const char *step, const char *detail) {
-    if (Gpu *gpu = makeGpu(port)) {
+    if (auto gpu = makeGpu(port)) {
         // The row holds 63 characters: the common prefix goes, and a long reason keeps its start (what was refused) and its end (why).
         if (!detail) detail = "";
         if (!strncmp(detail, "native-metal: ", 14)) detail += 14;
@@ -322,22 +349,29 @@ static void clientFailure(unsigned port, const char *step, const char *detail) {
         streamText(*gpu, text);
         // A refusal's text is what says why a client ends (iconservicesagent's pipeline refusal showed 18 characters of it): the rest of it
         // follows in rows of its own, up to six, each 46 characters.
-        if (!strcmp(step, "problem") && length > 46)
+        if (!strcmp(step, "problem") && length > 46) {
+            auto delayedPort = std::make_shared<AcceleratorReference>(port);
+            if (!delayedPort->held()) return;
             for (unsigned part = 1, at = 46; part <= 6 && at < length; ++part, at += 46) {
                 // The log keeps the latest text row only: each part follows the one before it by 4 s so a sample catches every one.
                 std::string row = "problem" + std::to_string(part) + " " + std::string(detail + at).substr(0, 46);
-                auto *target = gpu;
+                Gpu target = *gpu;
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, int64_t(part) * 4 * NSEC_PER_SEC),
-                               dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{streamText(*target, row.c_str());});
+                               dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+                    (void)delayedPort;  // The queued report keeps this service port live.
+                    Gpu copy = target;
+                    streamText(copy, row.c_str());
+                });
             }
+        }
     }
 }
 static id clientDevice(unsigned port) {
     char turnip[1024];
     if (!turnip::libraryPath(turnip, sizeof turnip) || access(turnip, R_OK) != 0) {clientFailure(port, "no-turnip", ""); return nil;}
+    AcceleratorReference reference(port);
     uint64_t registryID = 0;
-    if (void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW | RTLD_LOCAL)) {
-        if (auto retain = (int (*)(unsigned))dlsym(iokit, "IOObjectRetain")) retain(port);
+    if (void *iokit = ioKitLibrary()) {
         if (auto entryID = (int (*)(unsigned, uint64_t *))dlsym(iokit, "IORegistryEntryGetRegistryEntryID")) entryID(port, &registryID);
     }
     // IOSurfaces this GPU reads or writes must be plain rows, as in the render server.
@@ -388,6 +422,7 @@ static id clientDevice(unsigned port) {
     // encoder with no reason anywhere readable (its own log lines need the plugin's format strings, which the device does not keep), and a
     // once-a-second reader never ran before the crash (i568).
     if (device) {
+        reference.keep();
         gClientPort = port;
         native_bridge_metal_problem_hook = [](const char *problem) {clientFailure(gClientPort, "problem", problem);};
         char problem[200] = {};
@@ -433,10 +468,20 @@ static void quartzCoreBundleReport() {
 #endif
 static id deviceForPort(unsigned port) {
     static id device;
-    static bool tried;
+    static bool opening;
+    static uint64_t retryAfter;
     @synchronized([NativeAdrenoMetalDeviceBase class]) {
-        if (tried) return device;
-        tried = true;
+        if (device) return device;
+        if (opening || clock_gettime_nsec_np(CLOCK_UPTIME_RAW) < retryAfter) return nil;
+        opening = true;
+        struct Attempt {
+            bool &opening;
+            uint64_t &retryAfter;
+            ~Attempt() {
+                retryAfter = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) + NSEC_PER_SEC;
+                opening = false;
+            }
+        } attempt{opening, retryAfter};
         exceptiondiag::start(); // the throw site of an uncaught exception, for the kernel's THROW row (ExceptionDiag.h)
         // No concurrent binning in any Metal process: with it BV ran ahead of BR and the two stopped waiting on each other inside a pass
         // (int-261p, int-262, and in system memory int-265). Without it Turnip's autotune picks tile memory (GMEM) or system memory per
@@ -511,11 +556,10 @@ static id deviceForPort(unsigned port) {
 #else
         if (!nativeIsRenderServer()) return device = clientDevice(port);
 #endif
-        // The discovery releases the accelerator port when it is done; the monitor and the scanout client keep using it.
-        if (void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW | RTLD_LOCAL)) {
-            if (auto retain = (int (*)(unsigned))dlsym(iokit, "IOObjectRetain")) retain(port);
-        }
-        Gpu *gpu = makeGpu(port);
+        // Discovery lends the port. Keep it for the worker threads only after the device opens.
+        AcceleratorReference reference(port);
+        auto pendingGpu = makeGpu(port);
+        Gpu *gpu = pendingGpu.get();
         if (!gpu) return nil;
         gpu->mark(0x6800);
         char turnip[1024];
@@ -524,7 +568,7 @@ static id deviceForPort(unsigned port) {
         // The runtime refuses to open without a writable shader-cache directory, and which directories backboardd's sandbox lets it write is not
         // known from here: try the user cache and temp directories, then /tmp and /var/tmp, and use the first that opens a device.
         uint64_t registryID = 0;
-        if (void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW | RTLD_LOCAL)) {
+        if (void *iokit = ioKitLibrary()) {
             if (auto entryID = (int (*)(unsigned, uint64_t *))dlsym(iokit, "IORegistryEntryGetRegistryEntryID")) entryID(port, &registryID);
         }
         // What the render server sees for its framebuffer choice (marker 0x6Axx): bit0 the deep-framebuffer preference is set, bit1 it is false,
@@ -636,6 +680,8 @@ static id deviceForPort(unsigned port) {
             streamText(*gpu, text);
             return nil;
         }
+        pendingGpu.release();
+        reference.keep();
         gpu->mark(0x6802);
         // The display hand-off client on its own thread: it only serves, not the discovery.
         pthread_t scanout;
@@ -730,45 +776,55 @@ static id deviceForPort(unsigned port) {
     if (!self || !port) return nil;
 #endif
     if (publish::requested()) return publish::deviceForPort(port);
-    static bool attempted;
-    if (attempted) return nil;
-    attempted = true;
+    static std::atomic<bool> testStarted{false};
+    if (testStarted.exchange(true)) return nil;
     // The test runs on its own thread: a kernel call that never returns (int-042: BoFree) then stalls that thread only, not SpringBoard's
     // main thread (the UI froze with the test running inline).
     // The discovery code releases the accelerator port as soon as this returns nil, which is before the test thread has started: the first
     // marker (and every later open) then went to a dead name and never reached the kernel (K0 in int-043..052, with the plugin file opened by
     // SpringBoard). Keep one extra user reference on the port, and let the thread look the service up itself as well.
-    if (void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW | RTLD_LOCAL)) {
-        if (auto retain = (int (*)(unsigned))dlsym(iokit, "IOObjectRetain")) retain(port);
-    }
-    struct Job {unsigned port; char name[32];};
-    Job *job = new Job{port, {}};
+    struct Job {
+        publish::AcceleratorReference reference;
+        unsigned port;
+        char name[32] = {};
+        explicit Job(unsigned service) : reference(service), port(service) {}
+    };
+    auto job = std::make_unique<Job>(port);
     strlcpy(job->name, getprogname(), sizeof job->name);
     pthread_t thread;
     pthread_attr_t attributes;
-    pthread_attr_init(&attributes);
-    pthread_attr_setdetachstate(&attributes, PTHREAD_CREATE_DETACHED);
-    if (pthread_create(&thread, &attributes, [](void *arg) -> void * {
-            Job *j = static_cast<Job *>(arg);
+    if (pthread_attr_init(&attributes) != 0) {
+        testStarted.store(false);
+        return nil;
+    }
+    const bool started = pthread_attr_setdetachstate(&attributes, PTHREAD_CREATE_DETACHED) == 0 &&
+        pthread_create(&thread, &attributes, [](void *arg) -> void * {
+            std::unique_ptr<Job> j(static_cast<Job *>(arg));
             unsigned port = j->port;
-            if (void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW | RTLD_LOCAL)) {
+            unsigned own = 0;
+            void *iokit = publish::ioKitLibrary();
+            if (iokit) {
                 auto matching = (void *(*)(const char *))dlsym(iokit, "IOServiceMatching");
                 auto getService = (unsigned (*)(unsigned, void *))dlsym(iokit, "IOServiceGetMatchingService");
                 if (matching && getService) {
 #if TARGET_OS_OSX
-                    const unsigned own = getService(0, matching("AGXAccelerator"));
+                    own = getService(0, matching("AGXAccelerator"));
 #else
-                    const unsigned own = getService(0, matching("IOAcceleratorES"));
+                    own = getService(0, matching("IOAcceleratorES"));
 #endif
                     if (own) port = own;
                 }
             }
             gAfterTurnip = bridgephase::run;
             adrenoUserTest(port, j->name);
-            delete j;
+            if (own) {
+                if (auto release = (int (*)(unsigned))dlsym(iokit, "IOObjectRelease")) release(own);
+            }
             return nullptr;
-        }, job) != 0) delete job;
+        }, job.get()) == 0;
     pthread_attr_destroy(&attributes);
+    if (started) job.release();
+    else testStarted.store(false);
     return nil;
 }
 @end
@@ -776,7 +832,6 @@ static id deviceForPort(unsigned port) {
 #if TARGET_OS_OSX
 #include <objc/runtime.h>
 #include <mach/mach_time.h>
-#include <atomic>
 // WindowServer's frame pacing, as macOS-DroidVM's plugin (24af265, kc253-kc292), each behind its boot argument.
 //
 // ca-triple-buffer=1 sets QuartzCore's debug option CA_FORCE_TRIPLE_BUFFERED_LATENCY (read by IOMFBDisplay::can_update_):

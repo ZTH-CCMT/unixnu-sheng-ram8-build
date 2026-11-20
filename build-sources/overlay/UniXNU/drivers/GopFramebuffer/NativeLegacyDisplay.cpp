@@ -52,8 +52,8 @@ extern "C" void native_legacy_retirement_observed(IOService *);
 // client reports the GPU copy done (native_legacy_gpu_complete). A refused offer or a failed copy uses the CPU copy below and is counted.
 // format: NGP_BGRX8888, or for a half-float surface NGP_RGBA16F_LINEAR / NGP_RGBA16F_ENCODED (the client converts it on the GPU).
 extern "C" bool native_legacy_gpu_offer(void *display,IOMemoryDescriptor *,uint64_t stride,uint32_t width,uint32_t height,uint32_t format);
-// The compositor's swapped surfaces, for a display that fetches them itself: [0] distinct surfaces seen, [1] swaps checked; for the first four, at
-// [2 + 3 * k]: allocation bytes, physical segments, largest segment (KiB). The pages are wired for the count and released.
+// Surface diagnostics: [0] distinct samples accepted, capped at four, and [1] swaps checked.
+// Each sample reports allocation bytes and, for direct scanout, physical segments and the largest segment in KiB.
 extern "C" {volatile uint32_t native_legacy_surfaces[14];}
 // Direct scanout (dpu-scanout=2): the display's two pipes fetch the compositor's surface through the display bank's window
 // (NativeUfs native_ufs_dpu_map). [0] flips, [1] surfaces mapped, [2] map failures, [3] latches that took over 50 ms, [4] longest latch (us),
@@ -75,6 +75,72 @@ extern "C" uint32_t native_adreno_reset_epoch() __attribute__((weak_import));
 // validated and not yet retired.
 extern "C" {volatile uint64_t native_legacy_center_half[2];}
 extern "C" {volatile uint64_t (*native_legacy_ring)[2]=nullptr;volatile uint32_t native_legacy_ring_cap=0;volatile uint32_t native_legacy_ring_count;volatile uint64_t native_legacy_snap[64][2];volatile uint32_t native_legacy_snap_count;volatile uint32_t native_legacy_swapstat[16];}
+// Serialize producers across display workloops and let the exporter copy one complete row at a time.
+static IOLock *gLegacyTraceLock=nullptr;
+static void startLegacyTrace() {
+    if(__atomic_load_n(&native_legacy_ring_cap,__ATOMIC_ACQUIRE))return;
+    IOLock *lock=__atomic_load_n(&gLegacyTraceLock,__ATOMIC_ACQUIRE);
+    if(!lock) {
+        IOLock *candidate=IOLockAlloc();
+        if(!candidate)return;
+        if(__atomic_compare_exchange_n(&gLegacyTraceLock,&lock,candidate,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE))
+            lock=candidate;
+        else IOLockFree(candidate);
+    }
+    IOLockLock(lock);
+    if(!native_legacy_ring) {
+        constexpr uint32_t cap=65536;
+        native_legacy_ring=static_cast<volatile uint64_t (*)[2]>(IOMallocZero(sizeof(uint64_t)*2*cap));
+        if(native_legacy_ring)__atomic_store_n(&native_legacy_ring_cap,cap,__ATOMIC_RELEASE);
+    }
+    IOLockUnlock(lock);
+}
+static void recordLegacyTrace(uint64_t time,uint64_t value) {
+    const uint32_t cap=__atomic_load_n(&native_legacy_ring_cap,__ATOMIC_ACQUIRE);
+    if(!cap)return;
+    IOLock *lock=__atomic_load_n(&gLegacyTraceLock,__ATOMIC_ACQUIRE);
+    IOLockLock(lock);
+    const uint32_t index=__atomic_load_n(&native_legacy_ring_count,__ATOMIC_RELAXED);
+    volatile uint64_t *row=native_legacy_ring[index&(cap-1)];
+    row[0]=time;
+    row[1]=value;
+    __atomic_store_n(&native_legacy_ring_count,index+1,__ATOMIC_RELEASE);
+    IOLockUnlock(lock);
+}
+extern "C" bool native_legacy_copy_swap_row(uint32_t index,uint64_t out[2]) {
+    const uint32_t cap=__atomic_load_n(&native_legacy_ring_cap,__ATOMIC_ACQUIRE);
+    if(!out || !cap)return false;
+    IOLock *lock=__atomic_load_n(&gLegacyTraceLock,__ATOMIC_ACQUIRE);
+    IOLockLock(lock);
+    const uint32_t count=__atomic_load_n(&native_legacy_ring_count,__ATOMIC_RELAXED);
+    const bool valid=index<count && count-index<=cap;
+    if(valid) {
+        const volatile uint64_t *row=native_legacy_ring[index&(cap-1)];
+        out[0]=row[0];
+        out[1]=row[1];
+    }
+    IOLockUnlock(lock);
+    return valid;
+}
+static void captureLegacyTrace() {
+    const uint32_t cap=__atomic_load_n(&native_legacy_ring_cap,__ATOMIC_ACQUIRE);
+    if(!cap || __atomic_load_n(&native_legacy_snap_count,__ATOMIC_ACQUIRE))return;
+    IOLock *lock=__atomic_load_n(&gLegacyTraceLock,__ATOMIC_ACQUIRE);
+    IOLockLock(lock);
+    if(!__atomic_load_n(&native_legacy_snap_count,__ATOMIC_RELAXED)) {
+        const uint32_t count=__atomic_load_n(&native_legacy_ring_count,__ATOMIC_RELAXED);
+        constexpr uint32_t entries=sizeof(native_legacy_snap)/sizeof(native_legacy_snap[0]);
+        for(uint32_t i=0;i<entries;++i) {
+            const uint32_t index=count>=entries?count-entries+i:i;
+            const volatile uint64_t *row=native_legacy_ring[index&(cap-1)];
+            const bool valid=index<count && count-index<=cap;
+            native_legacy_snap[i][0]=valid?row[0]:0;
+            native_legacy_snap[i][1]=valid?row[1]:0;
+        }
+        __atomic_store_n(&native_legacy_snap_count,1u,__ATOMIC_RELEASE);
+    }
+    IOLockUnlock(lock);
+}
 // What the compositor presents and where each frame goes: swaps accepted with [0] plain 'BGRA', [1] one-plane compressed '&BGA', [2] half-float
 // 'RGhA'; [3] swaps refused for the surface's format and [4] that format (the last one); frames [5] the display pipes fetch themselves (8-bit
 // only), handed to the GPU client as [6] 8-bit and [7] half float, converted by the CPU as [8] 8-bit and [9] half float. A render server
@@ -84,23 +150,69 @@ extern "C" {volatile uint32_t native_legacy_formats[10];}
 static inline void countFormat(unsigned index) {native_legacy_formats[index]=native_legacy_formats[index]+1;}
 extern "C" uint32_t native_ufs_dpu_map(unsigned slot,const uint64_t *pages,unsigned count) __attribute__((weak_import));
 extern "C" volatile uint32_t native_ufs_dpu_state __attribute__((weak_import));
-static void noteSurface(OSObject *surface,IOMemoryDescriptor *memory)
-{
-    static OSObject *seen[4];
-    native_legacy_surfaces[1]=native_legacy_surfaces[1]+1;
-    for(OSObject *known:seen)if(known==surface)return;
-    const unsigned k=native_legacy_surfaces[0];
-    native_legacy_surfaces[0]=k+1;
-    if(k>=4)return;
-    seen[k]=surface;
-    if(memory->prepare()!=kIOReturnSuccess)return;
-    uint32_t segments=0;uint64_t largest=0;
-    for(IOByteCount offset=0,length=0;offset<memory->getLength() && segments<100000;offset+=length,++segments) {
-        if(!memory->getPhysicalSegment(offset,&length,kIOMemoryMapperNone) || !length)break;
-        if(length>largest)largest=length;
+// The boot-log writer enables this bounded sampler. Keep each identity alive
+// until all four slots are filled or the display stops.
+static bool gSurfaceSamplesWanted=false;
+static const void *gSurfaceSampleOwner=nullptr;
+static OSObject *gSeenSurfaces[4];
+static void noteSurface(const void *owner,OSObject *surface,uint64_t bytes,uint32_t segments=0,uint32_t largestKiB=0) {
+    if(!__atomic_load_n(&gSurfaceSamplesWanted,__ATOMIC_RELAXED))return;
+    __atomic_fetch_add(&native_legacy_surfaces[1],1u,__ATOMIC_RELAXED);
+    if(__atomic_load_n(&native_legacy_surfaces[0],__ATOMIC_RELAXED)>=4)return;
+    IOLock *lock=__atomic_load_n(&gLegacyTraceLock,__ATOMIC_ACQUIRE);
+    if(!lock)return;
+    OSObject *release[4]={};
+    IOLockLock(lock);
+    const unsigned slot=__atomic_load_n(&native_legacy_surfaces[0],__ATOMIC_RELAXED);
+    if(slot>=4 || (gSurfaceSampleOwner && gSurfaceSampleOwner!=owner)) {
+        IOLockUnlock(lock);
+        return;
     }
-    memory->complete();
-    native_legacy_surfaces[2+3*k]=uint32_t(memory->getLength());native_legacy_surfaces[3+3*k]=segments;native_legacy_surfaces[4+3*k]=uint32_t(largest>>10);
+    for(unsigned i=0;i<slot;++i) {
+        if(gSeenSurfaces[i]!=surface)continue;
+        if(segments && !native_legacy_surfaces[3+3*i]) {
+            native_legacy_surfaces[3+3*i]=segments;
+            native_legacy_surfaces[4+3*i]=largestKiB;
+        }
+        IOLockUnlock(lock);
+        return;
+    }
+    gSurfaceSampleOwner=owner;
+    surface->retain();gSeenSurfaces[slot]=surface;
+    native_legacy_surfaces[2+3*slot]=uint32_t(bytes>UINT32_MAX?UINT32_MAX:bytes);
+    native_legacy_surfaces[3+3*slot]=segments;
+    native_legacy_surfaces[4+3*slot]=largestKiB;
+    __atomic_store_n(&native_legacy_surfaces[0],slot+1,__ATOMIC_RELAXED);
+    if(slot+1==4) {
+        for(unsigned i=0;i<4;++i) {release[i]=gSeenSurfaces[i];gSeenSurfaces[i]=nullptr;}
+    }
+    IOLockUnlock(lock);
+    for(OSObject *seen:release)if(seen)seen->release();
+}
+static void stopSurfaceSamples(const void *owner) {
+    IOLock *lock=__atomic_load_n(&gLegacyTraceLock,__ATOMIC_ACQUIRE);
+    if(!lock)return;
+    OSObject *seen[4]={};
+    IOLockLock(lock);
+    if(gSurfaceSampleOwner==owner) {
+        gSurfaceSampleOwner=nullptr;
+        for(unsigned i=0;i<4;++i) {seen[i]=gSeenSurfaces[i];gSeenSurfaces[i]=nullptr;}
+        for(unsigned i=2;i<14;++i)native_legacy_surfaces[i]=0;
+        __atomic_store_n(&native_legacy_surfaces[0],0u,__ATOMIC_RELAXED);
+    }
+    IOLockUnlock(lock);
+    for(OSObject *surface:seen)if(surface)surface->release();
+}
+extern "C" bool native_legacy_copy_surface_stats(uint32_t out[14]) {
+    __atomic_store_n(&gSurfaceSamplesWanted,true,__ATOMIC_RELAXED);
+    IOLock *lock=__atomic_load_n(&gLegacyTraceLock,__ATOMIC_ACQUIRE);
+    if(!out || !lock)return false;
+    IOLockLock(lock);
+    out[0]=__atomic_load_n(&native_legacy_surfaces[0],__ATOMIC_RELAXED);
+    out[1]=__atomic_load_n(&native_legacy_surfaces[1],__ATOMIC_RELAXED);
+    for(unsigned i=2;i<14;++i)out[i]=native_legacy_surfaces[i];
+    IOLockUnlock(lock);
+    return out[0]!=0;
 }
 extern "C" void native_legacy_gpu_fallback_observed(int status);
 // Swaps retired when the GPU client took the frame (before its copy finished), and copies that then failed after such a retirement.
@@ -269,11 +381,8 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         }
         uint32_t submitted=0,retired=0;uint32_t outstanding=0;
         if(&native_adreno_fences && native_adreno_fences(&submitted,&retired)){const int32_t d=int32_t(submitted-retired);outstanding=d>0?(d>255?255:uint32_t(d)):0;}
-        if(!native_legacy_ring_cap)return;
-        const uint32_t n=native_legacy_ring_count;volatile uint64_t *at=native_legacy_ring[n&(native_legacy_ring_cap-1)];
-        at[0]=nowUs();
-        at[1]=uint64_t(event)<<56|uint64_t(slot+1)<<48|uint64_t(validatedCount()&255)<<40|uint64_t(outstanding)<<24|((uintptr_t(request)>>4)&0xffffff);
-        native_legacy_ring_count=n+1;
+        recordLegacyTrace(nowUs(),uint64_t(event)<<56|uint64_t(slot+1)<<48|uint64_t(validatedCount()&255)<<40|
+                          uint64_t(outstanding)<<24|((uintptr_t(request)>>4)&0xffffff));
     }
     // Microseconds since this request was validated, 0 when it is not tracked.
     uint64_t sinceValidated(const OriginalLegacySwapRequest *request) const {
@@ -287,14 +396,7 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         if(us>native_legacy_swapstat[13])native_legacy_swapstat[13]=uint32_t(us>0xffffffffull?0xffffffffull:us);
         if(us>100000) {
             stat(12);
-            if(!native_legacy_snap_count && native_legacy_ring_cap) {
-                const uint32_t n=native_legacy_ring_count;
-                for(unsigned i=0;i<64;++i) {
-                    const uint32_t from=n>=64?n-64+i:i;
-                    const uint32_t mask=native_legacy_ring_cap-1;native_legacy_snap[i][0]=from<n?native_legacy_ring[from&mask][0]:0;native_legacy_snap[i][1]=from<n?native_legacy_ring[from&mask][1]:0;
-                }
-                native_legacy_snap_count=1;
-            }
+            captureLegacyTrace();
         }
     }
     bool addValidated(const OriginalLegacySwapRequest *request,uint32_t epoch) {
@@ -333,7 +435,13 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     // Direct scanout state, used on the work loop only. DPU 9.2 inside the MDP block (0xae01000): VIG 0 and 1 at 0x4000 and 0x6000 (source
     // address 0 at +0x14, stride 0 at +0x24; VIG 1 takes the right half through its own source x), CTL 0 at 0x15000 (flush at +0x18, VIG 0
     // and 1 are bits 0 and 1). i562: a flush of the two pipes latched within 5.4 ms with no start (the panel refreshes by itself).
-    struct DirectSlot {OSObject *surface;IOMemoryDescriptor *memory;uint32_t iova;uint64_t used,physical;unsigned pageCount;};
+    struct DirectSlot {
+        OSObject *surface;
+        IOMemoryDescriptor *memory;
+        uint32_t iova;
+        uint64_t used,physical;
+        unsigned pageCount,segments,largestKiB;
+    };
     static constexpr unsigned kDirectSlots=4;
     static constexpr unsigned kDirectMaxPages=8192;
     static constexpr size_t kDirectPageBytes=(1+kDirectSlots)*kDirectMaxPages*sizeof(uint64_t);
@@ -439,12 +547,16 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         }
         const IOByteCount bytes=memory->getLength();
         if(!bytes || bytes>uint64_t(kDirectMaxPages)*4096 || memory->prepare()!=kIOReturnSuccess){native_legacy_direct[2]=native_legacy_direct[2]+1;return -1;}
-        unsigned count=0;bool ok=true;
+        unsigned count=0,segments=0;bool ok=true;
+        IOByteCount largest=0;
         for(IOByteCount offset=0;offset<bytes && ok;) {
             IOByteCount length=0;
             const addr64_t pa=memory->getPhysicalSegment(offset,&length,kIOMemoryMapperNone);
             if(length>bytes-offset)length=bytes-offset;
             if(!pa || (pa&0xfff) || !length || ((length&0xfff) && length<bytes-offset)){ok=false;break;}
+            // Reuse the scanout walk for diagnostics instead of preparing and walking the surface a second time.
+            ++segments;
+            if(length>largest)largest=length;
             for(IOByteCount at=0;at<length;at+=4096)directPages[count++]=pa+at;
             offset+=length;
         }
@@ -458,7 +570,7 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
             pageCount=count;
         }
         surface->retain();memory->retain();
-        slot={surface,memory,iova,directClock,directPages[0],pageCount};
+        slot={surface,memory,iova,directClock,directPages[0],pageCount,segments,unsigned(largest>>10)};
         native_legacy_direct[1]=native_legacy_direct[1]+1;
         return pick;
     }
@@ -755,6 +867,7 @@ public:
         auto shutdown=[](OSObject *,void *argument,void *,void *,void *)->IOReturn {
             auto *display=static_cast<NativeLegacyDisplay *>(argument);
             display->primary=false;
+            stopSurfaceSamples(display);
             display->stopTransferEvents();
             display->transferred=false;display->gpuRequest=nullptr;display->gpuRetired=false;
             for(unsigned i=0;i<8;++i)if(display->validated[i])display->removeValidated(display->validated[i]);
@@ -795,7 +908,7 @@ public:
         if(loop)loop->runAction(shutdown,this,this);else shutdown(this,this,nullptr,nullptr,nullptr);
     }
     void free() override {
-        forgetDirectDisplay();stopVsync();stopTransferEvents();
+        forgetDirectDisplay();stopVsync();stopSurfaceSamples(this);stopTransferEvents();
         if(gpuCompletionLock){IOLockFree(gpuCompletionLock);gpuCompletionLock=nullptr;}
         if(logicalPM){PMstop();logicalPM=false;}primary=false;OSSafeReleaseNULL(bootMapping);IOMobileFramebufferLegacy::free();
     }
@@ -830,11 +943,7 @@ public:
     }
     bool startDisplay(IOService *provider) {
         if(!IOMobileFramebufferLegacy::start(provider))return false;
-        if(!native_legacy_ring) {
-            const uint32_t cap=65536;
-            volatile uint64_t (*memory)[2]=(volatile uint64_t (*)[2])IOMallocZero(sizeof(uint64_t)*2*cap);
-            if(memory) {native_legacy_ring=memory;native_legacy_ring_cap=cap;}
-        }
+        startLegacyTrace();
         if(primary && bootMapping)announcePoweredByFirmware();
         unsigned enabled=0;PE_parse_boot_argn("offline-legacy-pm",&enabled,sizeof(enabled));
         if(!enabled)return true;
@@ -971,7 +1080,6 @@ public:
         if(!gpuBypass) {
             if(!native_legacy_prepare_scanout()) {native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;}
         }
-        noteSurface(surface,memory);
         const bool half=nativeHalf(native_legacy_surface_format(surface),native_legacy_surface_planes(surface));
         if(half) {
             // Every 32nd half-float frame: the centre pixel's four raw components and the sample count, for the boot log. They tell
@@ -991,8 +1099,10 @@ public:
             int slot=-1;
             if(!prepareDirectSwap(request,surface,memory,slot))return;
             if(slot>=0) {
+                const DirectSlot &mapped=directSlots[slot];
+                noteSurface(this,surface,memory->getLength(),mapped.segments,mapped.largestKiB);
                 native_legacy_swap_stage(1);
-                flip(directSlots[slot].iova,uint32_t(sourceStride));directBoot=false;
+                flip(mapped.iova,uint32_t(sourceStride));directBoot=false;
                 native_legacy_direct[0]=native_legacy_direct[0]+1;countFormat(5);
                 stat(9);note(4,slot,request);noteFlipDelay(request);
                 shadowValid=false;pendingSlot=slot;latchRequest=request;transferred=true;
@@ -1001,6 +1111,7 @@ public:
             }
             native_legacy_direct[7]=native_legacy_direct[7]+1;
         }
+        noteSurface(this,surface,memory->getLength());
         directToBoot();
         stat(7);note(7,-1,request);
         if(!gpuBypass && offerGpuCopy(memory,sourceStride,width,height,half?halfOfferFormat:NGP_BGRX8888)) {
@@ -1277,7 +1388,7 @@ public:
                 }
             }
         }
-        if(!accepted && reason==2 && !surface && enabled==1) {
+        if(!accepted && reason==2 && !surface && validateEnabled) {
             // No surface in any slot and every updated layer disabled over black: present a blank screen.
             OSObject *none[4]={};memcpy(none,bytes+kRequestSurfaces,sizeof(none));
             uint32_t width=0,height=0;getDisplayDimensions(&width,&height);

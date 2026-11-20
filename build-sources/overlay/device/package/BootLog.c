@@ -204,7 +204,7 @@ extern volatile unsigned native_lookup_count __attribute__((weak_import));
 extern volatile uint32_t native_dpu_pipes[54] __attribute__((weak_import));
 extern volatile uint32_t native_dpu_more[40] __attribute__((weak_import));
 extern volatile uint32_t native_ufs_dpu_smmu[24] __attribute__((weak_import));
-extern volatile uint32_t native_legacy_surfaces[14] __attribute__((weak_import));
+extern bool native_legacy_copy_surface_stats(uint32_t out[14]) __attribute__((weak_import));
 extern volatile uint32_t native_legacy_swapstat[16] __attribute__((weak_import));
 extern volatile uint64_t native_legacy_center_half[2] __attribute__((weak_import));
 extern volatile uint32_t native_charger_pmic[2 + 5 * 7] __attribute__((weak_import));
@@ -1059,17 +1059,17 @@ static size_t compose(char *out, size_t cap, uint32_t slot, unsigned now) {
     }
     at = put(out, at, cap, row, sizeof row);
   }
-  if (log_gpu_on && (&native_adreno_vm_phase_us && (native_adreno_vm_phase_us[0][0] || native_adreno_vm_phase_us[1][0]))) {
+  if (log_gpu_on && (&native_adreno_vm_phase_us && (__atomic_load_n(&native_adreno_vm_phase_us[0][0], __ATOMIC_RELAXED) || __atomic_load_n(&native_adreno_vm_phase_us[1][0], __ATOMIC_RELAXED)))) {
     char row[170];
     for (unsigned k = 0; k < 2; ++k) {
       const volatile uint64_t *p = native_adreno_vm_phase_us[k];
-      if (!p[0]) continue;
+      if (!__atomic_load_n(&p[0], __ATOMIC_RELAXED)) continue;
       // NativeAdrenoVm.cpp's phase slots: 1 route check, 2 cache maintenance, 3 table transaction, 4 the mapping order, 5 the map's
       // checks before it (its preflight) or the unmap's retirement.
       snprintf(row, sizeof row, "[vm %s] n=%llu us: observe=%llu %s=%llu batch=%llu %s=%llu %s=%llu max=%llu MiB=%llu", k ? "unmap" : "map",
-               (unsigned long long)p[0], (unsigned long long)p[1], k ? "acquire" : "publish", (unsigned long long)p[2], (unsigned long long)p[3],
-               k ? "erase" : "insert", (unsigned long long)p[4], k ? "retire" : "preflight", (unsigned long long)p[5], (unsigned long long)p[6],
-               (unsigned long long)(p[7] >> 20));
+               (unsigned long long)__atomic_load_n(&p[0], __ATOMIC_RELAXED), (unsigned long long)__atomic_load_n(&p[1], __ATOMIC_RELAXED), k ? "acquire" : "publish", (unsigned long long)__atomic_load_n(&p[2], __ATOMIC_RELAXED), (unsigned long long)__atomic_load_n(&p[3], __ATOMIC_RELAXED),
+               k ? "erase" : "insert", (unsigned long long)__atomic_load_n(&p[4], __ATOMIC_RELAXED), k ? "retire" : "preflight", (unsigned long long)__atomic_load_n(&p[5], __ATOMIC_RELAXED), (unsigned long long)__atomic_load_n(&p[6], __ATOMIC_RELAXED),
+               (unsigned long long)(__atomic_load_n(&p[7], __ATOMIC_RELAXED) >> 20));
       at = put(out, at, cap, row, sizeof row);
     }
   }
@@ -1081,10 +1081,10 @@ static size_t compose(char *out, size_t cap, uint32_t slot, unsigned now) {
     int n = snprintf(row, sizeof row, "[vm kinds]");
     for (unsigned k = 0; k < 5; ++k) {
       const volatile uint64_t *v = native_adreno_vm_kind_us[k];
-      n += snprintf(row + n, sizeof row - (size_t)n, " | %s %llu/%lluus/%llu", kinds[k], (unsigned long long)v[0], (unsigned long long)v[1],
-                    (unsigned long long)v[2]);
+      n += snprintf(row + n, sizeof row - (size_t)n, " | %s %llu/%lluus/%llu", kinds[k], (unsigned long long)__atomic_load_n(&v[0], __ATOMIC_RELAXED), (unsigned long long)__atomic_load_n(&v[1], __ATOMIC_RELAXED),
+                    (unsigned long long)__atomic_load_n(&v[2], __ATOMIC_RELAXED));
     }
-    if (native_adreno_vm_kind_us[0][0] || native_adreno_vm_kind_us[1][0] || native_adreno_vm_kind_us[2][0]) at = put(out, at, cap, row, sizeof row);
+    if (__atomic_load_n(&native_adreno_vm_kind_us[0][0], __ATOMIC_RELAXED) || __atomic_load_n(&native_adreno_vm_kind_us[1][0], __ATOMIC_RELAXED) || __atomic_load_n(&native_adreno_vm_kind_us[2][0], __ATOMIC_RELAXED)) at = put(out, at, cap, row, sizeof row);
   }
   // [bo memory]: user BOs from the system (count, spans, refused, last refusal status, MiB live and peak), kernel-mapped BOs, import spans.
   if (log_gpu_on && (&native_adreno_bo_memory)) {
@@ -1289,9 +1289,9 @@ static size_t compose(char *out, size_t cap, uint32_t slot, unsigned now) {
     char row[300];
     snprintf(row, sizeof row, "[coherence] %.110s | on=%u skipped map=%u unmap=%u submit=%u complete=%u | fence pauses slept=%llu spun=%llu timed out=%llu",
              native_gpu_coherence_row,
-             &native_adreno_io_coherent ? native_adreno_io_coherent : 0, &native_adreno_coherent_skips ? native_adreno_coherent_skips[0] : 0,
-             &native_adreno_coherent_skips ? native_adreno_coherent_skips[1] : 0, &native_adreno_coherent_skips ? native_adreno_coherent_skips[2] : 0,
-             &native_adreno_coherent_skips ? native_adreno_coherent_skips[3] : 0,
+             &native_adreno_io_coherent ? native_adreno_io_coherent : 0, &native_adreno_coherent_skips ? __atomic_load_n(&native_adreno_coherent_skips[0], __ATOMIC_RELAXED) : 0,
+             &native_adreno_coherent_skips ? __atomic_load_n(&native_adreno_coherent_skips[1], __ATOMIC_RELAXED) : 0, &native_adreno_coherent_skips ? __atomic_load_n(&native_adreno_coherent_skips[2], __ATOMIC_RELAXED) : 0,
+             &native_adreno_coherent_skips ? __atomic_load_n(&native_adreno_coherent_skips[3], __ATOMIC_RELAXED) : 0,
              (unsigned long long)(&native_gpu_idle_sleeps ? native_gpu_idle_sleeps : 0), (unsigned long long)(&native_gpu_idle_spins ? native_gpu_idle_spins : 0),
              (unsigned long long)(&native_gpu_idle_timeouts ? native_gpu_idle_timeouts : 0));
     at = put(out, at, cap, row, sizeof row);
@@ -1314,13 +1314,13 @@ static size_t compose(char *out, size_t cap, uint32_t slot, unsigned now) {
     int n = snprintf(row, sizeof row, "[maint kind]");
     static const char *const names[7] = {"drv", "syswc", "sys", "kern", "impr", "impw", "impu"};
     for (unsigned i = 0; i < 7 && n > 0 && n < 330; ++i)
-      n += snprintf(row + n, sizeof row - (size_t)n, " %s %llu/%llu/%llu", names[i], (unsigned long long)k[i][0], (unsigned long long)k[i][1],
-                    (unsigned long long)k[i][2]);
+      n += snprintf(row + n, sizeof row - (size_t)n, " %s %llu/%llu/%llu", names[i], (unsigned long long)__atomic_load_n(&k[i][0], __ATOMIC_RELAXED), (unsigned long long)__atomic_load_n(&k[i][1], __ATOMIC_RELAXED),
+                    (unsigned long long)__atomic_load_n(&k[i][2], __ATOMIC_RELAXED));
     at = put(out, at, cap, row, sizeof row);
     snprintf(row, sizeof row, "[maint walk] submits=%llu visited=%llu held=%llu completes=%llu visited=%llu reclass=%llu reassert=%llu | "
              "sync skip map=%u unmap=%u audit=%u lines=%u dirty=%u stale=%u ended=%u fail=%x all=%u",
-             (unsigned long long)w[0], (unsigned long long)w[1], (unsigned long long)w[2], (unsigned long long)w[3], (unsigned long long)w[4],
-             (unsigned long long)w[5], (unsigned long long)w[6], native_adreno_sync_skips[0], native_adreno_sync_skips[1],
+             (unsigned long long)__atomic_load_n(&w[0], __ATOMIC_RELAXED), (unsigned long long)__atomic_load_n(&w[1], __ATOMIC_RELAXED), (unsigned long long)__atomic_load_n(&w[2], __ATOMIC_RELAXED), (unsigned long long)__atomic_load_n(&w[3], __ATOMIC_RELAXED), (unsigned long long)__atomic_load_n(&w[4], __ATOMIC_RELAXED),
+             (unsigned long long)__atomic_load_n(&w[5], __ATOMIC_RELAXED), (unsigned long long)__atomic_load_n(&w[6], __ATOMIC_RELAXED), native_adreno_sync_skips[0], native_adreno_sync_skips[1],
              native_adreno_sync_audit[0], native_adreno_sync_audit[1], native_adreno_sync_audit[2], native_adreno_sync_audit[3],
              native_adreno_sync_audit[4], native_adreno_sync_audit[5], &native_adreno_maint_all ? native_adreno_maint_all : 0);
     at = put(out, at, cap, row, sizeof row);
@@ -1426,16 +1426,16 @@ static size_t compose(char *out, size_t cap, uint32_t slot, unsigned now) {
       char kinds[420];
       int n = snprintf(kinds, sizeof kinds, "[maint kinds] cleaned/KiB/left alone at submissions:");
       for (unsigned k = 0; k < 7 && n > 0 && n < 380; ++k)
-        n += snprintf(kinds + n, sizeof kinds - (size_t)n, " %s %llu/%llu/%llu", kind[k], (unsigned long long)native_adreno_maint_kind[k][0],
-                      (unsigned long long)native_adreno_maint_kind[k][1], (unsigned long long)native_adreno_maint_kind[k][2]);
+        n += snprintf(kinds + n, sizeof kinds - (size_t)n, " %s %llu/%llu/%llu", kind[k], (unsigned long long)__atomic_load_n(&native_adreno_maint_kind[k][0], __ATOMIC_RELAXED),
+                      (unsigned long long)__atomic_load_n(&native_adreno_maint_kind[k][1], __ATOMIC_RELAXED), (unsigned long long)__atomic_load_n(&native_adreno_maint_kind[k][2], __ATOMIC_RELAXED));
       at = put(out, at, cap, kinds, sizeof kinds);
     }
     if (&native_adreno_maint_walk && &native_adreno_sync_audit && &native_adreno_sync_skips) {
       const volatile uint64_t *w = native_adreno_maint_walk; const volatile uint32_t *a = native_adreno_sync_audit;
       char walk[340];
       snprintf(walk, sizeof walk, "[maint walk] submissions=%llu visited=%llu held=%llu | completions=%llu visited=%llu | reclassified=%llu reassert visited=%llu | sync skipped map=%u unmap=%u | sync audit n=%u lines=%u dirty=%u stale=%u distrusted=%u fail=%x | all=%u",
-               (unsigned long long)w[0], (unsigned long long)w[1], (unsigned long long)w[2], (unsigned long long)w[3], (unsigned long long)w[4],
-               (unsigned long long)w[5], (unsigned long long)w[6], native_adreno_sync_skips[0], native_adreno_sync_skips[1], a[0], a[1], a[2], a[3],
+               (unsigned long long)__atomic_load_n(&w[0], __ATOMIC_RELAXED), (unsigned long long)__atomic_load_n(&w[1], __ATOMIC_RELAXED), (unsigned long long)__atomic_load_n(&w[2], __ATOMIC_RELAXED), (unsigned long long)__atomic_load_n(&w[3], __ATOMIC_RELAXED), (unsigned long long)__atomic_load_n(&w[4], __ATOMIC_RELAXED),
+               (unsigned long long)__atomic_load_n(&w[5], __ATOMIC_RELAXED), (unsigned long long)__atomic_load_n(&w[6], __ATOMIC_RELAXED), native_adreno_sync_skips[0], native_adreno_sync_skips[1], a[0], a[1], a[2], a[3],
                a[4], a[5], &native_adreno_maint_all ? native_adreno_maint_all : 0);
       at = put(out, at, cap, walk, sizeof walk);
     }
@@ -1767,10 +1767,11 @@ static size_t compose(char *out, size_t cap, uint32_t slot, unsigned now) {
       at = put(out, at, cap, row, sizeof row);
     }
   }
-  // The compositor's swapped surfaces (NativeLegacyDisplay.cpp): distinct, swaps, then per surface allocation KiB, physical segments, largest KiB.
-  if (log_display_on && &native_legacy_surfaces && native_legacy_surfaces[0]) {
+  // The display records segment statistics only when it already walked pages for direct scanout.
+  uint32_t surface_stats[14];
+  if (log_display_on && &native_legacy_copy_surface_stats && native_legacy_copy_surface_stats(surface_stats)) {
     char row[200];
-    const volatile uint32_t *v = native_legacy_surfaces;
+    const uint32_t *v = surface_stats;
     snprintf(row, sizeof row, "[swap surfaces] %u seen, %u swaps | %uK %u segs max %uK | %uK %u segs max %uK | %uK %u segs max %uK | %uK %u segs max %uK",
              v[0], v[1], v[2] >> 10, v[3], v[4], v[5] >> 10, v[6], v[7], v[8] >> 10, v[9], v[10], v[11] >> 10, v[12], v[13]);
     at = put(out, at, cap, row, sizeof row);

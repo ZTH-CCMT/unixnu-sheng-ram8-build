@@ -50,14 +50,22 @@ struct CpPeer {
     std::vector<uint32_t> regs;
     std::vector<uint32_t> writes;
     unsigned publish=0,acquire=0,barriers=0,fail_publish=0,fail_acquire=0,fail_barrier=0;
-    unsigned sqe_calls=0;bool diagnostic_callbacks=true;
+    unsigned sqe_calls=0;bool diagnostic_callbacks=true,clear_stop_on_write=false;
     uint32_t fail_read_reg=~0u,fail_write_reg=~0u;
     CpPeer():regs(0x10000,0){}
 };
 static CpPeer cp;
 static uint64_t clock_us=0;
 static int cwrite(void *c,uint32_t reg,uint32_t v)
-{CHECK(c==&cp && reg<cp.regs.size());if(reg==cp.fail_write_reg)return 1;cp.regs[reg]=v;cp.writes.push_back(reg);return 0;}
+{
+    CHECK(c==&cp && reg<cp.regs.size());
+    if(reg==cp.fail_write_reg)return 1;
+    cp.regs[reg]=reg==0x08a0 && cp.clear_stop_on_write?v&~1u:v;
+    cp.writes.push_back(reg);
+    return 0;
+}
+static int cgmuvote(void *,uint32_t reg,uint32_t value)
+{CHECK(reg==0x1f8c4 && value<=1);return 0;}
 static int cread(void *c,uint32_t reg,uint32_t *v)
 {CHECK(c==&cp && v && reg<cp.regs.size());if(reg==cp.fail_read_reg)return 1;*v=cp.regs[reg];return 0;}
 static int cbarrier(void *c){CHECK(c==&cp);++cp.barriers;return cp.barriers==cp.fail_barrier;}
@@ -308,6 +316,29 @@ static void testSwitchCompletesWithoutInterrupt()
 }
 
 
+static void testImmediateSwitchCompletion()
+{
+    for(bool fail_control_read:{false,true}) {
+        DualRingPath p;
+        p.setup();
+        cp.clear_stop_on_write=true;
+        if(fail_control_read)cp.fail_read_reg=0x08a0;
+        const uint32_t fence=p.enqueue(1,5);
+        CHECK(p.submit.preemptStats().triggers==1);
+        if(fail_control_read) {
+            CHECK(!p.low.current() && p.keepalive && p.submit.preemptStats().completed==0);
+            cp.fail_read_reg=~0u;
+            CHECK(p.submit.preemptIrq());
+        }
+        CHECK(p.low.current() && !p.ring.current() && !p.keepalive);
+        CHECK(p.submit.preemptStats().completed==1 && p.submit.preemptStats().faulted==0);
+        CHECK(!p.submit.preemptIrq());  // A delayed worker must not complete the same switch twice.
+        p.low_fences[1]=fence;
+        CHECK(p.submit.retireCompleted()==kIOReturnSuccess && !p.submit.outstanding());
+    }
+    std::puts("PASS immediate STOP-clear claims completion under the submission lock");
+}
+
 static void testSwitchCompletesBeforeRecovery()
 {
     DualRingPath p;
@@ -325,7 +356,7 @@ static void testSwitchCompletesBeforeRecovery()
     CHECK(result.completed_late && result.replayed==0 && !result.guilty);
     CHECK(p.restart_count==0 && p.submit.stats().restarts==0);
     CHECK(p.ring.current() && !p.low.current() && !p.keepalive);
-    CHECK(p.submit.deadReason()==0 && p.submit.preemptStats().completed==2);
+    CHECK(p.submit.deadReason()==0 && p.submit.preemptStats().completed==2 && p.submit.preemptStats().faulted==0);
     NativeAdrenoPreemptStats late_stats{};
     uint32_t late_loaded=~0u,late_cntl=~0u,late_dead=~0u;
     bool late_flight=true;
@@ -1365,7 +1396,7 @@ int main(int argc,char **argv)
         uint32_t lowmem[8192]{},lowfence[1024]{};uint8_t rec[2][64]{},info[2][32]{};
         CHECK(low.attachSecondary(&ringio,&ringcache,lowmem,sizeof(lowmem),0x200000,lowfence,sizeof(lowfence),0x208000)==0);
         CHECK(p.ring.setPreempt(0x300000,0x400000,0x108008)==0 && low.setPreempt(0x500000,0x600000,0x208008)==0);
-        NativeAdrenoSubmit::PreemptSetup setup{};setup.io={&cp,cwrite,cread,cbarrier,nullptr,nullptr};
+        NativeAdrenoSubmit::PreemptSetup setup{};setup.io={&cp,cwrite,cread,cbarrier,nullptr,cgmuvote};
         setup.pages={{0x300000,0x500000},{0x400000,0x600000},{rec[0],rec[1]},{info[0],info[1]}};
         setup.now=cnow;setup.clock=&cp;setup.mode=2;
         CHECK(p.submit.setPreemption(&p.ring,&low,setup,true)==0);
@@ -1434,7 +1465,7 @@ int main(int argc,char **argv)
         uint32_t lowmem[8192]{};uint8_t rec[2][64]{},info[2][32]{};
         CHECK(low.attachSecondary(&ringio,&ringcache,lowmem,sizeof(lowmem),0x200000,lowfence,sizeof(lowfence),0x208000)==0);
         CHECK(p.ring.setPreempt(0x300000,0x400000,0x108008)==0 && low.setPreempt(0x500000,0x600000,0x208008)==0);
-        NativeAdrenoSubmit::PreemptSetup setup{};setup.io={&cp,cwrite,cread,cbarrier,nullptr,nullptr};
+        NativeAdrenoSubmit::PreemptSetup setup{};setup.io={&cp,cwrite,cread,cbarrier,nullptr,cgmuvote};
         setup.pages={{0x300000,0x500000},{0x400000,0x600000},{rec[0],rec[1]},{info[0],info[1]}};
         setup.now=cnow;setup.clock=&cp;setup.mode=2;
         CHECK(p.submit.setPreemption(&p.ring,&low,setup,true)==0);
@@ -1541,6 +1572,7 @@ int main(int argc,char **argv)
     std::printf("PASS: 1 execbuf submission with exact IB packet and fence, 8 pre-reference refusals, 1 duplicate-buffer reference case and 1 poisoned-commit retention case over software SMMU/CP peers; 2 write-combine audit cases (trusted, dirty and failed); 1 hangcheck and 1 recovery with replay, 1 usable VM after recovery and 1 failed restart\n");
     testHiddenActiveFence();
     testSwitchCompletesWithoutInterrupt();
+    testImmediateSwitchCompletion();
     testSwitchCompletesBeforeRecovery();
     testSwitchTimeoutRecovery(true);
     testSwitchTimeoutRecovery(false);

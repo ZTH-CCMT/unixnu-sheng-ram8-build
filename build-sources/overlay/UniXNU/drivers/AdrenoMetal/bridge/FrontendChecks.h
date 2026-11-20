@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// The native Metal frontend's qualification through the public Metal API only, shared by the host test (frontend_host.mm, over MoltenVK) and
+// The native Metal frontend's qualification through Metal entry points, shared by the host test (frontend_host.mm, over MoltenVK) and
 // the plugin (NativeMetalBridgePhase.h, over Turnip on the Adreno 740). Every check reads back what the GPU wrote. Steps (markers 0x6601..):
 // 1 compute; 2 render to a private texture with a blit readback; 3 render into a real IOSurface read by the CPU, 4 sampling it into a
 // second surface (the composition shape); 5 a compute kernel reading and writing textures; 6 completion handler order; 7 an encoder refusal
@@ -14,17 +14,22 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <cstdint>
 #include <vector>
+
+// Keep diagnostic deadlines separate from Metal's public, blocking wait.
+@protocol NBFrontendDiagnosticCompletion
+- (BOOL)nbWaitUntilCompletedForDiagnosticMilliseconds:(uint32_t)milliseconds;
+@end
 
 namespace frontendchecks {
 struct Report {
-    unsigned failed, last;
-    char first[96];
-    unsigned qcFunctions, qcKernels, qcKernelsOk, qcPairs, qcPairsOk;
-    void (*mark)(uint32_t);
-    bool hostSimulation;  // the host simulation's IOKit shim hides IOSurface (steps 3-4 skipped) and Metal's listener (none is made)
+    unsigned failed = 0, last = 0;
+    char first[96] = {};
+    unsigned qcFunctions = 0, qcKernels = 0, qcKernelsOk = 0, qcPairs = 0, qcPairsOk = 0;
+    void (*mark)(uint32_t) = nullptr;
+    bool hostSimulation = false;  // the host simulation's IOKit shim hides IOSurface (steps 3-4 skipped) and Metal's listener (none is made)
 };
-static Report *gReport;
 __attribute__((format(printf, 2, 3))) static void fail(Report *r, const char *format, ...) {
     char text[160];
     va_list args;
@@ -38,18 +43,27 @@ static void step(Report *r, uint32_t marker) {
     r->last = marker;
     if (r->mark) r->mark(marker);
 }
-#define CHECK(c, ...) do { if (!(c)) fail(gReport, __VA_ARGS__); } while (0)
-static bool completed(id<MTLCommandBuffer> cb, const char *what) {
-    [cb waitUntilCompleted];
-    if (cb.status != MTLCommandBufferStatusCompleted) {
-        fail(gReport, "%s: status %lu %s", what, (unsigned long)cb.status, cb.error.localizedDescription.UTF8String ?: "");
+#define CHECK(c, ...) do { if (!(c)) fail(r, __VA_ARGS__); } while (0)
+static bool awaitCompletion(Report *r, id<MTLCommandBuffer> cb, const char *what) {
+    id<NBFrontendDiagnosticCompletion> diagnostic = (id<NBFrontendDiagnosticCompletion>)cb;
+    if (![cb respondsToSelector:@selector(nbWaitUntilCompletedForDiagnosticMilliseconds:)] ||
+        ![diagnostic nbWaitUntilCompletedForDiagnosticMilliseconds:5000]) {
+        fail(r, "%s: command completion timed out or was refused", what);
         return false;
     }
     return true;
 }
-static bool finish(id<MTLCommandBuffer> cb, const char *what) {
+static bool completed(Report *r, id<MTLCommandBuffer> cb, const char *what) {
+    if (!awaitCompletion(r, cb, what)) return false;
+    if (cb.status != MTLCommandBufferStatusCompleted) {
+        fail(r, "%s: status %lu %s", what, (unsigned long)cb.status, cb.error.localizedDescription.UTF8String ?: "");
+        return false;
+    }
+    return true;
+}
+static bool finish(Report *r, id<MTLCommandBuffer> cb, const char *what) {
     [cb commit];
-    return completed(cb, what);
+    return completed(r, cb, what);
 }
 // The fixture's picture: top-left quarter (255, 51, 0, 255), the rest cleared blue; `bgra` swaps red and blue in memory.
 static unsigned wrongTexels(const uint8_t *bytes, size_t row, unsigned side, bool bgra = false) {
@@ -68,7 +82,7 @@ static IOSurfaceRef surface(unsigned side, OSType format) {
                         (id)kIOSurfacePixelFormat: @(format)};
     return IOSurfaceCreate((__bridge CFDictionaryRef)p);
 }
-static id<MTLRenderPipelineState> pipeline(id<MTLDevice> device, id<MTLLibrary> library, NSString *fragment, MTLPixelFormat format) {
+static id<MTLRenderPipelineState> pipeline(Report *r, id<MTLDevice> device, id<MTLLibrary> library, NSString *fragment, MTLPixelFormat format) {
     MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
     d.vertexFunction = [library newFunctionWithName:@"colored_vertex"];
     d.fragmentFunction = [library newFunctionWithName:fragment];
@@ -104,7 +118,11 @@ static const float kFull[6][2] = {{-1, 1}, {1, 1}, {-1, -1}, {1, 1}, {1, -1}, {-
 // function-constant fixture, `qcPath` (may be nil) the target's QuartzCore default.metallib.
 static void run(id<MTLDevice> device, id<MTLLibrary> library, id<MTLLibrary> fcLibrary, NSString *qcPath, Report *r) {
     NBMetalOriginScope origin(NBOriginSelfTest);
-    gReport = r;
+    const auto mark = r->mark;
+    const bool hostSimulation = r->hostSimulation;
+    *r = Report{};
+    r->mark = mark;
+    r->hostSimulation = hostSimulation;
     @autoreleasepool {
         CHECK([library.functionNames containsObject:@"sampled_fragment"], "function names");
         CHECK(![library newFunctionWithName:@"no_such_function"], "a missing function must be nil");
@@ -133,14 +151,14 @@ static void run(id<MTLDevice> device, id<MTLLibrary> library, id<MTLLibrary> fcL
             [e setBytes:&scale length:4 atIndex:2];
             [e dispatchThreads:MTLSizeMake(in.size(), 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
             [e endEncoding];
-            if (finish(cb, "compute")) {
+            if (finish(r, cb, "compute")) {
                 const float *v = (const float *)output.contents;
                 unsigned bad = 0;
                 for (unsigned i = 0; i < in.size(); ++i) bad += v[i] != 3.0f * i;
                 CHECK(!bad, "compute: %u wrong outputs", bad);
             }
         }
-        id<MTLRenderPipelineState> colored = pipeline(device, library, @"colored_fragment", MTLPixelFormatRGBA8Unorm);
+        id<MTLRenderPipelineState> colored = pipeline(r, device, library, @"colored_fragment", MTLPixelFormatRGBA8Unorm);
         step(r, 0x6602);
         // 2. render into a private texture, blit to a buffer
         {
@@ -156,7 +174,7 @@ static void run(id<MTLDevice> device, id<MTLLibrary> library, id<MTLLibrary> fcL
             [b copyFromTexture:target sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(8, 8, 1)
                       toBuffer:readback destinationOffset:0 destinationBytesPerRow:32 destinationBytesPerImage:256];
             [b endEncoding];
-            if (finish(cb, "render")) CHECK(!wrongTexels((const uint8_t *)readback.contents, 32, 8), "render: wrong texels");
+            if (finish(r, cb, "render")) CHECK(!wrongTexels((const uint8_t *)readback.contents, 32, 8), "render: wrong texels");
         }
         step(r, 0x6603);
         // 3. render into an IOSurface (its pages imported, no copy), then 4. sample it into a second surface
@@ -171,14 +189,14 @@ static void run(id<MTLDevice> device, id<MTLLibrary> library, id<MTLLibrary> fcL
             CHECK(layerTexture && screenTexture && layerTexture.iosurface == layer, "IOSurface textures");
             id<MTLCommandBuffer> cb = [queue commandBuffer];
             drawQuad(cb, colored, layerTexture, nil, kQuarter, 6);
-            if (finish(cb, "surface render")) {
+            if (finish(r, cb, "surface render")) {
                 IOSurfaceLock(layer, kIOSurfaceLockReadOnly, nullptr);
                 CHECK(!wrongTexels((const uint8_t *)IOSurfaceGetBaseAddress(layer), IOSurfaceGetBytesPerRow(layer), 64), "surface render: wrong texels");
                 IOSurfaceUnlock(layer, kIOSurfaceLockReadOnly, nullptr);
             }
             step(r, 0x6604);
             // sampled_fragment samples its texture at position * 1/8 (normalized), so an 8x8 viewport of the screen reads the layer whole
-            id<MTLRenderPipelineState> sampled = pipeline(device, library, @"sampled_fragment", MTLPixelFormatRGBA8Unorm);
+            id<MTLRenderPipelineState> sampled = pipeline(r, device, library, @"sampled_fragment", MTLPixelFormatRGBA8Unorm);
             cb = [queue commandBuffer];
             MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
             pass.colorAttachments[0].texture = screenTexture;
@@ -194,7 +212,7 @@ static void run(id<MTLDevice> device, id<MTLLibrary> library, id<MTLLibrary> fcL
             [e setFragmentTexture:layerTexture atIndex:0];
             [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
             [e endEncoding];
-            if (finish(cb, "composition")) {
+            if (finish(r, cb, "composition")) {
                 IOSurfaceLock(screen, kIOSurfaceLockReadOnly, nullptr);
                 const uint8_t *p = (const uint8_t *)IOSurfaceGetBaseAddress(screen);
                 std::vector<uint8_t> corner(8 * 8 * 4);
@@ -225,7 +243,7 @@ static void run(id<MTLDevice> device, id<MTLLibrary> library, id<MTLLibrary> fcL
             [e setTexture:dst atIndex:1];
             [e dispatchThreads:MTLSizeMake(16, 16, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
             [e endEncoding];
-            if (finish(cb, "texture compute")) {
+            if (finish(r, cb, "texture compute")) {
                 std::vector<uint8_t> out(texels.size());
                 [dst getBytes:out.data() bytesPerRow:64 fromRegion:MTLRegionMake2D(0, 0, 16, 16) mipmapLevel:0];
                 unsigned bad = 0;
@@ -248,7 +266,7 @@ static void run(id<MTLDevice> device, id<MTLLibrary> library, id<MTLLibrary> fcL
             [cb addScheduledHandler:^(id<MTLCommandBuffer>) {scheduled = order++;}];
             __block MTLCommandBufferStatus seen = MTLCommandBufferStatusNotEnqueued;
             [cb addCompletedHandler:^(id<MTLCommandBuffer> c) {seen = c.status; done = order++;}];
-            if (finish(cb, "handlers")) {
+            if (finish(r, cb, "handlers")) {
                 CHECK(scheduled == 0 && done == 1 && order == 2, "handler order %d %d", scheduled, done);
                 CHECK(seen == MTLCommandBufferStatusCompleted, "status inside the completed handler");
                 const uint8_t *p = (const uint8_t *)buffer.contents;
@@ -270,9 +288,10 @@ static void run(id<MTLDevice> device, id<MTLLibrary> library, id<MTLLibrary> fcL
             __block bool ran = false;
             [cb addCompletedHandler:^(id<MTLCommandBuffer>) {ran = true;}];
             [cb commit];
-            [cb waitUntilCompleted];
-            CHECK(cb.status == MTLCommandBufferStatusError && cb.error, "a draw without a pipeline must fail the command buffer");
-            CHECK(ran, "the completed handler runs for a failed command buffer");
+            if (awaitCompletion(r, cb, "draw without a pipeline")) {
+                CHECK(cb.status == MTLCommandBufferStatusError && cb.error, "a draw without a pipeline must fail the command buffer");
+                CHECK(ran, "the completed handler runs for a failed command buffer");
+            }
         }
         step(r, 0x6609);
         // 9. function constants (newFunctionWithName:constantValues:error:): the runtime's fixture kernel_function_constant_gate_fold, whose
@@ -297,7 +316,7 @@ static void run(id<MTLDevice> device, id<MTLLibrary> library, id<MTLLibrary> fcL
                 [e setBuffer:output offset:0 atIndex:1];
                 [e dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
                 [e endEncoding];
-                if (finish(cb, "specialized compute")) {
+                if (finish(r, cb, "specialized compute")) {
                     const float got = ((const float *)output.contents)[24], expected = mode ? in * 1000 * mode : in;
                     CHECK(got == expected, "mode %d: out[24] %g, expected %g", mode, got, expected);
                 }
@@ -366,7 +385,7 @@ static void run(id<MTLDevice> device, id<MTLLibrary> library, id<MTLLibrary> fcL
                 [third copyFromBuffer:c sourceOffset:0 toBuffer:c destinationOffset:2048 size:64];
                 [third endEncoding];
                 [cpu commit];
-                if (finish(signalling, "event signal") && completed(waiting, "event wait")) {
+                if (finish(r, signalling, "event signal") && completed(r, waiting, "event wait")) {
                     CHECK(((const uint8_t *)b.contents)[4095] == 0x3c, "the GPU wait did not order the copy after the fill");
                     CHECK(event.signaledValue == 1, "signaled value %llu", (unsigned long long)event.signaledValue);
                 }
@@ -376,7 +395,7 @@ static void run(id<MTLDevice> device, id<MTLLibrary> library, id<MTLLibrary> fcL
                 MTLSharedEventListener *listener = r->hostSimulation ? nil : [[MTLSharedEventListener alloc] init];
                 [event notifyListener:listener atValue:3 block:^(id<MTLSharedEvent>, uint64_t value) {heard = value; dispatch_semaphore_signal(notified);}];
                 event.signaledValue = 3;
-                if (completed(cpu, "CPU-signaled wait")) {
+                if (completed(r, cpu, "CPU-signaled wait")) {
                     const uint8_t *p = (const uint8_t *)c.contents;
                     CHECK(p[2048] == 0x77 && p[2111] == 0x77, "the fence did not order the copy after the fill");
                 }
@@ -404,7 +423,7 @@ static void run(id<MTLDevice> device, id<MTLLibrary> library, id<MTLLibrary> fcL
                     id<MTLBlitCommandEncoder> fill = [cb blitCommandEncoder];
                     [fill fillBuffer:hb range:NSMakeRange(0, 4096) value:0x5a];
                     [fill endEncoding];
-                    if (finish(cb, "heap fill")) CHECK(((const uint8_t *)hb.contents)[0] == 0x5a && ((const uint8_t *)hb.contents)[4095] == 0x5a, "heap buffer contents");
+                    if (finish(r, cb, "heap fill")) CHECK(((const uint8_t *)hb.contents)[0] == 0x5a && ((const uint8_t *)hb.contents)[4095] == 0x5a, "heap buffer contents");
                 }
             }
             MTLHeapDescriptor *pd = [MTLHeapDescriptor new];
@@ -423,7 +442,7 @@ static void run(id<MTLDevice> device, id<MTLLibrary> library, id<MTLLibrary> fcL
                     [fill fillBuffer:first range:NSMakeRange(0, 4096) value:0x11];
                     [fill fillBuffer:second range:NSMakeRange(0, 4096) value:0x22];
                     [fill endEncoding];
-                    if (finish(cb, "placement fill"))
+                    if (finish(r, cb, "placement fill"))
                         CHECK(((const uint8_t *)first.contents)[4095] == 0x11 && ((const uint8_t *)second.contents)[0] == 0x22, "placed buffers overlap");
                 }
             }
@@ -450,14 +469,13 @@ static void run(id<MTLDevice> device, id<MTLLibrary> library, id<MTLLibrary> fcL
                 [e setVertexBytes:colors.data() length:colors.size() * sizeof(float) atIndex:1];
                 [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
                 [e endEncoding];
-                if (finish(cb, "visibility result")) CHECK(*(const uint64_t *)visible.contents != 0, "visibility result stayed 0 for a visible quad");
+                if (finish(r, cb, "visibility result")) CHECK(*(const uint64_t *)visible.contents != 0, "visibility result stayed 0 for a visible quad");
             }
         }
         if (layer) CFRelease(layer);
         if (screen) CFRelease(screen);
     }
     step(r, 0x660f);
-    gReport = nullptr;
 }
 #undef CHECK
 }  // namespace frontendchecks

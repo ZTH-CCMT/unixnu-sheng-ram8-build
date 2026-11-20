@@ -375,7 +375,13 @@ void NativeAdrenoSubmit::driveSwitch(const NativeAdrenoRingClock *clock)
         const auto capture_tail=[](void *cookie,NativeAdrenoPublishedTail *out) {
             static_cast<NativeAdrenoRing *>(cookie)->capturePublishedTail(out);
         };
-        if(preempt_.trigger(i,true,capture?+capture_tail:nullptr,ring(loaded))) {aging_grant_=i==1 && high;ring(0)->setCurrent(false);ring(1)->setCurrent(false);return;}
+        bool ready=false;
+        if(preempt_.trigger(i,true,capture?+capture_tail:nullptr,ring(loaded),&ready)) {
+            aging_grant_=i==1 && high;ring(0)->setCurrent(false);ring(1)->setCurrent(false);
+            // The CP can finish before the interrupt worker acquires the submission lock.
+            if(ready)(void)completeSwitch();
+            return;
+        }
         /* A failed register write can leave target exposure uncertain. The
          * watchdog will recover pending work on either ring. */
         preempt_.noteSkipped();
@@ -387,8 +393,10 @@ void NativeAdrenoSubmit::driveSwitch(const NativeAdrenoRingClock *clock)
 bool NativeAdrenoSubmit::completeSwitch(bool *read_error)
 {
     if(read_error)*read_error=false;
-    if(!preemption() || !preempt_.inFlight())return false;
-    if(!preempt_.complete(read_error))return false;
+    if(!preemption())return false;
+    const auto state=preempt_.complete();
+    if(read_error)*read_error=state==NativeAdrenoSwitchState::ReadError;
+    if(state!=NativeAdrenoSwitchState::Completed)return false;
     // A late completion supersedes only the timeout of this in-flight switch.
     // Retain any errors in restoring WPTR or releasing the power vote.
     if(dead_reason_==2 || dead_reason_==8) {preempt_dead_=false;dead_reason_=0;}
@@ -514,6 +522,8 @@ IOReturn NativeAdrenoSubmit::setPreemption(NativeAdrenoRing *high,NativeAdrenoRi
     }
     if(preempt_on_)return kIOReturnBusy;
     if(!high || !low || high==low)return kIOReturnBadArgument;
+    if(!setup.io.write32 || !setup.io.read32 || !setup.io.barrier || !setup.io.gmu_write32 || !setup.now)
+        return kIOReturnBadArgument;
     if(!high->preemption() || !low->preemption())return kIOReturnBadArgument;
     for(unsigned i=0;i<NativeAdrenoPreemptRingCount;++i)
         if(!setup.pages.record_cpu[i] || !setup.pages.smmu_cpu[i] ||
