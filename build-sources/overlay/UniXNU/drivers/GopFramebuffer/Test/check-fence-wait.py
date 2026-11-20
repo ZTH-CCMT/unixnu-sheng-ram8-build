@@ -8,7 +8,7 @@ import sys
 import tempfile
 
 source = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).resolve().parents[1] / 'NativeLegacyDisplay.cpp'
-text = source.read_text()
+text = source.read_text(encoding='utf-8')
 adreno = Path(sys.argv[2]) if len(sys.argv) > 2 else source.parents[1] / 'Adreno740'
 gpu_methods = []
 if adreno.is_dir():
@@ -18,7 +18,7 @@ if adreno.is_dir():
         ('NativeAdrenoSubmit.cpp', 'bool NativeAdrenoSubmit::fenceProgress(', 'bool NativeAdrenoSubmit::fencePending('),
         ('NativeAdrenoPublish.cpp', 'extern "C" IOReturn native_adreno_scanout_wait(', '/* Publishes the service'),
     ):
-        body = (adreno / filename).read_text()
+        body = (adreno / filename).read_text(encoding='utf-8')
         if first not in body:
             if len(sys.argv) > 2:
                 sys.exit(f'Expected D candidate methods in {adreno / filename}')
@@ -35,6 +35,8 @@ diagnostics = (
     fragment('// The boot-log writer enables', 'extern "C" void native_legacy_gpu_fallback_observed')
 )
 blank = fragment('        if(!accepted && reason==2 && !surface', '        if(accepted && !addValidated')
+cpu_read = fragment('    struct CpuReadMapping {', '    void *shadow=')
+half_conversion = fragment('static uint64_t visibleRowSpan(', '#if defined(NATIVE_LEGACY_MACOS)')
 held_swap = fragment('    struct SwapInfo {', "    // The client's async result").replace(' override', '')
 methods = []
 # The cancellation method ends at its closing brace: it answers differently on macOS inside its own conditional block.
@@ -44,7 +46,7 @@ for start, end, keep in [('    bool isValidated(', '    uint64_t traceRequestIds
                          ('    static void sortScanoutPages(', '    int directSlot(', ''),
                          ('    bool gpuWrote(', '    static void fenceFired(', ''),
                          ('    void fenceTick()', '    static void latchFired(', ''),
-                         ('    void latchTick()', '    // Back to the boot loader', ''),
+                         ('    void latchTick()', '    bool vsyncWanted()', ''),
                          ('    void startTransferEvents()', '    void forgetDirectDisplay()', ''),
                          ('    void finishGpuSwap(', '    // Hands the pending head', ''),
                          ('    void clearRetirement()', '#if defined(NATIVE_LEGACY_CANCEL_SWAPS)', ''),
@@ -71,7 +73,24 @@ struct OSObject {
     void retain() {assert(holds);++holds;}
     void release() {assert(holds>1);--holds;}
 };
-struct IOMemoryDescriptor {};
+enum {kIOMapAnywhere=1,kIOMapReadOnly=2,kIOMapCopybackCache=4};
+struct IOMemoryMap : OSObject {
+    uintptr_t address=1;
+    uintptr_t getVirtualAddress() const {return address;}
+};
+struct IOMemoryDescriptor : OSObject {
+    IOMemoryMap mapping;
+    unsigned maps=0,completes=0;
+    bool mapFails=false;
+    IOMemoryMap *map(unsigned flags) {
+        assert(flags==(kIOMapAnywhere|kIOMapReadOnly|kIOMapCopybackCache));
+        ++maps;
+        if(mapFails)return nullptr;
+        mapping.retain();
+        return &mapping;
+    }
+    void complete() {++completes;}
+};
 using IOLock=std::mutex;
 static IOLock *IOLockAlloc() {return new IOLock;}
 static void IOLockFree(IOLock *lock) {delete lock;}
@@ -84,7 +103,6 @@ volatile uint32_t native_legacy_surfaces[14];
 static bool takeGpuOffer=true;
 static bool native_legacy_gpu_offer(void *,IOMemoryDescriptor *,uint64_t,unsigned,unsigned,unsigned) {return takeGpuOffer;}
 static unsigned completedCopies,failedCopies;
-static uint64_t native_legacy_early_failures;
 static void native_legacy_transfer_observed(int status,const void *,uint64_t) {assert(!status);++completedCopies;}
 static void native_legacy_gpu_fallback_observed(int status) {assert(status);++failedCopies;}
 static uint32_t resetEpoch=1;
@@ -183,8 +201,9 @@ struct Display : OSObject {
     uint64_t traceRequestIds[8]={},validatedAt[8]={};
     unsigned directMaps=0,retirements=0;
     bool rekick=false,resetDuringMap=false;
-    struct Slot {unsigned pageCount;};
-    Slot directSlots[3]{};
+    struct DirectSlot {unsigned pageCount;OSObject *surface;IOMemoryDescriptor *memory;};
+    static constexpr unsigned kDirectSlots=4;
+    DirectSlot directSlots[kDirectSlots]{};
     const uint64_t *mappedPages=nullptr;
     const uint64_t *scanoutPages(unsigned) const {return mappedPages;}
     bool retireSwap(const OriginalLegacySwapRequest *request,bool force) {
@@ -200,7 +219,7 @@ struct Display : OSObject {
         return 2;
     }
     uint64_t fenceSince=0;
-    bool fenceCaptured=false,fenceSlow=false,traceGpuComplete=false,gpuRetired=false,transferred=false,scanoutCaptured=false;
+    bool fenceCaptured=false,fenceSlow=false,traceGpuComplete=false,transferred=false,scanoutCaptured=false;
     Timer timer;
     Timer *fenceTimer=&timer;
     Timer latch;
@@ -210,7 +229,12 @@ struct Display : OSObject {
     bool latchTimedOut=false;
     int shownSlot=-1,pendingSlot=-1;
     uint32_t mdp[1]={};
-    static constexpr uint32_t kCtlFlush=0;
+    static constexpr uint32_t kCtlFlush=0,kBootIova=1,kBootStride=2;
+    bool directOn=true,directBoot=true;
+    void flip(uint32_t iova,uint32_t stride) {
+        assert(iova==kBootIova && stride==kBootStride);
+        mdp[kCtlFlush/4]=3;
+    }
     unsigned kicks=0,finished=0;
     void (*kickBody)(Display &)=nullptr;
     void kickSwapQueue() {++kicks;if(kickBody)kickBody(*this);}
@@ -219,7 +243,103 @@ struct Display : OSObject {
     void stat(unsigned) {}
     void note(unsigned event,int,const OriginalLegacySwapRequest *) {if(event==2)++waits;if(event==3)++passed;}
 #include "methods.inc"
+#include "cpu-read.inc"
 };
+static uint8_t halfColors[32768];
+static const uint8_t *halfTable() {return halfColors;}
+#include "half-conversion.inc"
+static void testCpuHalfRows() {
+    for(unsigned i=0;i<sizeof(halfColors);++i)halfColors[i]=uint8_t(i%251);
+    const uint16_t pixels[3][4]={{0,0x3c00,0x7c00,0x0400},{0xffff,0x7e00,0x8000,0},
+                                 {0x0001,0x7bff,0x4000,0xffff}};
+    uint32_t expected[3]{};
+    for(unsigned x=0;x<3;++x) {
+        expected[x]=0xff000000u;
+        for(unsigned channel=0;channel<3;++channel) {
+            const uint16_t component=pixels[x][channel];
+            if(component<32768)expected[x]|=uint32_t(halfColors[component])<<(16-8*channel);
+        }
+    }
+    uint8_t source[58]{};
+    std::memcpy(source+1,pixels,sizeof(pixels));
+    std::memcpy(source+30,pixels,sizeof(pixels));
+    alignas(8) uint8_t output[48];
+    for(unsigned stride : {16u,20u}) {
+        std::memset(output,0x5a,sizeof(output));
+        assert(convertHalfRows(output,sizeof(output),stride,source+1,sizeof(source)-1,29,3,2));
+        assert(!std::memcmp(output,expected,sizeof(expected)));
+        assert(!std::memcmp(output+stride,expected,sizeof(expected)));
+        for(unsigned x=12;x<stride;++x)assert(output[x]==0x5a && output[stride+x]==0x5a);
+        assert(!convertHalfRows(output+1,sizeof(output)-1,stride,source+1,sizeof(source)-1,29,3,2));
+        assert(!convertHalfRows(output,stride+11,stride,source+1,sizeof(source)-1,29,3,2));
+    }
+    std::puts("PASS: half-float paired stores match scalar pixels, preserve row padding and enforce alignment");
+}
+static void testCpuReadMappings() {
+    Display display;
+    OSObject surfaces[5];
+    IOMemoryDescriptor memories[5];
+    auto *first=display.mapCpuReadSurface(&surfaces[0],&memories[0]);
+    assert(first && first->holds==3 && surfaces[0].holds==2 && memories[0].holds==2);
+    first->release();
+    for(unsigned k=0;k<100;++k) {
+        auto *map=display.mapCpuReadSurface(&surfaces[0],&memories[0]);
+        assert(map==first);
+        map->release();
+    }
+    assert(memories[0].maps==1);
+    // A replaced descriptor for the same surface must be mapped separately.
+    auto *replacement=display.mapCpuReadSurface(&surfaces[0],&memories[1]);
+    assert(replacement && replacement!=first);
+    replacement->release();
+    for(unsigned k=2;k<5;++k)display.mapCpuReadSurface(&surfaces[k],&memories[k])->release();
+    assert(memories[0].holds==1 && first->holds==1);
+    memories[0].mapFails=true;
+    assert(!display.mapCpuReadSurface(&surfaces[0],&memories[0]));
+    memories[0].mapFails=false;
+    display.mapCpuReadSurface(&surfaces[0],&memories[0])->release();
+    assert(memories[0].maps==3);
+    display.releaseCpuReadMappings();
+    display.releaseCpuReadMappings();
+    for(unsigned k=0;k<5;++k)assert(surfaces[k].holds==1 && memories[k].holds==1 && memories[k].mapping.holds==1);
+
+    assert(visibleRowSpan(4096,256,200,4)==968);
+    assert(visibleRowSpan(967,256,200,4)==0);
+    assert(visibleRowSpan(4096,256,400,4)==0);
+    assert(visibleRowSpan(UINT64_MAX,UINT64_MAX,8,2)==0);
+    assert(visibleRowSpan(4096,0,0,8)==0);
+    std::puts("PASS: CPU fallback reuses matching mappings and flushes only a checked visible span");
+}
+static void testBootScanoutLifetime() {
+    Display display;
+    display.directBoot=false;
+    display.shownSlot=1;
+    display.directToBoot();
+    assert(display.directBoot && display.shownSlot==1);
+    display.clearBootScanoutSlot();
+    assert(display.shownSlot==1);
+    display.mdp[0]=0;
+    display.clearBootScanoutSlot();
+    assert(display.shownSlot==-1);
+
+    OSObject surfaces[4];
+    IOMemoryDescriptor memories[4];
+    for(unsigned i=0;i<4;++i) {
+        surfaces[i].retain();
+        memories[i].retain();
+        display.directSlots[i]={0,&surfaces[i],&memories[i]};
+    }
+    display.shownSlot=0;
+    display.pendingSlot=1;
+    display.releaseStoppedDirectSlots(false);
+    for(unsigned i=0;i<4;++i) {
+        assert(surfaces[i].holds==(i<2?2u:1u));
+        assert(memories[i].holds==(i<2?2u:1u) && memories[i].completes==(i<2?0u:1u));
+    }
+    display.releaseStoppedDirectSlots(true);
+    for(unsigned i=0;i<4;++i)assert(surfaces[i].holds==1 && memories[i].holds==1 && memories[i].completes==1);
+    std::puts("PASS: boot flip and shutdown pin only slots the DPU may still scan");
+}
 static void query(bool known,uint32_t submitted=0,uint32_t retired=0,uint32_t reason=2) {
     queryKnown=known;querySubmitted=submitted;queryRetired=retired;queryReason=reason;
 }
@@ -265,7 +385,7 @@ struct NativeAdrenoSubmit {
     NativeAdrenoVm *vm_;
     bool attached_=true,poisoned_=false,multi=true;
     unsigned table_mode_=2,ring_count_=2;
-    uint32_t fence_issued_=0,failed=0;
+    uint32_t fence_issued_=0,retired_dual_through_=0,failed=0;
     bool preemption() const {return multi;}
     Ring *ring(unsigned index) {return &rings[index];}
     bool failedFence(uint32_t fence) const {return fence==failed;}
@@ -302,6 +422,18 @@ static void stress() {
     queryDetail=actualPrefix;
     queryEpoch=epoch;
     resetEpoch=101;
+    gpu.rings[0]={1,UINT32_MAX};
+    gpu.fence_issued_=UINT32_MAX;
+    gpu.jobs_={{true,UINT32_MAX,0,&front,front.unmapped}};
+    uint32_t submitted=0,retired=0;
+    assert(gpu.fenceProgress(&submitted,&retired,nullptr) && submitted==UINT32_MAX &&
+           retired==UINT32_MAX-1);
+    const uint32_t maxTargets[]={UINT32_MAX,0};
+    uint32_t completed[2]{};
+    assert(gpu.scanoutProgress(maxTargets,completed)==kIOReturnTimeout);
+    gpu.rings[0].done=UINT32_MAX;
+    assert(gpu.scanoutProgress(maxTargets,completed)==kIOReturnSuccess);
+    assert(gpu.fenceProgress(&submitted,&retired,nullptr) && retired==UINT32_MAX);
     auto submit=[&](uint32_t first,uint32_t second) {
         gpu.rings[0]={first-1,first};
         gpu.rings[1]={second-1,second};
@@ -807,6 +939,9 @@ static void testHeldSwapNotices() {
     std::puts("PASS: held swap notifications drain oldest first, record overflow and discard old-connection entries at stop");
 }
 int main() {
+    testCpuReadMappings();
+    testCpuHalfRows();
+    testBootScanoutLifetime();
     testHeldSwapNotices();
     testSwapRing();
     testSurfaceSamples();
@@ -848,18 +983,19 @@ int main() {
     query(true,140,139);assert(!d.gpuWrote(&a));
     query(false,0,0,1);assert(!d.gpuWrote(&b) && !d.fenceCaptured && !d.fenceTarget && !d.fenceSlow);
     query(true,150,149);assert(!d.gpuWrote(&b) && d.fenceTarget==150);
-    d.validated[0]=&b;d.gpuRequest=&b;d.transferred=true;d.gpuRetired=true;
+    d.validated[0]=&b;d.gpuRequest=&b;d.transferred=true;
     assert(d.cancelSwapsAfterTimeout() && !d.timer.delay && !d.fenceFor && !d.fenceCaptured);
-    assert(!d.validated[0] && !d.gpuRequest && !d.transferred && !d.gpuRetired && !d.traceGpuComplete);
+    assert(!d.validated[0] && !d.gpuRequest && !d.transferred && !d.traceGpuComplete);
     // The family may reuse the cancelled request address.
     query(true,160,159);assert(!d.gpuWrote(&b) && d.fenceTarget==160);
     query(true,161,160);assert(d.gpuWrote(&b));
 
-    // Completion comparison retains the GPU's wrapping 32-bit fence semantics.
-    query(true,UINT32_MAX,UINT32_MAX-1);assert(!d.gpuWrote(&a));
-    query(true,0,0);assert(d.gpuWrote(&a));
-    query(true,0,UINT32_MAX);assert(!d.gpuWrote(&b));
-    query(true,1,0);assert(d.gpuWrote(&b));
+    // IDs never wrap in one GPU lifetime. A lower completion cannot satisfy a high target.
+    query(true,UINT32_MAX,1);assert(!d.gpuWrote(&a));
+    query(true,UINT32_MAX,0x80000000);assert(!d.gpuWrote(&a));
+    query(true,UINT32_MAX,UINT32_MAX);assert(d.gpuWrote(&a));
+    query(true,0x80000000,0x7fffffff);assert(!d.gpuWrote(&b));
+    query(true,0x80000000,0x80000000);assert(d.gpuWrote(&b));
 
     // Legacy providers also defer failed queries. CPU-only builds keep their path.
     queryDetail=nullptr;
@@ -923,6 +1059,8 @@ with tempfile.TemporaryDirectory(prefix='gop-fence-wait-') as directory:
     (root / 'diagnostics.inc').write_text(diagnostics)
     (root / 'blank.inc').write_text(blank)
     (root / 'held-swap.inc').write_text(held_swap)
+    (root / 'cpu-read.inc').write_text(cpu_read)
+    (root / 'half-conversion.inc').write_text(half_conversion)
     (root / 'test.cpp').write_text(harness)
     subprocess.run([os.environ.get('CXX', 'c++'), '-std=c++17', '-Wall', '-Wextra', '-Werror',
                     f'-DTEST_ADRENO={int(bool(gpu_methods))}',

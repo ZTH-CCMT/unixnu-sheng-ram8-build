@@ -33,14 +33,15 @@ struct NativeAdrenoRingCache {
     void *cookie;
     /* Publish CPU-initialized ring or fence bytes before device access. */
     int (*publish)(void *,const volatile uint32_t *words,size_t bytes);
-    /* Invalidate the fence page before the CPU reads CP-written values. */
+    /* Make all cache lines overlapping the given byte range visible before CPU reads. */
     int (*acquire)(void *,volatile uint32_t *words,size_t bytes);
 };
 struct NativeAdrenoRingClock {
     void *cookie;
     uint64_t (*now_us)(void *);
-    /* Optional; may sleep. Never used before a successful submit. */
+    /* Optional pause between polls. May sleep when the caller permits it. */
     int (*idle)(void *)=nullptr;
+    bool waitForPoll(uint64_t start_us,uint32_t timeout_us) const;
 };
 enum NativeAdrenoRingFence {
     NativeAdrenoRingFenceComplete = 0,

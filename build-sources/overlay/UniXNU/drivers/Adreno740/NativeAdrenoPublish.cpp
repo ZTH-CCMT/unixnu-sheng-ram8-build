@@ -1003,8 +1003,12 @@ IOReturn AGXDeviceUserClient::run(uint32_t method,const void *input,size_t input
         r.entered=entered;r.us=microseconds(entered,mach_absolute_time());r.lock_us=microseconds(0,lockClock[LockWaited]);
         r.method=uint16_t(method);r.held16=uint16_t(held>0xffff?0xffff:held);r.pid=proc_selfpid();
         r.status=uint32_t(status);
-        r.kib=method==NativeAdrenoMethodBoAlloc && input && input_size==sizeof(NativeAdrenoAbiBoAlloc)?
-            uint32_t(static_cast<const NativeAdrenoAbiBoAlloc *>(input)->bytes>>10):0;
+        r.kib=0;
+        if(method==NativeAdrenoMethodBoAlloc && input && input_size==sizeof(NativeAdrenoAbiBoAlloc)) {
+            NativeAdrenoAbiBoAlloc request{};
+            memcpy(&request,input,sizeof(request));
+            r.kib=uint32_t(request.bytes>>10);
+        }
     }
     return status;
 }
@@ -1030,10 +1034,11 @@ IOReturn AGXDeviceUserClient::runTimed(uint32_t method,const void *input,size_t 
 {
     if(method==NativeGpuTraceMethod) {
         if(!input || input_size!=sizeof(NativeGpuTraceRecord) || output_size)return kIOReturnBadArgument;
-        const auto *record=static_cast<const NativeGpuTraceRecord *>(input);
-        if(record->event!=GpuTraceThread && record->event!=GpuTraceProblem && record->event!=GpuTraceTurnipPass &&
-           record->event!=GpuTraceTurnipGmemSide && record->event!=GpuTraceTurnipAttachment)return kIOReturnBadArgument;
-        native_gpu_trace_record(record->event,proc_selfpid(),record->value,12);
+        NativeGpuTraceRecord record{};
+        memcpy(&record,input,sizeof(record));
+        if(record.event!=GpuTraceThread && record.event!=GpuTraceProblem && record.event!=GpuTraceTurnipPass &&
+           record.event!=GpuTraceTurnipGmemSide && record.event!=GpuTraceTurnipAttachment)return kIOReturnBadArgument;
+        native_gpu_trace_record(record.event,proc_selfpid(),record.value,12);
         return kIOReturnSuccess;
     }
 
@@ -1117,7 +1122,11 @@ IOReturn AGXDeviceUserClient::action(OSObject *target,void *,IOExternalMethodArg
 IOReturn AGXDeviceUserClient::externalMethod(uint32_t selector,IOExternalMethodArguments *arguments,
     IOExternalMethodDispatch *,OSObject *target,void *reference)
 {
-    if(selector==NativeGpuTraceMethod && arguments)
+    if(!arguments || arguments->scalarInputCount || arguments->scalarOutputCount ||
+        arguments->structureInputDescriptor || arguments->structureOutputDescriptor || arguments->asyncWakePort ||
+        (arguments->structureInputSize && !arguments->structureInput) ||
+        (arguments->structureOutputSize && !arguments->structureOutput))return kIOReturnBadArgument;
+    if(selector==NativeGpuTraceMethod)
         return run(selector,arguments->structureInput,arguments->structureInputSize,
                    arguments->structureOutput,arguments->structureOutputSize);
     /* One entry per ABI method; sizes are the exact wire records. */
@@ -1140,29 +1149,40 @@ IOReturn AGXDeviceUserClient::externalMethod(uint32_t selector,IOExternalMethodA
         {&action,0,sizeof(NativeAdrenoAbiBoImport),0,sizeof(NativeAdrenoAbiBoAllocReply)},
         {&action,0,sizeof(NativeAdrenoAbiPriority),0,0},
         {&action,0,sizeof(NativeAdrenoAbiNote),0,0}};
+    constexpr size_t wireMethods=sizeof(table)/sizeof(table[0]);
+    static_assert(wireMethods==NativeAdrenoMethodNote,"Adreno method table must match the wire ABI");
     native_adreno_metal_diag.ext_entries=native_adreno_metal_diag.ext_entries+1;
     if(selector<256)native_adreno_metal_diag.sel_bits[selector>>5]|=1u<<(selector&31);
     /* Tunnel. The sandbox resolves a filter policy for this class at open time and then admits only the selectors its profile lists,
      * so which selector numbers reach this object is decided outside the driver. A tunnel call carries the real ABI method in its
      * first eight bytes and may use ANY admitted selector: {magic, method, payload...} in, the method's exact output out. Method
      * 0xffffffff is a probe that only proves the selector was admitted. */
-    if(arguments && arguments->structureInput && arguments->structureInputSize>=8 &&
-        static_cast<const uint32_t *>(arguments->structureInput)[0]==NativeAdrenoTunnelMagic) {
-        const uint32_t *header=static_cast<const uint32_t *>(arguments->structureInput);
-        if(header[1]==0xffffffffu) {
+    uint32_t header[2]={};
+    if(arguments->structureInputSize>=sizeof(header))memcpy(header,arguments->structureInput,sizeof(header));
+    if(header[0]==NativeAdrenoTunnelMagic) {
+        const uint32_t method=header[1];
+        const size_t inputBytes=arguments->structureInputSize-sizeof(header);
+        const size_t outputBytes=arguments->structureOutputSize;
+        if(method==0xffffffffu) {
+            if(inputBytes || outputBytes)return kIOReturnBadArgument;
             native_adreno_metal_diag.probes=native_adreno_metal_diag.probes+1;
             return kIOReturnSuccess;
         }
+        if(method && method<=wireMethods) {
+            const auto &dispatch=table[method-1];
+            if(inputBytes!=dispatch.checkStructureInputSize || outputBytes!=dispatch.checkStructureOutputSize)
+                return kIOReturnBadArgument;
+        }
         native_adreno_metal_diag.tunnel_calls=native_adreno_metal_diag.tunnel_calls+1;
-        const IOReturn tunneled=run(header[1],reinterpret_cast<const uint8_t *>(arguments->structureInput)+8,
-            arguments->structureInputSize-8,arguments->structureOutput,arguments->structureOutputSize);
+        const IOReturn tunneled=run(method,static_cast<const uint8_t *>(arguments->structureInput)+sizeof(header),
+            inputBytes,arguments->structureOutput,outputBytes);
         native_adreno_metal_diag.ext_status=uint32_t(tunneled);
         return tunneled;
     }
     native_adreno_metal_diag.ext_selector=selector;
-    native_adreno_metal_diag.ext_in=arguments?arguments->structureInputSize:0xffff;
-    native_adreno_metal_diag.ext_out=arguments?arguments->structureOutputSize:0xffff;
-    if(selector<1 || selector>sizeof(table)/sizeof(table[0])) {
+    native_adreno_metal_diag.ext_in=arguments->structureInputSize;
+    native_adreno_metal_diag.ext_out=arguments->structureOutputSize;
+    if(selector<1 || selector>wireMethods) {
         native_adreno_metal_diag.ext_status=uint32_t(kIOReturnUnsupported);
         return kIOReturnUnsupported;
     }

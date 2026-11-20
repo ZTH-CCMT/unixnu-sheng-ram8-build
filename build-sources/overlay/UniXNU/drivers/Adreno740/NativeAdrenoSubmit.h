@@ -59,7 +59,7 @@ struct NativeAdrenoRecovery {
 /* Each client's queues are one range of the shared queue space: client n owns [n << 32, (n + 1) << 32). */
 enum : uint64_t {NativeAdrenoQueueRange=UINT64_C(1)<<32};
 struct NativeAdrenoSubmitStats {
-    uint32_t submissions,completed,timeouts,poisoned_jobs,hangs,restarts;
+    uint32_t submissions,completed,timeouts,poisoned_jobs,hangs,restarts,fence_exhaustions;
     size_t references_held,references_retired,peak_jobs;
 };
 /* Kernel-side execbuf: turns validated indirect buffers into one ring
@@ -143,6 +143,8 @@ private:
     uint32_t *fence_tag_=nullptr;
     uint8_t *fence_ring_=nullptr;
     uint32_t fence_issued_=0;
+    // IDs issued by either ring before the last successful preemption disable.
+    uint32_t retired_dual_through_=0;
     // A fence at or below this per-ring boundary may have reached the CP.
     uint32_t exposed_through_[2]{};
     uint32_t switch_saved_wptr_=0,switch_saved_fence_=0;
@@ -172,6 +174,7 @@ private:
     void markPreemptDead(uint32_t reason);
     NativeAdrenoRing *ringOfFence(uint32_t fence) const;
     unsigned ringForPriority() const;
+    void startSwitch(unsigned index,bool agingGrant);
     bool completeSwitch(bool *read_error=nullptr);
     void noteSwitchTimeout(uint32_t reason);
     /* The oldest job on `index` that the ring's CP has not finished (its fence beyond what that ring last wrote); null when none. */
@@ -185,6 +188,7 @@ private:
      * two rings a wait that pauses drives the switch between them after every pause. */
     NativeAdrenoRingFence waitOnRing(NativeAdrenoRing *r,uint32_t fence,const NativeAdrenoRingClock *clock,
         uint32_t timeout_us,uint32_t *observed);
+    bool timeline_user_=false;
     NativeAdrenoSubmitStats stats_{};
     /* The CP's state for a fence that stopped advancing (native_adreno_stall); waited is the fence the timed-out wait was for. */
     IOReturn noteStall(uint32_t observed,const NativeAdrenoRingClock *clock,uint32_t waited);

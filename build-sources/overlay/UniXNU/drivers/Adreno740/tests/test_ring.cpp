@@ -11,6 +11,8 @@ struct Peer {
     std::vector<uint32_t> regs;
     std::vector<std::pair<uint32_t,uint32_t>> writes;
     unsigned read_calls=0,publish=0,acquire=0,barriers=0;
+    volatile uint32_t *last_acquired=nullptr;
+    size_t acquired_bytes=0;
     unsigned fail_write=0,fail_read=0,fail_barrier=0,fail_publish=0,fail_acquire=0;
     unsigned client_ack_after=0,arb_ack_after=0,halt_polls=0;
     uint32_t fail_clear_reg=UINT32_MAX;
@@ -52,7 +54,9 @@ static int publish(void *cookie,const volatile uint32_t *words,size_t bytes)
 }
 static int acquire(void *cookie,volatile uint32_t *words,size_t bytes)
 {
-    CHECK(cookie==&peer && words && (bytes==4096 || bytes==64));++peer.acquire;
+    CHECK(cookie==&peer && words && (bytes==4096 || bytes==64 || bytes==sizeof(*words)));++peer.acquire;
+    peer.last_acquired=words;
+    peer.acquired_bytes=bytes;
     return peer.acquire==peer.fail_acquire;
 }
 static uint64_t now(void *cookie){CHECK(cookie==&peer);return clock_us;}
@@ -324,6 +328,7 @@ int main()
         CHECK(r.submit(&word,1,&issued)==kIOReturnSuccess && issued==2);
         fence[1]=1;
         CHECK(r.observeFence(2,nullptr,0,&observed)==NativeAdrenoRingFenceTimeout && observed==1);
+        CHECK(peer.last_acquired==fence+1 && peer.acquired_bytes==sizeof(*fence));
         CHECK(r.completedFence()==1 && r.outstanding()==1 && r.detach()==kIOReturnBusy);
         fence[1]=0;
         CHECK(r.observeFence(1,nullptr,0,&observed)==NativeAdrenoRingFenceTimeout && observed==0);
@@ -331,9 +336,12 @@ int main()
         fence[1]=2;
         CHECK(r.observeFence(1,nullptr,0,&observed)==NativeAdrenoRingFenceComplete && observed==2);
         CHECK(r.completedFence()==2 && r.outstanding()==0);
+        clock_us=0;
+        CHECK(r.idle(&clock_,0)==kIOReturnTimeout && clock_us==0);
+        CHECK(r.idle(&clock_,1000)==kIOReturnTimeout && clock_us==1000);
         peer.regs[0x0806]=r.writePointer();
         CHECK(r.idle(&clock_,0)==kIOReturnSuccess && r.detach()==kIOReturnSuccess);
-        std::puts("PASS observation updates ring completion without regressing on an older sample");
+        std::puts("PASS observation acquires only the fence word, and nonzero idle waits call the pause hook");
     }
     /* Timeline stamps: the CP's always-on counter is read into the fence page before the user words and after them, and read back by fence. */
     {

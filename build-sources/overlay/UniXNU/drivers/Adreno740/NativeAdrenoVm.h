@@ -135,6 +135,7 @@ class NativeAdrenoVm final {
     IOReturn fail(ArmSmmu4KStatus);
     Mapping *find(uint64_t);
     const Mapping *find(uint64_t) const;
+    const Mapping *findIova(uint64_t iova) const;
     size_t orderBegin(unsigned upper) const {return upper?order_count_[0]:0;}
     size_t orderEnd(unsigned upper) const {return upper?order_count_[0]+order_count_[1]:order_count_[0];}
     /* The first mapping of the region whose last byte is at or past iova (orderEnd when none). */

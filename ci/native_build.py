@@ -21,8 +21,7 @@ DUMMY_CHIP = '13579bdf'
 RAM_BYTES = 8 * 1024**3
 DATA_BYTES = 215 * 1024**3
 VERSION = 'V6.3'
-GPU_SOURCE_SHA = 'f0844784f63017995861fb9554986ad613bcd43092e3b5b4dd1e85d804c29040'
-GPU_BOARD_SHA = {'GpuPowerProbe.cpp': 'fd964d7b7f771daa22c41b4c7cbcfd82d80489ef5b2383f2b896a876a8c9d97b', 'GpuSqeCapture.h': '0aaa5455e3f992ce53a8d61b1e5cf0bb04834e1e39ca4c6ba74f04ffcdd3f8c4', 'BootLog.c': 'fd1f3e05ebfdf331f3dcbe5cfe8f68d19eeef394a74dbf0f50ed179362859dad'}
+GPU_BOARD_SOURCES = ('GpuPowerProbe.cpp', 'GpuSqeCapture.h', 'BootLog.c')
 TURNIP_KMD = 'src/freedreno/vulkan/tu_knl_darwin.cc'
 TURNIP_KMD_SHA = 'ef48eb2ee59b19c362592b5e3eea6c5453f00dde227b14b0ccfc03123cdb2ec6'
 SEED_SHA = 'e1bfa6971ef9fe6a27b53474c509cd518325459484230daf7f679642a04323b3'
@@ -54,6 +53,33 @@ def digest(path):
 
 def json_file(path):
     return json.loads(path.read_text())
+
+
+def gpu_source_identity(core):
+    # Match device/scripts/build-adreno740-kits.py in the pinned device checkout.
+    identity = hashlib.sha256()
+    sources = sorted((core / 'drivers/Adreno740').glob('Native*'), key=lambda path: path.name)
+    sources = [path for path in sources if path.is_file()]
+    require(sources, 'No materialized Adreno driver sources')
+    for source in sources:
+        identity.update(source.name.encode())
+        identity.update(source.read_bytes())
+    return identity.hexdigest()
+
+
+def check_gpu_board_sources(board, expected):
+    for name, source_sha in expected.items():
+        require(digest(board / name) == source_sha, f'GPU board source differs: {board / name}')
+
+
+def gpu_candidate_sources(core, device, receipt):
+    lock_path = Path(__file__).resolve().parents[1] / 'build-sources/manifest.json'
+    require(receipt['status'] == 'verified' and receipt['source_lock_sha256'] == digest(lock_path),
+            'Source staging receipt does not match the current build source lock')
+    files = json_file(lock_path)['files']
+    board_source_sha = {name: files[f'device/package/{name}']['sha256'] for name in GPU_BOARD_SOURCES}
+    check_gpu_board_sources(device / 'package', board_source_sha)
+    return gpu_source_identity(core), board_source_sha
 
 
 def run(*args, **kwargs):
@@ -160,10 +186,8 @@ def object_symbol(obj, symbol):
     return lines[0]
 
 
-def gpu_evidence_objects(tree):
-    board = tree / 'kits/sheng'
-    for name, expected in GPU_BOARD_SHA.items():
-        require(digest(board / name) == expected, f'GPU board source differs: {name}')
+def gpu_evidence_objects(tree, board_source_sha):
+    check_gpu_board_sources(tree / 'kits/sheng', board_source_sha)
 
     adreno = tree / 'build/adreno740'
     submit = adreno / 'NativeAdrenoSubmit.o'
@@ -183,7 +207,7 @@ def gpu_evidence_objects(tree):
     bootlog_meta = archived_object(storage / 'libShengSourceStorage.a', bootlog)
     call = object_symbol(bootlog, rf'\s{GPU_EVIDENCE_SYMBOL}$')
     require('(undefined)' in call, 'BootLog does not reference the Adreno evidence copy')
-    return {'board_source_sha256': GPU_BOARD_SHA,
+    return {'board_source_sha256': board_source_sha,
             'NativeAdrenoSubmit.o': dict(submit_meta, symbol=definition),
             'GpuPowerProbe.o': dict(probe_meta, symbol=callback),
             'BootLog.o': dict(bootlog_meta, symbol=call)}
@@ -277,7 +301,9 @@ def main():
     print('Native iPadOS XNU optimization: -Os', flush=True)
     env.pop('UNIXNU_WIFI_JOIN', None)
     receipt = top / 'materialized-sources.json'
-    require(json_file(receipt)['seed_sha256'] == SEED_SHA, 'Source staging seed identity differs')
+    source_receipt = json_file(receipt)
+    require(source_receipt['seed_sha256'] == SEED_SHA, 'Source staging seed identity differs')
+    gpu_source_sha, board_source_sha = gpu_candidate_sources(core, device, source_receipt)
     print(f'Available before Wi-Fi preparation: {shutil.disk_usage(top).free / 1024**3:.1f} GiB', flush=True)
     notices = prepare_wifi(top, device, env)
     print(f'Available before native package: {shutil.disk_usage(top).free / 1024**3:.1f} GiB', flush=True)
@@ -328,8 +354,8 @@ def main():
 
     gpu_trace_path = tree / 'build/adreno740/gpu-trace-build.json'
     gpu_trace = json_file(gpu_trace_path)
-    require(gpu_trace['source_sha256'] == GPU_SOURCE_SHA
-            and gpu_trace['trace_source_id'] == GPU_SOURCE_SHA[:16]
+    require(gpu_trace['source_sha256'] == gpu_source_sha
+            and gpu_trace['trace_source_id'] == gpu_source_sha[:16]
             and gpu_trace['target'] == 'arm64e-apple-ios27.0',
             'Compiled Adreno source identity differs from the declared candidate')
     print(f'Adreno {VERSION} source ID {gpu_trace["trace_source_id"]}', flush=True)
@@ -349,7 +375,7 @@ def main():
     payload_kernel = stage / 'payload-kernel-check.macho'
     fat_readback(payload, 'Payloads/kernel.macho', payload_kernel)
     require(digest(payload_kernel) == payload_info['payload_kernel_sha256'], 'Packed kernel digest differs')
-    gpu_objects = gpu_evidence_objects(tree)
+    gpu_objects = gpu_evidence_objects(tree, board_source_sha)
     gpu_reset_address, gpu_timeout_address, gpu_evidence_address, gpu_scanout_address = gpu_diagnostic_symbols(tree, payload_kernel)
     gpu_link_path = stage / 'gpu-sqe-link-evidence.json'
     gpu_objects.update(status='VERIFIED_STRONG_PACKAGED_GPU_SQE_COPY',
@@ -408,8 +434,8 @@ def main():
         'gpu_switch_evidence_copy_symbol': gpu_evidence_address,
         'gpu_scanout_wait_symbol': gpu_scanout_address,
         'gpu_sqe_link_evidence_sha256': digest(gpu_link_path),
-        'gpu_board_source_sha256': GPU_BOARD_SHA,
-        'gpu_source_sha256': GPU_SOURCE_SHA,
+        'gpu_board_source_sha256': board_source_sha,
+        'gpu_source_sha256': gpu_source_sha,
         'gpu_trace_source_id': gpu_trace['trace_source_id'],
         'turnip_source_id': turnip['source_id'], 'turnip_kmd_sha256': TURNIP_KMD_SHA,
         'personalization_required': True, 'hardware_tested': False,

@@ -134,7 +134,9 @@ static bool readTask(uintptr_t address, void *out, size_t size) {
     vm_size_t got = 0;
     return vm_read_overwrite(mach_task_self(), address, size, (vm_address_t) out, &got) == KERN_SUCCESS && got == size;
 }
-[[maybe_unused]] static bool writeTask(uintptr_t address, const void *data, size_t size) {   // iPadOS only (24A446 QuartzCore)
+// The entire range must belong to the reported region. vm_region_64 may instead
+// return the next region when the requested address is unmapped.
+static bool taskProtection(uintptr_t address, size_t size, vm_prot_t &protection) {
     vm_address_t start = address;
     vm_size_t length = 0;
     vm_region_basic_info_data_64_t info = {};
@@ -144,8 +146,14 @@ static bool readTask(uintptr_t address, void *out, size_t size) {
         reinterpret_cast<vm_region_info_t>(&info), &count, &object);
     if (object != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), object);
     if (result != KERN_SUCCESS || start > address || address - start > length ||
-        size > length - (address - start) || !(info.protection & VM_PROT_WRITE) ||
-        (info.protection & VM_PROT_EXECUTE)) return false;
+        size > length - (address - start)) return false;
+    protection = info.protection;
+    return true;
+}
+[[maybe_unused]] static bool writeTask(uintptr_t address, const void *data, size_t size) {
+    vm_prot_t protection = 0;
+    if (!taskProtection(address, size, protection) || !(protection & VM_PROT_WRITE) ||
+        (protection & VM_PROT_EXECUTE)) return false;
     return vm_write(mach_task_self(), address, (vm_offset_t) data, (mach_msg_type_number_t) size) == KERN_SUCCESS;
 }
 #if defined(__arm64e__) && !TARGET_OS_OSX
@@ -210,20 +218,35 @@ static bool bootArgSet(const char *key) {
     return at && (at[length] == 0 || at[length] == ' ');
 }
 // `site` is the slid address of that branch in the running QuartzCore; any other word there is left alone (0x6E41).
-[[maybe_unused]] static unsigned patchFramebufferBranch(uintptr_t site) {
+[[maybe_unused]] static unsigned patchFramebufferBranch(Gpu *gpu, uintptr_t site) {
+    if (!vm_page_size || vm_page_size < sizeof(uint32_t) || site % alignof(uint32_t)) return 0x6E40;
+    const size_t pageOffset = site % vm_page_size;
+    if (pageOffset > vm_page_size - sizeof(uint32_t)) return 0x6E40;
+    const vm_address_t page = site - pageOffset;
+    vm_prot_t protection = 0;
+    if (!taskProtection(page, vm_page_size, protection) ||
+        (protection & (VM_PROT_READ | VM_PROT_EXECUTE)) != (VM_PROT_READ | VM_PROT_EXECUTE) ||
+        (protection & VM_PROT_WRITE)) return 0x6E40;
+
     uint32_t word = 0;
     if (!readTask(site, &word, sizeof word)) return 0x6E40;
     if (word == 0xd503201f) return 0x6E42;
     if (word != 0x37000608) return 0x6E41;
-    const vm_address_t page = site & ~(uintptr_t)(vm_page_size - 1);
-    if (vm_protect(mach_task_self(), page, vm_page_size, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) != KERN_SUCCESS) return 0x6E51;
+    const auto task = mach_task_self();
+    if (vm_protect(task, page, vm_page_size, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) != KERN_SUCCESS)
+        return 0x6E51;
+
     const uint32_t nop = 0xd503201f;
-    const bool wrote = vm_write(mach_task_self(), site, (vm_offset_t)&nop, sizeof nop) == KERN_SUCCESS;
-    const bool restored = vm_protect(mach_task_self(), page, vm_page_size, FALSE, VM_PROT_READ | VM_PROT_EXECUTE) == KERN_SUCCESS;
+    const bool wrote = vm_write(task, site, (vm_offset_t)&nop, sizeof nop) == KERN_SUCCESS;
+    if (vm_protect(task, page, vm_page_size, FALSE, protection) != KERN_SUCCESS &&
+        vm_protect(task, page, vm_page_size, FALSE, protection) != KERN_SUCCESS) {
+        // The render server must not run on the damaged mapping. Launchd
+        // restarts it in a new address space with the original QuartzCore.
+        gpu->mark(0x6E53);
+        _exit(1);
+    }
     sys_icache_invalidate((void *)site, sizeof nop);
-    if (!wrote) return 0x6E52;
-    if (!restored) return 0x6E53;
-    return 0x6E42;
+    return wrote ? 0x6E42 : 0x6E52;
 }
 #if defined(__arm64e__) && !TARGET_OS_OSX
 static void configureQuartzCoreFramebuffer(Gpu *gpu) {
@@ -238,7 +261,7 @@ static void configureQuartzCoreFramebuffer(Gpu *gpu) {
     const uint8_t off = 0;
     gpu->mark(writeTask(0x1e702116c + 156 + slide, &off, sizeof off) ? 0x6E03 : 0x6EF3);
     if (strcmp(getprogname(), "backboardd")) return;
-    if (bootArgSet("fb-bgra=1")) gpu->mark(patchFramebufferBranch(0x184461928 + slide));
+    if (bootArgSet("fb-bgra=1")) gpu->mark(patchFramebufferBranch(gpu, 0x184461928 + slide));
 
     pthread_t reader;
     if (pthread_create(&reader, nullptr, [](void *arg) -> void * {
@@ -871,6 +894,20 @@ static uint64_t hostTicks(double seconds) {
     if (!base.denom) mach_timebase_info(&base);
     return (uint64_t)(seconds * 1e9 * base.denom / base.numer);
 }
+// Match the call shapes used by the replacements before reading either IMP.
+static bool freeWakeupABI(Method wake, Method begin) {
+    if (!wake || !begin || method_getNumberOfArguments(wake) != 2 ||
+        method_getNumberOfArguments(begin) != 4) return false;
+    char type[16] = {};
+    method_getReturnType(wake, type, sizeof type - 1);
+    if (strcmp(type, @encode(double))) return false;
+    method_getReturnType(begin, type, sizeof type - 1);
+    if (strcmp(type, @encode(uint64_t))) return false;
+    method_getArgumentType(begin, 2, type, sizeof type - 1);
+    if (type[strspn(type, "rnNoORV")] != '^') return false;
+    method_getArgumentType(begin, 3, type, sizeof type - 1);
+    return !strcmp(type, @encode(uint64_t));
+}
 __attribute__((constructor)) static void freeWakeupFromBootArgs() {
     if (strcmp(getprogname(), "WindowServer") || !publish::bootArgSet("ca-free-wakeup=1")) return;
     char args[1100] = {};
@@ -886,9 +923,11 @@ __attribute__((constructor)) static void freeWakeupFromBootArgs() {
     static SEL wakeSel = sel_registerName("nextWakeupTime"), beginSel = sel_registerName("beginExternalUpdate:usingSoftwareRenderer:");
     Method wake = display ? class_getInstanceMethod(display, wakeSel) : nullptr;
     Method begin = display ? class_getInstanceMethod(display, beginSel) : nullptr;
-    if (!wake || !begin || method_getTypeEncoding(wake)[0] != 'd' || method_getNumberOfArguments(begin) != 4) {
-        os_log(OS_LOG_DEFAULT, "NativeAdrenoMetal: free wakeup: CAWindowServerDisplay lacks %{public}s",
-               !wake ? "nextWakeupTime" : "beginExternalUpdate:usingSoftwareRenderer:");
+    if (!freeWakeupABI(wake, begin)) {
+        const char *wakeType = wake ? method_getTypeEncoding(wake) : nullptr;
+        const char *beginType = begin ? method_getTypeEncoding(begin) : nullptr;
+        os_log(OS_LOG_DEFAULT, "NativeAdrenoMetal: free wakeup unsupported ABI: nextWakeupTime=%{public}s beginExternalUpdate=%{public}s",
+               wakeType ? wakeType : "(missing)", beginType ? beginType : "(missing)");
         return;
     }
     static auto wakeGrid = reinterpret_cast<double (*)(id, SEL)>(method_getImplementation(wake));

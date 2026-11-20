@@ -54,6 +54,7 @@
 #include "NativeGpuTrace.h"
 #include "NativeGpuLatency.h"
 #include "MetalDiagnosticOrigin.h"
+#include "MetalCodeGenRequest.h"
 #include "MetalTraceQueue.h"
 #include "MetalTraceFile.h"
 
@@ -723,21 +724,31 @@ static void noteFormat(uint32_t format,bool made) {
 }
 // The system's own front end (MTLCompiler.framework, which MTLCompilerService runs for Apple's newLibraryWithSource: and stitched
 // libraries) answers a request here, in the client, with a metallib of AIR, which is then loaded as any library from data. The reply,
-// to a block called before the request returns, is a header whose u32s at 8 and 12 are its own size and that of the warnings after it,
-// then the metallib. One service per process, one request at a time.
+// observed on supported images before the request returns, is a header whose u32s at 8 and 12 are its own size and that of the
+// warnings after it, then the metallib. One service per process, one request at a time.
 typedef void (^NBCodeGenReply)(int32_t status,const void *reply,size_t length,const char *message);
 // The compiler was written for MTLCompilerService's threads and recurses deeply; here it runs on whatever thread asked, and a dispatch
 // worker's 512 KiB stack was too small for it (Aztec Ruins' shaders: a stack-protector abort inside libGPUCompilerImplLazy). A request
 // runs on a thread of its own with a 16 MiB stack, the caller waiting.
-static void *runBlock(void *block) {@autoreleasepool {((__bridge void (^)(void))block)();}return nullptr;}
+static void *runBlock(void *context) {
+ @autoreleasepool {
+  void (^body)(void)=(__bridge_transfer void (^)(void))context;
+  body();
+ }
+ return nullptr;
+}
 static void onLargeStack(void (^body)(void)) {
  pthread_attr_t attr;pthread_t thread;
  if(pthread_attr_init(&attr)){body();return;}
  const uint32_t diagnosticOrigin=tMetalOrigin;
- __attribute__((objc_precise_lifetime)) void (^scopedBody)(void)=^{NBMetalOriginScope origin(diagnosticOrigin);body();};
- const bool made=!pthread_attr_setstacksize(&attr,16u<<20) && !pthread_create(&thread,&attr,runBlock,(__bridge void *)scopedBody);
+ void *context=(__bridge_retained void *)^{NBMetalOriginScope origin(diagnosticOrigin);body();};
+ const bool made=!pthread_attr_setstacksize(&attr,16u<<20) && !pthread_create(&thread,&attr,runBlock,context);
  pthread_attr_destroy(&attr);
- if(made)pthread_join(thread,nullptr);else body();
+ if(made)pthread_join(thread,nullptr);
+ else {
+  (void)(__bridge_transfer id)context;
+  body();
+ }
 }
 // A request's reply depends only on its bytes and the compiler, so writable same-user caches share it
 // (native-metal-shaders/SHA256.reply, SHA-256 of MTLCompiler's LC_UUID, the request type and its bytes): an
@@ -833,12 +844,32 @@ static void shaderCacheWrite(NSString *path,NSData *metallib,NSString *warnings)
 // and refused.
 static char gCompilerLoaded[16]="untried";
 static std::atomic<uint32_t> gStitchMade,gStitchFailed;
-static NSData *codeGenRequest(uint32_t type,const std::vector<uint8_t> &request,NSString **warnings,NSString **failure) {
+struct NBCodeGenResult {
+ NSData *metallib=nil;
+ NSString *warnings=nil;
+ NSString *failure=nil;
+};
+
+static NBCodeGenResult decodeCodeGenReply(int32_t status,const void *reply,size_t length,const char *why) {
+ NBCodeGenResult result;
+ uint32_t header=0,warning=0;
+ const auto *bytes=static_cast<const uint8_t *>(reply);
+ if(bytes && length>=16){memcpy(&header,bytes+8,4);memcpy(&warning,bytes+12,4);}
+ if(status || header<16 || uint64_t(header)+warning>=length) {
+  result.failure=why && *why?@(why):[NSString stringWithFormat:@"the Metal compiler failed (status %d)",status];
+  return result;
+ }
+ if(warning)result.warnings=[[NSString alloc] initWithBytes:bytes+header length:warning encoding:NSUTF8StringEncoding];
+ result.metallib=[NSData dataWithBytes:bytes+header+warning length:length-header-warning];
+ return result;
+}
+
+static NSData *codeGenRequest(uint32_t type,std::vector<uint8_t> request,NSString **warnings,NSString **failure) {
  static void *service;
  static void (*build)(void *,void *,uint32_t,const void *,size_t,NBCodeGenReply);
  static unsigned char compilerUuid[16];
  static dispatch_once_t once;
- static std::mutex lock;
+ static NBMetalCodeGenGate gate;
  dispatch_once(&once,^{
   static const char kFramework[]="/System/Library/PrivateFrameworks/MTLCompiler.framework";
   // The top-level path, then the version the framework's own Current link names (macOS), then the highest version directory: iOS 27
@@ -904,29 +935,34 @@ static NSData *codeGenRequest(uint32_t type,const std::vector<uint8_t> &request,
   *warnings=keptWarnings;*failure=nil;
   return kept;
  }
- __block NSData *metallib=nil;
- __block NSString *warned=nil,*message=nil;
- __block bool called=false;
- {
-  std::lock_guard<std::mutex> guard(lock);
+ NBCodeGenResult result;
+ const bool ran=gate.run([&] {
+  // A preceding request can fill the cache while this one waits for the service.
+  NSData *reused=nil;NSString *reusedWarnings=nil;
+  if(cached && shaderCacheRead(cached,cachedName,&reused,&reusedWarnings)) {
+   gCompileCached++;
+   result.metallib=reused;
+   result.warnings=reusedWarnings;
+   return true;
+  }
+  auto exchange=std::make_shared<NBMetalCodeGenExchange<NBCodeGenResult>>(std::move(request));
   const uint64_t compileBegan=nowUs();
-  onLargeStack(^{build(service,nullptr,type,request.data(),request.size(),^(int32_t status,const void *reply,size_t length,const char *why) {
-   called=true;
-   uint32_t header=0,warning=0;
-   if(reply && length>=16){memcpy(&header,(const uint8_t *)reply+8,4);memcpy(&warning,(const uint8_t *)reply+12,4);}
-   if(status || !reply || length<16 || (uint64_t)header+warning>length) {
-    message=why && *why?@(why):[NSString stringWithFormat:@"the Metal compiler failed (status %d)",status];
-    return;
-   }
-   if(warning)warned=[[NSString alloc] initWithBytes:(const uint8_t *)reply+header length:warning encoding:NSUTF8StringEncoding];
-   metallib=[NSData dataWithBytes:(const uint8_t *)reply+header+warning length:length-header-warning];
-  });});
+  onLargeStack(^{build(service,nullptr,type,exchange->bytes.data(),exchange->bytes.size(),
+   ^(int32_t status,const void *reply,size_t length,const char *why) {
+    exchange->complete([&]{return decodeCodeGenReply(status,reply,length,why);});
+   });});
   gTimeCompile.add(compileBegan);
- }
- if(!called)message=@"the Metal compiler did not answer";
- *warnings=warned;*failure=message;
- if(!message)shaderCacheWrite(cached,metallib,warned);
- return message?nil:metallib;
+  if(!exchange->finish(result)) {
+   result.failure=@"the Metal compiler returned without its synchronous reply";
+   return false;
+  }
+  if(!result.failure)shaderCacheWrite(cached,result.metallib,result.warnings);
+  return true;
+ });
+ if(!ran)result.failure=@"the Metal compiler previously returned without its synchronous reply";
+ *warnings=result.warnings;
+ *failure=result.failure;
+ return result.failure?nil:result.metallib;
 }
 // Metal source, request 13: two little-endian u64 lengths, the source NUL-padded to a multiple of 4 bytes and the arguments
 // NUL-terminated.
@@ -943,7 +979,7 @@ static NSData *compileMetalSource(NSString *source,NSString *arguments,NSString 
  std::vector<uint8_t> request(16+sourceBytes+optionBytes,0);
  memcpy(request.data(),&sourceBytes,8);memcpy(request.data()+8,&optionBytes,8);
  memcpy(request.data()+16,text.bytes,text.length);memcpy(request.data()+16+sourceBytes,options,optionBytes);
- return codeGenRequest(13,request,warnings,failure);
+ return codeGenRequest(13,std::move(request),warnings,failure);
 }
 // The front end's arguments for a set of compile options, as Metal passes them: the language version, fast math (Metal's default),
 // invariance, size optimization and the preprocessor macros; module caches in this process's temporary directory, which a sandboxed
@@ -4914,7 +4950,7 @@ static void reportUnreadableLibrary(NSString *path) {
  // and the platform, 'arid' and the size of an archive id. None of them, as zeros.
  word(0x6e756d73 /* 'nums' */);word(0);word(0x7074666d /* 'ptfm' */);word(0);word(0x61726964 /* 'arid' */);word(0);
  NSString *warnings=nil,*failure=nil;
- NSData *metallib=codeGenRequest(14,request,&warnings,&failure);
+ NSData *metallib=codeGenRequest(14,std::move(request),&warnings,&failure);
  if(!metallib) {
   gStitchFailed++;
   NBLOG(@"native-metal: stitched library: %@",[failure substringToIndex:MIN(failure.length,(NSUInteger)300)]);

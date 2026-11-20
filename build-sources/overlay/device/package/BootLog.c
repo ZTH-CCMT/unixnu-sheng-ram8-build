@@ -117,11 +117,12 @@ extern volatile int native_gestalt_cache_status __attribute__((weak_import));
 extern volatile int native_ls_store_status __attribute__((weak_import));
 extern volatile uint64_t native_data_persist_present __attribute__((weak_import));
 // Data disk I/O (RamBlock NativeRamBlock.cpp) and the store window's commands (ShengUfs NativeUfs.cpp), in mach_absolute_time ticks.
-extern volatile uint64_t native_data_io_reads __attribute__((weak_import)), native_data_io_read_bytes __attribute__((weak_import)),
-    native_data_io_read_ticks __attribute__((weak_import)), native_data_io_writes __attribute__((weak_import)),
-    native_data_io_write_bytes __attribute__((weak_import)), native_data_io_write_ticks __attribute__((weak_import)),
-    native_data_io_gate_ticks __attribute__((weak_import)), native_data_io_max_ticks __attribute__((weak_import)),
-    native_data_flushes __attribute__((weak_import)), native_data_flush_ticks __attribute__((weak_import)),
+struct NativeDataIoStats {
+    uint64_t requests[2], bytes[2], ticks[2];
+    uint64_t gate_ticks, max_ticks;
+};
+extern void native_data_io_snapshot(struct NativeDataIoStats *) __attribute__((weak_import));
+extern volatile uint64_t native_data_flushes __attribute__((weak_import)), native_data_flush_ticks __attribute__((weak_import)),
     native_data_flush_blocks __attribute__((weak_import)), native_data_timer_flushes __attribute__((weak_import));
 extern volatile uint32_t native_data_write_back __attribute__((weak_import));
 extern volatile uint64_t native_ufs_store_rd_ops __attribute__((weak_import)), native_ufs_store_rd_ticks __attribute__((weak_import)),
@@ -215,7 +216,7 @@ extern unsigned sheng_board_clock_row(char *row, unsigned size) __attribute__((w
 extern unsigned sheng_thermal_level_row(char *row, unsigned size) __attribute__((weak_import));
 extern volatile uint32_t native_pmic_rtc[3] __attribute__((weak_import));
 extern volatile uint32_t native_pmic_rtc_offset[3] __attribute__((weak_import));
-extern volatile uint32_t native_adreno_tl_count __attribute__((weak_import));
+extern bool native_adreno_timeline_range(uint64_t *generation, uint64_t *first, uint64_t *end) __attribute__((weak_import));
 extern volatile uint32_t native_adreno_stall_log_count __attribute__((weak_import));
 extern bool native_adreno_stall_pointers_copy(uint32_t index, uint32_t out[6]) __attribute__((weak_import));
 extern volatile uint32_t native_gpu_dcvs_log_count __attribute__((weak_import));
@@ -637,15 +638,17 @@ static size_t compose(char *out, size_t cap, uint32_t slot, unsigned now) {
     at = put(out, at, cap, "[data]", 8);
     at = put(out, at, cap, row, sizeof row);
     // Disk requests (count/MiB/ms, gate wait, longest in us), synchronize (count/ms/bitmap blocks, timer-started), store commands.
-    if (&native_data_io_reads && &native_data_write_back) {
+    if (native_data_io_snapshot && &native_data_write_back) {
+      struct NativeDataIoStats stats;
+      native_data_io_snapshot(&stats);
       uint64_t f = 0; __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(f)); if (!f) f = 19200000;
 #define BL_MS(t) ((unsigned long long)((t) * 1000ULL / f))
 #define BL_US(t) ((unsigned long long)((t) * 1000000ULL / f))
       char io[560];
       int n = snprintf(io, sizeof io, "DIO wb=%u rd=%llu/%lluM/%llums wr=%llu/%lluM/%llums gate=%llums max=%lluus fl=%llu/%llums/%llu tf=%llu",
-               native_data_write_back, (unsigned long long)native_data_io_reads, (unsigned long long)(native_data_io_read_bytes >> 20),
-               BL_MS(native_data_io_read_ticks), (unsigned long long)native_data_io_writes, (unsigned long long)(native_data_io_write_bytes >> 20),
-               BL_MS(native_data_io_write_ticks), BL_MS(native_data_io_gate_ticks), BL_US(native_data_io_max_ticks),
+               native_data_write_back, (unsigned long long)stats.requests[0], (unsigned long long)(stats.bytes[0] >> 20),
+               BL_MS(stats.ticks[0]), (unsigned long long)stats.requests[1], (unsigned long long)(stats.bytes[1] >> 20),
+               BL_MS(stats.ticks[1]), BL_MS(stats.gate_ticks), BL_US(stats.max_ticks),
                (unsigned long long)native_data_flushes, BL_MS(native_data_flush_ticks), (unsigned long long)native_data_flush_blocks,
                (unsigned long long)native_data_timer_flushes);
       if (&native_ufs_store_rd_ops && n > 0 && (size_t)n < sizeof io)
@@ -1812,9 +1815,11 @@ static size_t compose(char *out, size_t cap, uint32_t slot, unsigned now) {
   if (log_display_on && &native_legacy_swapstat && native_legacy_swapstat[0]) {
     char row[420];
     const volatile uint32_t *w = native_legacy_swapstat;
-    snprintf(row, sizeof row, "[swap stats] validated %u kicks %u refused(in flight %u not ready %u no head %u latch %u) fence waits %u copy %u blank %u flips %u latches %u retires %u slow %u longest %uus max depth %u | rings tl=%u stall=%u dcvs=%u | scanout waits deadline %u int %u other %u woken %u",
+    uint64_t timeline_count = 0;
+    if (&native_adreno_timeline_range) native_adreno_timeline_range(NULL, NULL, &timeline_count);
+    snprintf(row, sizeof row, "[swap stats] validated %u kicks %u refused(in flight %u not ready %u no head %u latch %u) fence waits %u copy %u blank %u flips %u latches %u retires %u slow %u longest %uus max depth %u | rings tl=%llu stall=%u dcvs=%u | scanout waits deadline %u int %u other %u woken %u",
              w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8], w[9], w[10], w[11], w[12], w[13], w[15],
-             &native_adreno_tl_count ? native_adreno_tl_count : 0,
+             (unsigned long long)timeline_count,
              &native_adreno_stall_log_count ? __atomic_load_n(&native_adreno_stall_log_count, __ATOMIC_RELAXED) : 0,
              &native_gpu_dcvs_log_count ? native_gpu_dcvs_log_count : 0,
              &native_gop_wait_reasons ? native_gop_wait_reasons[0] : 0, &native_gop_wait_reasons ? native_gop_wait_reasons[1] : 0,

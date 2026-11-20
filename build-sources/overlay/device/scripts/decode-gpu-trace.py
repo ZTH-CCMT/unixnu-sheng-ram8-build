@@ -74,11 +74,58 @@ RUNTIME_STAGES = {40:'memory_begin',41:'memory_pool',42:'memory_kib',43:'availab
 
 CPU_DETAIL_KINDS=dict(enumerate(('encoding','closure_release','completed_callback','buffer','texture','owner_deallocator','surface_release','function','library','compute_pipeline','render_pipeline','sampler','depth_stencil','event','fence','encoder','command_buffer','queue','heap','binary_archive','memory_owner'),1))
 FRAME_RECORD=struct.Struct('<II4Q8I')
+FRAME_SEQUENCE_MAGIC=b'NBSEQHI1'
+FRAME_SEQUENCE_HIGH=struct.Struct('<I')
+
+def iter_frontend_records(blob):
+    size=FRAME_RECORD.size
+    if not blob:
+        return
+    if len(blob)<size:
+        raise ValueError('truncated frontend stream')
+    header=FRAME_RECORD.unpack_from(blob)
+    if header[0]!=40:
+        if len(blob)%size:
+            raise ValueError('truncated frontend stream')
+        for record in FRAME_RECORD.iter_unpack(blob):
+            yield record,record[1]
+        return
+
+    _,schema,_,offered,_,event_count,meta_count,_,writer_error,event_capacity,_,layout,meta_capacity,_=header
+    if schema!=2 or layout!=54 or not 0<meta_capacity<=32768 or not 0<event_capacity<=131072 or meta_count>meta_capacity:
+        raise ValueError('unsupported frontend chain layout')
+    base=(1+meta_capacity+event_capacity)*size
+    extension=blob[base:base+len(FRAME_SEQUENCE_MAGIC)]
+    if extension and extension!=FRAME_SEQUENCE_MAGIC:
+        raise ValueError('invalid frontend sequence extension')
+    high_base=base+len(FRAME_SEQUENCE_MAGIC)
+    if extension and (len(blob)-high_base)%FRAME_SEQUENCE_HIGH.size:
+        raise ValueError('truncated frontend sequence extension')
+    if extension and len(blob)>high_base+(meta_capacity+event_capacity)*FRAME_SEQUENCE_HIGH.size:
+        raise ValueError('oversized frontend sequence extension')
+    # A failed writer can leave mismatched payload and high-word writes. A
+    # pre-extension v2 capture also cannot recover a wrapped producer number.
+    sequence_known=not writer_error if extension else offered<=1<<32
+
+    def read(slot):
+        offset=slot*size
+        if offset+size>min(len(blob),base):
+            raise ValueError(f'truncated frontend record at byte {offset}')
+        record=FRAME_RECORD.unpack_from(blob,offset)
+        high_offset=high_base+(slot-1)*FRAME_SEQUENCE_HIGH.size
+        high=FRAME_SEQUENCE_HIGH.unpack_from(blob,high_offset)[0] if extension and high_offset<len(blob) else 0
+        return record,((high<<32)|record[1]) if sequence_known else None
+
+    for index in range(meta_count):
+        yield read(1+index)
+    for index in range(max(0,event_count-event_capacity),event_count):
+        yield read(1+meta_capacity+index%event_capacity)
+
 def frontend_details(blob):
-    if len(blob)%FRAME_RECORD.size:raise ValueError('truncated frontend stream')
     rows=[]
-    for at in range(0,len(blob),FRAME_RECORD.size):
-        kind,seq,t0,t1,t2,t3,a,b,c,d,tid,cpu0,cpu1,tid2=FRAME_RECORD.unpack_from(blob,at)
+    for record,trace_sequence in iter_frontend_records(blob):
+        kind,seq,t0,t1,t2,t3,a,b,c,d,tid,cpu0,cpu1,tid2=record
+        before=len(rows)
         if kind==1:
             rows.append(dict(name='command_summary',sequence=seq,created_us=t0,committed_us=t1,scheduled_us=t2,completed_us=t3,
                              passes=a,draws=b,kpx=c,blits=d,creator_thread=tid,creator_cpu_begin=cpu0,creator_cpu_commit=cpu1,commit_thread=tid2))
@@ -96,7 +143,7 @@ def frontend_details(blob):
         elif kind==15:
             rows.append(dict(name='frontend_stage',us=t0,command=t1,commit=t2,batch=t3,phase=a,thread=b,surfaces=c,kib=d))
         elif kind==17:
-            rows.append(dict(name='cpu_detail',sequence=seq,us=t0,operation=t1,command=t2,object=t3,
+            rows.append(dict(name='cpu_detail',sequence=seq if trace_sequence is None else trace_sequence,us=t0,operation=t1,command=t2,object=t3,
                              kind=a&65535,detail_name=CPU_DETAIL_KINDS.get(a&65535,'unknown'),phase=a>>16,thread=b,function=c|(d<<32),elapsed_us=cpu0,line=cpu1))
         elif kind==18:rows.append(dict(name='cpu_detail_link',us=t0,operation=t1,parent=t2,queued_us=t3,began_us=a|(b<<32)))
         elif kind==22:rows.append(dict(name='runtime_stage_wide',us=t0,runtime=t1,stage=a,argument=b))
@@ -111,6 +158,8 @@ def frontend_details(blob):
         elif kind==19:
             raw=struct.pack('<3Q2I',t1,t2,t3,b,c)
             rows.append(dict(name='cpu_definition',key=t0,part=a,text=raw.split(b'\0')[0].decode('utf-8',errors='replace')))
+        if kind!=1 and len(rows)!=before:
+            rows[-1]['trace_sequence']=trace_sequence
     return rows
 
 GPU_COUNTER_NAMES=('cp_clocks','uche_arbiter_stall','uche_latency_cycles','uche_latency_samples',

@@ -215,7 +215,7 @@ extern "C" bool native_legacy_copy_surface_stats(uint32_t out[14]) {
     return out[0]!=0;
 }
 extern "C" void native_legacy_gpu_fallback_observed(int status);
-// Swaps retired when the GPU client took the frame (before its copy finished), and copies that then failed after such a retirement.
+// Preserve the former early-retirement counters for existing boot-log decoders.
 extern "C" {volatile uint64_t native_legacy_early_retires,native_legacy_early_failures;}
 // Swaps the family gave up on after waiting 5 s for them (cancelSwapsAfterTimeout).
 extern "C" {volatile uint64_t native_legacy_swap_timeouts;}
@@ -260,21 +260,46 @@ static uint8_t *halfTable() {
     if(!__sync_bool_compare_and_swap(&table,(uint8_t *)nullptr,made))IOFree(made,32768);
     return table;
 }
-// Rows of RGBA half floats to the scanout's BGRA rows (alpha opaque). Returns false when the table cannot be made or a row runs past either end.
+// Bytes from the start of the mapping through the last visible pixel. Bound the calculation before multiplying.
+static uint64_t visibleRowSpan(uint64_t length,uint64_t stride,uint64_t rowBytes,uint32_t height) {
+    if(!rowBytes || !height || stride<rowBytes || length<rowBytes || height-1>(length-rowBytes)/stride)return 0;
+    return stride*(height-1)+rowBytes;
+}
+
+static uint32_t halfPixelBGRA(const uint8_t *pixel,const uint8_t *table) {
+    uint64_t components;
+    __builtin_memcpy(&components,pixel,sizeof(components));
+    const uint32_t r=uint32_t(components)&0xffff,g=uint32_t(components>>16)&0xffff,b=uint32_t(components>>32)&0xffff;
+    const uint32_t red=(r&0x8000)?0:table[r],green=(g&0x8000)?0:table[g],blue=(b&0x8000)?0:table[b];
+    return 0xff000000u|(red<<16)|(green<<8)|blue;
+}
+
+// Rows of RGBA half floats to the scanout's BGRA rows (alpha opaque).
 static bool convertHalfRows(volatile void *dst,uint64_t dstLength,uint64_t dstStride,const void *src,uint64_t srcLength,uint64_t srcStride,
                             uint32_t width,uint32_t height) {
+    const uint64_t destinationSpan=visibleRowSpan(dstLength,dstStride,uint64_t(width)*4,height);
+    const uint64_t sourceSpan=visibleRowSpan(srcLength,srcStride,uint64_t(width)*8,height);
+    const uintptr_t destination=reinterpret_cast<uintptr_t>(dst),source=reinterpret_cast<uintptr_t>(src);
+    if(!destination || !source || (destination&3) || (dstStride&3) ||
+       !destinationSpan || destinationSpan>UINTPTR_MAX-destination ||
+       !sourceSpan || sourceSpan>UINTPTR_MAX-source)return false;
     const uint8_t *table=halfTable();
-    if(!table || dstStride<uint64_t(width)*4 || srcStride<uint64_t(width)*8 || !height ||
-       dstStride*(height-1)+uint64_t(width)*4>dstLength || srcStride*(height-1)+uint64_t(width)*8>srcLength)return false;
+    if(!table)return false;
+    // As in the BGRA copy, use 64-bit device stores only when every row is naturally aligned.
+    const bool wide=!((destination|dstStride)&7);
     for(uint32_t y=0;y<height;++y) {
-        const uint64_t *in=reinterpret_cast<const uint64_t *>(static_cast<const uint8_t *>(src)+srcStride*y);
+        const uint8_t *in=static_cast<const uint8_t *>(src)+srcStride*y;
         volatile uint32_t *out=reinterpret_cast<volatile uint32_t *>(static_cast<volatile uint8_t *>(dst)+dstStride*y);
-        for(uint32_t x=0;x<width;++x) {
-            const uint64_t p=in[x];
-            const uint32_t r=uint32_t(p)&0xffff,g=uint32_t(p>>16)&0xffff,b=uint32_t(p>>32)&0xffff;
-            const uint32_t rv=(r&0x8000)?0:table[r],gv=(g&0x8000)?0:table[g],bv=(b&0x8000)?0:table[b];
-            out[x]=0xff000000u|(rv<<16)|(gv<<8)|bv;
+        uint32_t x=0;
+        if(wide) {
+            volatile uint64_t *pairs=reinterpret_cast<volatile uint64_t *>(out);
+            for(;x+1<width;x+=2) {
+                const uint64_t low=halfPixelBGRA(in+uint64_t(x)*8,table);
+                const uint64_t high=halfPixelBGRA(in+uint64_t(x+1)*8,table);
+                pairs[x/2]=low|(high<<32);
+            }
         }
+        for(;x<width;++x)out[x]=halfPixelBGRA(in+uint64_t(x)*8,table);
     }
     return true;
 }
@@ -319,12 +344,47 @@ extern "C" void native_legacy_direct_snapshot(void);
 class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     OSDeclareDefaultStructors(NativeLegacyDisplay)
     IOMemoryMap *bootMapping=nullptr;
+    struct CpuReadMapping {
+        OSObject *surface;
+        IOMemoryDescriptor *memory;
+        IOMemoryMap *map;
+    };
+    static constexpr unsigned kCpuReadMappings=4;
+    CpuReadMapping cpuReadMappings[kCpuReadMappings]={};
+    unsigned nextCpuReadMapping=0;
+
+    static void releaseCpuReadMapping(CpuReadMapping &entry) {
+        OSSafeReleaseNULL(entry.map);
+        OSSafeReleaseNULL(entry.memory);
+        OSSafeReleaseNULL(entry.surface);
+    }
+    void releaseCpuReadMappings() {
+        for(auto &entry:cpuReadMappings)releaseCpuReadMapping(entry);
+    }
+    IOMemoryMap *mapCpuReadSurface(OSObject *surface,IOMemoryDescriptor *memory) {
+        for(const auto &entry:cpuReadMappings) {
+            if(entry.surface==surface && entry.memory==memory) {
+                entry.map->retain();
+                return entry.map;
+            }
+        }
+        IOMemoryMap *map=memory->map(kIOMapAnywhere|kIOMapReadOnly|kIOMapCopybackCache);
+        if(!map || !map->getVirtualAddress())return map;
+        auto &entry=cpuReadMappings[nextCpuReadMapping];
+        nextCpuReadMapping=(nextCpuReadMapping+1)%kCpuReadMappings;
+        releaseCpuReadMapping(entry);
+        surface->retain();
+        memory->retain();
+        map->retain();
+        entry={surface,memory,map};
+        return map;
+    }
     void *shadow=nullptr;uint64_t shadowBytes=0;bool shadowValid=false;
     bool primary=false;
     bool logicalPM=false;
     bool transferred=false;
     // Boot options are immutable. Initialize before startDisplay can make callbacks.
-    bool transferEnabled,earlyRetire,retireEnabled,diffEnabled,validateEnabled;
+    bool transferEnabled,retireEnabled,diffEnabled,validateEnabled;
     uint32_t halfOfferFormat;
     void loadFrameOptions() {
         const auto option=[](const char *name,unsigned fallback=0) {
@@ -333,7 +393,6 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
             return value;
         };
         transferEnabled=option("offline-legacy-transfer")==1;
-        earlyRetire=option("early-retire",1)==1;
         const bool retire=option("offline-legacy-retire")==1;
         const bool cpuPresent=option("offline-legacy-cpu-present")==1;
         retireEnabled=retire || cpuPresent;
@@ -380,7 +439,10 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
                 native_legacy_surface_allocation(surface),memory?memory->getLength():0);
         }
         uint32_t submitted=0,retired=0;uint32_t outstanding=0;
-        if(&native_adreno_fences && native_adreno_fences(&submitted,&retired)){const int32_t d=int32_t(submitted-retired);outstanding=d>0?(d>255?255:uint32_t(d)):0;}
+        if(&native_adreno_fences && native_adreno_fences(&submitted,&retired) && submitted>retired) {
+            const uint32_t pending=submitted-retired;
+            outstanding=pending>255?255:pending;
+        }
         recordLegacyTrace(nowUs(),uint64_t(event)<<56|uint64_t(slot+1)<<48|uint64_t(validatedCount()&255)<<40|
                           uint64_t(outstanding)<<24|((uintptr_t(request)>>4)&0xffffff));
     }
@@ -413,10 +475,6 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     uint64_t gpuTraceRequest=0;
     uint64_t gpuLength=0;
     bool gpuBypass=false;
-    // The swap of the frame the GPU client is copying already retired (boot-arg early-retire, default 1). Retiring the offered
-    // swap releases the frame shown before it, whose copy has finished (transferred held this one back); the offered frame itself stays
-    // in use until the next swap retires, so the compositor never writes a frame the GPU is still reading.
-    bool gpuRetired=false;
     // gpuCompletionLock serializes the producer with detaching the source. The family gate owns the frame state.
     IOLock *gpuCompletionLock=nullptr;
     IOInterruptEventSource *gpuCompletionSource=nullptr;
@@ -512,6 +570,10 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         __asm__ volatile("dsb sy" ::: "memory");
     }
     static void sortScanoutPages(uint64_t *pages,unsigned count) {
+        // Ordered physical pages need no in-place rearrangement.
+        unsigned ordered=1;
+        while(ordered<count && pages[ordered-1]<=pages[ordered])++ordered;
+        if(ordered>=count)return;
         // As in ArmSmmu4K's alias check, use a bounded heap sort without allocations.
         auto sift=[&](unsigned at,unsigned size) {
             const uint64_t value=pages[at];
@@ -534,6 +596,7 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     }
     // Map into a free slot on first use. The active and pending hardware slots retain their backing.
     int directSlot(OSObject *surface,IOMemoryDescriptor *memory) {
+        clearBootScanoutSlot();
         ++directClock;
         int pick=-1;
         for(unsigned k=0;k<kDirectSlots;++k)if(directSlots[k].surface==surface && directSlots[k].memory==memory){directSlots[k].used=directClock;return int(k);}
@@ -544,7 +607,7 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         if(pick<0)return -1;
         DirectSlot &slot=directSlots[pick];
         if(slot.surface) {
-            slot.memory->complete();OSSafeReleaseNULL(slot.memory);OSSafeReleaseNULL(slot.surface);
+            releaseDirectSlot(slot);
             native_legacy_direct[6]=native_legacy_direct[6]+1;
         }
         const IOByteCount bytes=memory->getLength();
@@ -618,7 +681,7 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
             if(known && !fenceCaptured) {
                 fenceTarget=submitted;fenceCaptured=true;
             }
-            complete=known && int32_t(retired-fenceTarget)>=0;
+            complete=known && retired>=fenceTarget;
         }
         if(discardResetSwap(request))return false;
         if(result==kIOReturnAborted) {
@@ -738,10 +801,27 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
             finishTransfer(request,true);
         } else kickSwapQueue();   // The family already cancelled this request.
     }
+    void clearBootScanoutSlot() {
+        if(directBoot && shownSlot>=0 && !(mdp[kCtlFlush/4]&0x3))shownSlot=-1;
+    }
+    void releaseDirectSlot(DirectSlot &slot) {
+        if(slot.memory)slot.memory->complete();
+        OSSafeReleaseNULL(slot.memory);
+        OSSafeReleaseNULL(slot.surface);
+        slot={};
+    }
+    void releaseStoppedDirectSlots(bool bootLatched) {
+        for(unsigned index=0;index<kDirectSlots;++index) {
+            if(!bootLatched && (int(index)==shownSlot || int(index)==pendingSlot))continue;
+            releaseDirectSlot(directSlots[index]);
+        }
+    }
     // Back to the boot loader's memory (the blank frame and the copy are drawn there).
     void directToBoot() {
         if(!directOn || directBoot)return;
-        flip(kBootIova,kBootStride);directBoot=true;shownSlot=-1;
+        flip(kBootIova,kBootStride);directBoot=true;
+        // The DPU may still scan the last surface until the register acknowledges the boot flip.
+        clearBootScanoutSlot();
         native_legacy_direct[8]=native_legacy_direct[8]+1;
     }
     bool vsyncWanted() const {
@@ -900,13 +980,14 @@ public:
             display->primary=false;
             stopSurfaceSamples(display);
             display->stopTransferEvents();
+            display->releaseCpuReadMappings();
 #if defined(NATIVE_LEGACY_MACOS) && NATIVE_LEGACY_MACOS
             display->clearHeldSwapInfo();
 #endif
-            display->transferred=false;display->gpuRequest=nullptr;display->gpuRetired=false;
+            display->transferred=false;display->gpuRequest=nullptr;
             for(unsigned i=0;i<8;++i)if(display->validated[i])display->removeValidated(display->validated[i]);
             display->directToBoot();
-            display->latchRequest=nullptr;display->pendingSlot=-1;
+            display->latchRequest=nullptr;
             display->clearFenceWait();
             if(display->fenceTimer) {
                 if(IOWorkLoop *loop=display->getWorkLoop())loop->removeEventSource(display->fenceTimer);
@@ -920,14 +1001,9 @@ public:
             // Until the boot buffer is latched, either previously programmed slot can still be scanned.
             if(display->directOn) {
                 for(unsigned polls=0;polls<100 && (display->mdp[kCtlFlush/4]&0x3);++polls)IODelay(500);
-                if(!(display->mdp[kCtlFlush/4]&0x3)) {
-                    for(auto &slot:display->directSlots) {
-                        if(slot.memory)slot.memory->complete();
-                        OSSafeReleaseNULL(slot.memory);OSSafeReleaseNULL(slot.surface);
-                        slot={};
-                    }
-                }
+                display->releaseStoppedDirectSlots(!(display->mdp[kCtlFlush/4]&0x3));
             }
+            display->pendingSlot=-1;display->shownSlot=-1;
             display->directOn=false;display->mdp=nullptr;
             OSSafeReleaseNULL(display->mdpMap);
             if(display->directPages) {
@@ -943,6 +1019,7 @@ public:
     }
     void free() override {
         forgetDirectDisplay();stopVsync();stopSurfaceSamples(this);stopTransferEvents();
+        releaseCpuReadMappings();
         if(gpuCompletionLock){IOLockFree(gpuCompletionLock);gpuCompletionLock=nullptr;}
         if(logicalPM){PMstop();logicalPM=false;}primary=false;OSSafeReleaseNULL(bootMapping);IOMobileFramebufferLegacy::free();
     }
@@ -1152,22 +1229,21 @@ public:
             // The GPU writes the scanout memory behind the CPU's back: the differential copy's picture of it is stale from now on.
             native_legacy_swap_stage(1);countFormat(half?7:6);
             shadowValid=false;gpuRequest=request;gpuTraceRequest=traceId(request);gpuLength=length;transferred=true;
-            // The compositor renders the next frame only after this swap retires, so retiring at the end of the copy serialized render and
-            // copy (int-243: about 4.4 ms render then about 3 ms copy per frame). Retire now: the presenter holds its own reference to this
-            // frame's memory, the previous frame's copy has finished (transferred held this one back), and the next swap still waits for
-            // the copy because transferred stays set until finishGpuSwap.
-            if(earlyRetire && retireSwap(request,true)) {
-                gpuRetired=true;native_legacy_early_retires=native_legacy_early_retires+1;
-            }
+            // Keep family ownership until the presenter has finished reading the source.
+            // The presenter retains the descriptor, which does not prevent a producer from reusing the surface.
             return;
         }
         // Surfaces may be write-combined (iPadOS 27 display surfaces are): reading them uncached costs seconds per frame. Read through
         // a cacheable view, after cleaning and invalidating it so lines from the previous frame are not reused.
-        IOMemoryMap *source=memory->map(kIOMapAnywhere|kIOMapReadOnly|kIOMapCopybackCache);
-        if(!source || !source->getVirtualAddress() || source->getLength()<allocation || source->getLength()>UINT32_MAX) {
+        IOMemoryMap *source=mapCpuReadSurface(surface,memory);
+        if(!source || !source->getVirtualAddress() || source->getLength()<allocation) {
             OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnNoMemory,request,0);return;
         }
-        flush_dcache64((addr64_t)source->getVirtualAddress(),(unsigned)source->getLength(),false);
+        const uint64_t span=visibleRowSpan(source->getLength(),sourceStride,uint64_t(width)*(half?8:4),height);
+        if(!span || span>UINT32_MAX) {
+            OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnBadArgument,request,0);return;
+        }
+        flush_dcache64((addr64_t)source->getVirtualAddress(),unsigned(span),false);
         if(half) {
             if(!native_legacy_prepare_scanout()) {OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;}
             uint64_t copyStart;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyStart));
@@ -1228,14 +1304,6 @@ public:
             transferred=false;kickSwapQueue();return;
         }
         gpuRequest=nullptr;
-        if(gpuRetired) {
-            // The swap retired when the client took it; its copy ending only releases the next frame. A failed copy loses this frame
-            // (the next one takes the CPU copy).
-            gpuRetired=false;
-            if(status==0)native_legacy_transfer_observed(kIOReturnSuccess,request,gpuLength);
-            else {native_legacy_early_failures=native_legacy_early_failures+1;native_legacy_gpu_fallback_observed(status);gpuBypass=true;}
-            transferred=false;kickSwapQueue();return;
-        }
         if(status==0) {
             native_legacy_transfer_observed(kIOReturnSuccess,request,gpuLength);
             finishTransfer(request,true);return;
@@ -1292,7 +1360,7 @@ public:
         for(unsigned i=0;i<8;++i)if(validated[i])removeValidated(validated[i]);
         // Keep the pending hardware slot and its timer, but release the family's request reference.
         latchRequest=nullptr;
-        gpuRequest=nullptr;gpuRetired=false;transferred=gpuCopyBusy();
+        gpuRequest=nullptr;transferred=gpuCopyBusy();
 #if defined(NATIVE_LEGACY_MACOS) && NATIVE_LEGACY_MACOS
         // macOS names this slot are_timings_enabled: disp_has_no_clients_gated reprograms the display with a dummy swap when it is
         // true. The virtual-machine display answers false, as a display with no timing generator does.

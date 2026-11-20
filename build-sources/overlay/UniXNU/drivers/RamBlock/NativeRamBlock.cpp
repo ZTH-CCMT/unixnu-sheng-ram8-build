@@ -16,6 +16,7 @@
 #include <vm/vm_kern.h>
 #include <kern/clock.h>
 #include <kern/thread_call.h>
+#include <kern/thread.h>
 #include <pexpert/pexpert.h>
 #include "SparseDisk.h"
 #include "PersistOverlay.h"
@@ -56,14 +57,51 @@ volatile uint32_t native_data_persist_state = 0, native_data_persist_header = 9,
 // time waiting for locks (the gate; in direct mode also a staging buffer, the page range of a write and a running flush), the longest
 // request; the disk's synchronize (flushes, their time, bitmap blocks written, those the
 // idle timer started). native_data_write_back: 1 when the store runs write back (a write cache, made durable by synchronize).
-volatile uint64_t native_data_io_reads = 0, native_data_io_read_bytes = 0, native_data_io_read_ticks = 0,
-                  native_data_io_writes = 0, native_data_io_write_bytes = 0, native_data_io_write_ticks = 0,
-                  native_data_io_gate_ticks = 0, native_data_io_max_ticks = 0,
-                  native_data_flushes = 0, native_data_flush_ticks = 0, native_data_flush_blocks = 0, native_data_timer_flushes = 0;
+volatile uint64_t native_data_flushes = 0, native_data_flush_ticks = 0, native_data_flush_blocks = 0, native_data_timer_flushes = 0;
 volatile uint32_t native_data_write_back = 0;
 volatile uint64_t native_data_persist_pages = 0, native_data_persist_loaded = 0, native_data_persist_writes = 0,
                   native_data_persist_syncs = 0, native_data_persist_errors = 0, native_data_persist_first_lba = 0,
                   native_data_persist_present = 0;
+}
+
+struct NativeDataIoStats {
+    uint64_t requests[2], bytes[2], ticks[2];
+    uint64_t gate_ticks, max_ticks;
+};
+
+// The DIO log merges these counters on demand. Keep unrelated I/O threads off the same cache line.
+struct alignas(128) NativeDataIoShard {
+    NativeDataIoStats stats;
+};
+static NativeDataIoShard dataIoShards[32];
+
+static void recordDataIo(bool write, uint64_t bytes, uint64_t spent, uint64_t waited)
+{
+    const uintptr_t thread = reinterpret_cast<uintptr_t>(current_thread());
+    const size_t shard = ((thread >> 7) ^ (thread >> 12) ^ (thread >> 17)) & 31;
+    auto &stats = dataIoShards[shard].stats;
+    __atomic_fetch_add(&stats.requests[write], 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&stats.bytes[write], bytes, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&stats.ticks[write], spent, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&stats.gate_ticks, waited, __ATOMIC_RELAXED);
+    for (uint64_t seen = __atomic_load_n(&stats.max_ticks, __ATOMIC_RELAXED); spent > seen &&
+         !__atomic_compare_exchange_n(&stats.max_ticks, &seen, spent, true, __ATOMIC_RELAXED, __ATOMIC_RELAXED);) {}
+}
+
+extern "C" void native_data_io_snapshot(NativeDataIoStats *out)
+{
+    *out = {};
+    for (const auto &shard : dataIoShards) {
+        const auto &stats = shard.stats;
+        for (unsigned direction = 0; direction < 2; ++direction) {
+            out->requests[direction] += __atomic_load_n(&stats.requests[direction], __ATOMIC_RELAXED);
+            out->bytes[direction] += __atomic_load_n(&stats.bytes[direction], __ATOMIC_RELAXED);
+            out->ticks[direction] += __atomic_load_n(&stats.ticks[direction], __ATOMIC_RELAXED);
+        }
+        out->gate_ticks += __atomic_load_n(&stats.gate_ticks, __ATOMIC_RELAXED);
+        const uint64_t maximum = __atomic_load_n(&stats.max_ticks, __ATOMIC_RELAXED);
+        if (maximum > out->max_ticks) out->max_ticks = maximum;
+    }
 }
 
 class NativeRamBlock : public IOBlockStorageDevice {
@@ -566,14 +604,7 @@ IOReturn NativeRamBlock::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 blo
   const uint64_t spent = mach_absolute_time() - entered;
   __atomic_fetch_add(write ? &native_ram_block_writes : &native_ram_block_reads, 1, __ATOMIC_RELAXED);
   if (result) __atomic_fetch_add(&native_ram_block_failures, 1, __ATOMIC_RELAXED);
-  if (useStore || !isBig) {
-    __atomic_fetch_add(write ? &native_data_io_writes : &native_data_io_reads, 1, __ATOMIC_RELAXED);
-    __atomic_fetch_add(write ? &native_data_io_write_bytes : &native_data_io_read_bytes, bytes, __ATOMIC_RELAXED);
-    __atomic_fetch_add(write ? &native_data_io_write_ticks : &native_data_io_read_ticks, spent, __ATOMIC_RELAXED);
-    __atomic_fetch_add(&native_data_io_gate_ticks, waited, __ATOMIC_RELAXED);
-    for (uint64_t seen = __atomic_load_n(&native_data_io_max_ticks, __ATOMIC_RELAXED); spent > seen &&
-         !__atomic_compare_exchange_n(&native_data_io_max_ticks, &seen, spent, true, __ATOMIC_RELAXED, __ATOMIC_RELAXED);) {}
-  }
+  if (useStore || !isBig) recordDataIo(write, bytes, spent, waited);
   finishIo(!useStore);
   completion->action(completion->target, completion->parameter, result, done);
   return kIOReturnSuccess;
@@ -662,6 +693,8 @@ void NativeRamBlock::stop(IOService *provider)
   if (gate) {
     IOLockLock(gate);
     __atomic_store_n(&online, false, __ATOMIC_RELEASE);
+    // Requests waiting for attach or a cache barrier now have a terminal result.
+    IOLockWakeup(gate, &storeOpening, false);
     while (inflight) IOLockSleep(gate, &inflight, THREAD_UNINT);
     IOLockUnlock(gate);
     // No request can queue another flush once the in-flight writes have returned.

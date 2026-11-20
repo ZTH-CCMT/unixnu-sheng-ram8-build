@@ -146,7 +146,11 @@ OSDefineMetaClassAndStructors (ArmCpu, IOCPU)
 // Redistributor ISENABLER0: SGIs 0..15 (only SGI 0 is used by the kernel; the others let the self-SGI probe tell which INTIDs the GIC accepts) and PPI 27.
 static const uint32_t kSgiPpiEnable = 0xffffU | (1U << 27);
 
-static const uint32_t kIpiSpiBase = 1008;   // INTIDs 1008..1015 stand for 'IPI to logical core 0..7'
+static constexpr uint32_t kIpiSpiBase = 1008;   // INTIDs 1008..1015 stand for 'IPI to logical core 0..7'
+static constexpr bool isIpiSpi (uint32_t id)
+{
+  return id >= kIpiSpiBase && id < kIpiSpiBase + ARMCPU_SMP_SLOTS;
+}
 
 static uint32_t read32 (uintptr_t base, unsigned offset)
 {
@@ -158,13 +162,23 @@ static void write32 (uintptr_t base, unsigned offset, uint32_t value)
   *reinterpret_cast<volatile uint32_t *>(base + offset) = value;
 }
 
-// Distributor side of the software IPI of logical core `core`: group 1, edge-triggered, priority 0x80, routed to affinity `aff`, enabled.
+// The boot core sets the common words before secondary CPUs and device drivers
+// can access them. A per-core read-modify-write would lose bits on concurrent starts.
+static void spiIpiConfigureGroup (uintptr_t dist)
+{
+  static_assert (kIpiSpiBase % 16 == 0 && ARMCPU_SMP_SLOTS == 8, "IPI SPIs must share the same configuration word");
+  constexpr unsigned group = 0x80 + (kIpiSpiBase / 32) * 4;
+  constexpr unsigned configuration = 0xc00 + (kIpiSpiBase / 16) * 4;
+  constexpr unsigned priority = 0x400 + (kIpiSpiBase / 4) * 4;
+  write32 (dist, group, read32 (dist, group) | (0xffU << (kIpiSpiBase % 32)));
+  write32 (dist, configuration, read32 (dist, configuration) | 0xaaaaU);
+  write32 (dist, priority, 0x80808080);
+  write32 (dist, priority + 4, 0x80808080);
+}
+
 static void spiIpiConfigure (uintptr_t dist, uint32_t core, uint64_t aff)
 {
   const uint32_t id = kIpiSpiBase + core;
-  write32 (dist, 0x80 + (id / 32) * 4, read32 (dist, 0x80 + (id / 32) * 4) | (1U << (id % 32)));
-  write32 (dist, 0xc00 + (id / 16) * 4, read32 (dist, 0xc00 + (id / 16) * 4) | (2U << ((id % 16) * 2)));
-  write32 (dist, 0x400 + (id / 4) * 4, 0x80808080);
   *reinterpret_cast<volatile uint64_t *>(dist + 0x6000 + 8ULL * id) = aff & 0xff00ffffffULL;
   __asm__ volatile ("dsb sy" ::: "memory");
   write32 (dist, 0x100 + (id / 32) * 4, 1U << (id % 32));
@@ -176,7 +190,9 @@ static void spiIpiSend (uintptr_t dist, uint32_t core)
   const uint32_t id = kIpiSpiBase + core;
   __asm__ volatile ("dsb ishst" ::: "memory");
   write32 (dist, 0x200 + (id / 32) * 4, 1U << (id % 32));
-  __asm__ volatile ("dsb sy" ::: "memory");
+  // Complete the Distributor write across the full system. Prior loads
+  // and TLB maintenance are independent of the interrupt doorbell.
+  __asm__ volatile ("dsb st" ::: "memory");
 }
 
 // The cluster type the ADT gives this core (cluster-type 'E' or 'P'), so each cluster registers as its own processor set.
@@ -474,6 +490,10 @@ bool ArmCpu::initDistributor (void)
   for (unsigned id = 32; id < interrupts && id < 1020; id += 32) {
     write32 (dist, 0x180 + id / 8, 0xffffffff);
   }
+  if (gSpiIpi) {
+    if (!waitClear (dist, 0, 1U << 31)) { return false; }
+    spiIpiConfigureGroup (dist);
+  }
   return true;
 }
 
@@ -571,9 +591,6 @@ bool ArmCpu::start (IOService *provider)
   unsigned selfIpi = 0;
   PE_parse_boot_argn ("armcpu-self-ipi", &selfIpi, sizeof (selfIpi));
   gSelfIpi = selfIpi == 1;
-  unsigned spiIpi = 0;
-  PE_parse_boot_argn ("armcpu-spi-ipi", &spiIpi, sizeof (spiIpi));
-  gSpiIpi = spiIpi == 1;
   unsigned diagnostic = 0;
   PE_parse_boot_argn("armcpu-diagnostics", &diagnostic, sizeof(diagnostic));
   diagnosePower=diagnostic==1;
@@ -614,6 +631,9 @@ bool ArmCpu::start (IOService *provider)
     uint64_t bootMpidr;
     __asm__ volatile ("mrs %0, mpidr_el1" : "=r" (bootMpidr));
     armcpu_boot_mpidr = static_cast<uint32_t> (bootMpidr);
+    unsigned spiIpi = 0;
+    PE_parse_boot_argn ("armcpu-spi-ipi", &spiIpi, sizeof (spiIpi));
+    gSpiIpi = spiIpi == 1;
     if ((!skipGic && !prepareGic ()) || !IOCPU::start (provider)) { return false; }
   }
   cpuName = OSSymbol::withCStringNoCopy ("ARM architectural boot CPU");
@@ -872,7 +892,7 @@ void ArmCpu::interrupt (void)
       armcpu_irq_phase=4;
       if (ipi_handler != nullptr) { ipi_handler (); }
       armcpu_irq_phase=5;
-    } else if (gSpiIpi && (id & 0xffffff) >= kIpiSpiBase && (id & 0xffffff) < kIpiSpiBase + 8) {
+    } else if (gSpiIpi && isIpiSpi (id & 0xffffff)) {
       __atomic_fetch_add (&armcpu_ipi_interrupts, 1, __ATOMIC_RELAXED);
       armcpu_core_sgi[logicalId & 7] = armcpu_core_sgi[logicalId & 7] + 1;
       wokenBy (core, 1);
@@ -1146,6 +1166,7 @@ static IOReturn spiAttachLocked (IOLock *lock, uint32_t intid, bool edge, void (
   if (gDist == 0 || armcpu_gic_ready == 0 || handler == nullptr) { return kIOReturnNotReady; }
   const unsigned interrupts = ((read32 (gDist, 4) & 31) + 1) * 32;
   if (intid < 32 || intid >= 1020 || intid >= interrupts) { return kIOReturnBadArgument; }
+  if (gSpiIpi && isIpiSpi (intid)) { return kIOReturnExclusiveAccess; }
   waitForSpiRegistration (lock, intid);
   uint32_t used = __atomic_load_n (&gSpiUsed, __ATOMIC_ACQUIRE);
   for (uint32_t slot = 0; slot < used; slot++) {

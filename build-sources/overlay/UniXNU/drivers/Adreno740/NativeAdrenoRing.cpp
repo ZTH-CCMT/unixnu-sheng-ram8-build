@@ -568,7 +568,7 @@ IOReturn NativeAdrenoRing::fenceValue(uint32_t *value)
 {
     if(!value)return kIOReturnBadArgument;*value=0;
     if(!attached_)return kIOReturnNotReady;
-    if(cache_.acquire(cache_.cookie,fence_,fence_bytes_))return kIOReturnIOError;
+    if(cache_.acquire(cache_.cookie,fence_+1,sizeof(*fence_)))return kIOReturnIOError;
     *value=fence_[1];
     return kIOReturnSuccess;
 }
@@ -588,6 +588,19 @@ IOReturn NativeAdrenoRing::submitUnfenced(const uint32_t *words,size_t word_coun
     next_=end;
     return kIOReturnSuccess;
 }
+bool NativeAdrenoRingClock::waitForPoll(uint64_t start_us,uint32_t timeout_us) const
+{
+    if(!now_us || !timeout_us)return false;
+    const uint64_t elapsed=now_us(cookie)-start_us;
+    if(elapsed>=timeout_us)return false;
+    if(idle)return !idle(cookie);
+    // Early bring-up cannot sleep. Poll quickly for short waits, then back off
+    // without extending the timeout merely to reach the next interval.
+    const uint32_t interval=elapsed<100?10:elapsed<1000?40:100;
+    const uint32_t remaining=timeout_us-uint32_t(elapsed);
+    IODelay(interval<remaining?interval:remaining);
+    return true;
+}
 IOReturn NativeAdrenoRing::idle(const NativeAdrenoRingClock *clock,uint32_t timeout_us)
 {
     enum : uint32_t {RbbmStatus=0x0210,GpuBusyIgnAhb=1u<<23};
@@ -602,8 +615,7 @@ IOReturn NativeAdrenoRing::idle(const NativeAdrenoRingClock *clock,uint32_t time
             if(io_.read32(io_.cookie,RbbmStatus,&status))return poison();
             if(!(status&GpuBusyIgnAhb))return kIOReturnSuccess;
         }
-        if(clock->now_us(clock->cookie)-start>=timeout_us)return kIOReturnTimeout;
-        IODelay(10);
+        if(!clock->waitForPoll(start,timeout_us))return kIOReturnTimeout;
     }
 }
 IOReturn NativeAdrenoRing::progressState(uint32_t out[6])
@@ -669,7 +681,9 @@ IOReturn NativeAdrenoRing::submitFramed(const uint32_t *words,size_t word_count,
 IOReturn NativeAdrenoRing::submitFramed(const uint32_t *words,size_t word_count,uint32_t number,uint32_t *issued)
 {
     if(!issued)return kIOReturnBadArgument;*issued=0;
-    if(!number || (int32_t)(number-seqno_)<=0)return kIOReturnBadArgument;
+    // The ring's CP wait-timestamp uses the previous BV value until the new job
+    // reaches its end. Keep a numbered jump within the forward serial half-range.
+    if(number<=seqno_ || number-seqno_>INT32_MAX)return kIOReturnBadArgument;
     return submitWords(words,word_count,number,true,current_,issued);
 }
 IOReturn NativeAdrenoRing::submitWords(const uint32_t *words,size_t word_count,uint32_t number,bool framed,bool give_wptr,uint32_t *fence)
@@ -729,17 +743,15 @@ NativeAdrenoRingFence NativeAdrenoRing::observeFence(uint32_t fence,
     if(observed)*observed=0;
     if(!attached_ || poisoned_)return NativeAdrenoRingFencePoisoned;
     if(!fence || fence>seqno_)return NativeAdrenoRingFenceArgument;
-    uint64_t start=clock && clock->now_us?clock->now_us(clock->cookie):0;
+    const uint64_t start=timeout_us && clock && clock->now_us?clock->now_us(clock->cookie):0;
     for(;;) {
-        if(cache_.acquire(cache_.cookie,fence_,fence_bytes_)) {poison();return NativeAdrenoRingFencePoisoned;}
-        const uint32_t value=fence_[1];
+        uint32_t value=0;
+        if(fenceValue(&value)) {poison();return NativeAdrenoRingFencePoisoned;}
         if(observed)*observed=value;
         if(value>seqno_) {poison();return NativeAdrenoRingFencePoisoned;}
         if(value>completed_)completed_=value;
         if(value>=fence)return NativeAdrenoRingFenceComplete;
-        if(!clock || !clock->now_us)return NativeAdrenoRingFenceTimeout;
-        if(clock->now_us(clock->cookie)-start>=timeout_us)return NativeAdrenoRingFenceTimeout;
-        if(clock->idle && clock->idle(clock->cookie))return NativeAdrenoRingFenceTimeout;
+        if(!clock || !clock->waitForPoll(start,timeout_us))return NativeAdrenoRingFenceTimeout;
     }
 }
 NativeAdrenoRingFence NativeAdrenoRing::wait(uint32_t fence,const NativeAdrenoRingClock *clock,

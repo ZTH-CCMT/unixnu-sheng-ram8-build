@@ -117,9 +117,8 @@ extern volatile uint32_t native_legacy_ring_count __attribute__((weak_import));
 extern volatile uint64_t native_legacy_snap[64][2] __attribute__((weak_import));
 extern volatile uint32_t native_legacy_snap_count __attribute__((weak_import));
 extern volatile uint32_t native_legacy_swapstat[16] __attribute__((weak_import));
-extern volatile uint64_t (*native_adreno_tl)[8] __attribute__((weak_import));
-extern volatile uint32_t native_adreno_tl_cap __attribute__((weak_import));
-extern volatile uint32_t native_adreno_tl_count __attribute__((weak_import));
+extern bool native_adreno_timeline_range(uint64_t *generation, uint64_t *first, uint64_t *end) __attribute__((weak_import));
+extern bool native_adreno_timeline_copy(uint64_t generation, uint64_t index, uint64_t out[8]) __attribute__((weak_import));
 extern volatile uint32_t native_gop_wait_ring_count __attribute__((weak_import));
 extern volatile uint64_t native_gop_wait_ring[64][3] __attribute__((weak_import));
 extern volatile uint32_t native_gop_wait_reasons[4] __attribute__((weak_import));
@@ -390,12 +389,13 @@ static void rings_build(void) {
        native_legacy_swapstat[6], native_legacy_swapstat[7], native_legacy_swapstat[8], native_legacy_swapstat[9], native_legacy_swapstat[10], native_legacy_swapstat[11],
        native_legacy_swapstat[12], native_legacy_swapstat[13], native_legacy_swapstat[14], native_legacy_swapstat[15]);
   }
-  if (&native_adreno_tl_count && &native_adreno_tl_cap && native_adreno_tl_cap) {
-    const uint32_t n = native_adreno_tl_count;
-    RT("# gpu timeline: T <fence> <buffers> <submit us> <cp start ticks> <cp end ticks> (19.2 MHz) <level at submit> <ring status 1 attached 2 stamps 4 page 8 acquired 16 read> <pid> <seen retired us> <ring> <priority+1> <gpu role> <ring the CP ran> <switch in flight> <restarts that replayed it> <replay us> (total %u; raw words, zero when the CP wrote nothing)\n", n);
-    const uint32_t cap = native_adreno_tl_cap;
-    for (uint32_t i = n > cap ? n - cap : 0; i < n; ++i) {
-      const volatile uint64_t *r = native_adreno_tl[i & (cap - 1)];
+  uint64_t timeline_generation = 0, timeline_first = 0, timeline_end = 0;
+  if (&native_adreno_timeline_range && &native_adreno_timeline_copy &&
+      native_adreno_timeline_range(&timeline_generation, &timeline_first, &timeline_end)) {
+    RT("# gpu timeline: T <fence> <buffers> <submit us> <cp start ticks> <cp end ticks> (19.2 MHz) <level at submit> <ring status 1 attached 2 stamps 4 page 8 acquired 16 read> <pid> <seen retired us> <ring> <priority+1> <gpu role> <ring the CP ran> <switch in flight> <restarts that replayed it> <replay us> (total %llu; raw words, zero when the CP wrote nothing)\n", (unsigned long long)timeline_end);
+    for (uint64_t i = timeline_first; i < timeline_end && rings_len + 192 < DiagRings; ++i) {
+      uint64_t r[8];
+      if (!native_adreno_timeline_copy(timeline_generation, i, r)) continue;
       RT("T %u %u %llu %llu %llu %u %u %d %llu %u %u %u %u %u %u %llu\n", (unsigned)(r[0] & 0xffffffffu), (unsigned)((r[0] >> 32) & 0x03ffffffu), r[1], r[2], r[3], (unsigned)(r[4] & 0xffffffffu),
          (unsigned)(r[0] >> 58), (int)(r[4] >> 32), r[5], (unsigned)(r[6] & 15), (unsigned)((r[6] >> 4) & 15), (unsigned)((r[6] >> 8) & 255),
          (unsigned)((r[6] >> 16) & 15), (unsigned)((r[6] >> 20) & 15), (unsigned)((r[6] >> 24) & 255), r[7]);

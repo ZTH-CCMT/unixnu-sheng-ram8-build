@@ -329,6 +329,16 @@ size_t NativeAdrenoVm::orderAt(unsigned upper,uint64_t iova) const
     }
     return low;
 }
+const NativeAdrenoVm::Mapping *NativeAdrenoVm::findIova(uint64_t iova) const
+{
+    for(unsigned upper=0;upper<2;++upper) {
+        const size_t at=orderAt(upper,iova);
+        if(at==orderEnd(upper))continue;
+        const Mapping &m=mappings_[order_[at]];
+        if(iova>=m.iova)return &m;
+    }
+    return nullptr;
+}
 /* A mapping whose spans the table now holds takes its place in its region's order; its spans count for their region and class. */
 void NativeAdrenoVm::insert(Mapping *record)
 {
@@ -646,26 +656,24 @@ IOReturn NativeAdrenoVm::sampleWord(uint64_t iova,uint32_t *cached,uint32_t *dra
     *cached=*dram=~0u;
     if(!attached_ || poisoned_)return kIOReturnNotReady;
     if(iova&3)return kIOReturnBadArgument;
-    for(size_t i=0;i<high_;++i) {
-        const Mapping &m=mappings_[i];
-        if(!m.memory || iova<m.iova || iova-m.iova>=m.memory->bytes())continue;
-        const size_t offset=(size_t)(iova-m.iova);
-        if(m.memory->mapping())*cached=static_cast<const volatile uint32_t *>(m.memory->mapping())[offset/4];
-        for(size_t j=0;j<m.memory->spanCount();++j) {
-            const auto &span=m.memory->spans()[j];
-            if(offset<span.offset || offset-span.offset>=span.bytes)continue;
-            uint32_t value=0;
-            /* DRAM first: the cached reader writes its line back, so read after it DRAM would always agree (int-099). */
-            if(native_adreno_dram_read32 && !native_adreno_dram_read32(span.physical+(offset-span.offset),&value))*dram=value;
-            /* A page with no cacheable alias has no cached copy that could differ: both words are what DRAM holds. */
-            if(!kernelDram(span.physical+(offset-span.offset))) {*cached=*dram;break;}
-            /* A write-combined BO's own mapping is non-cacheable: read the cacheable alias instead, so a dirty line is still seen. */
-            if(native_adreno_cached_read32 && !native_adreno_cached_read32(span.physical+(offset-span.offset),&value))*cached=value;
-            break;
-        }
-        return kIOReturnSuccess;
+    const Mapping *mapping=findIova(iova);
+    if(!mapping)return kIOReturnBadArgument;
+    const Mapping &m=*mapping;
+    const size_t offset=(size_t)(iova-m.iova);
+    if(m.memory->mapping())*cached=static_cast<const volatile uint32_t *>(m.memory->mapping())[offset/4];
+    for(size_t j=0;j<m.memory->spanCount();++j) {
+        const auto &span=m.memory->spans()[j];
+        if(offset<span.offset || offset-span.offset>=span.bytes)continue;
+        uint32_t value=0;
+        /* DRAM first: the cached reader writes its line back, so read after it DRAM would always agree (int-099). */
+        if(native_adreno_dram_read32 && !native_adreno_dram_read32(span.physical+(offset-span.offset),&value))*dram=value;
+        /* A page with no cacheable alias has no cached copy that could differ: both words are what DRAM holds. */
+        if(!kernelDram(span.physical+(offset-span.offset))) {*cached=*dram;break;}
+        /* A write-combined BO's own mapping is non-cacheable: read the cacheable alias instead, so a dirty line is still seen. */
+        if(native_adreno_cached_read32 && !native_adreno_cached_read32(span.physical+(offset-span.offset),&value))*cached=value;
+        break;
     }
-    return kIOReturnBadArgument;
+    return kIOReturnSuccess;
 }
 IOReturn NativeAdrenoVm::reassertWriteCombined(uint32_t *reset) const
 {
@@ -752,33 +760,31 @@ IOReturn NativeAdrenoVm::auditRange(uint64_t iova,size_t bytes,uint32_t *lines,u
     if(!attached_ || poisoned_)return kIOReturnNotReady;
     if(!native_adreno_line_audit)return kIOReturnUnsupported;
     if(!bytes || iova>UINT64_MAX-bytes)return kIOReturnBadArgument;
-    for(size_t i=0;i<high_;++i) {
-        const Mapping &m=mappings_[i];
-        if(!m.memory || iova<m.iova || iova-m.iova>=m.memory->bytes())continue;
-        if(!m.memory->writeCombined())return kIOReturnSuccess;   /* maintained before every submission anyway */
-        /* Whole lines; the range is clipped to its BO. */
-        size_t at=(size_t)(iova-m.iova)&~(size_t)63;
-        const size_t end=(size_t)(iova-m.iova)+bytes>m.memory->bytes()?m.memory->bytes():(size_t)(iova-m.iova)+bytes;
-        while(at<end) {
-            const NativeAdrenoPhysicalSpan *span=nullptr;
-            for(size_t j=0;j<m.memory->spanCount();++j) {
-                const auto &s=m.memory->spans()[j];
-                if(at>=s.offset && at-s.offset<s.bytes) {span=&s;break;}
-            }
-            if(!span)return kIOReturnBadArgument;
-            const uint64_t physical=span->physical+(at-span->offset);
-            size_t chunk=4096-(size_t)(physical&4095);
-            if(chunk>span->offset+span->bytes-at)chunk=span->offset+span->bytes-at;
-            if(chunk>end-at)chunk=(end-at+63)&~(size_t)63;
-            /* A page outside the kernel's DRAM (a pool BO) has no cacheable alias to compare with DRAM: nothing to audit, and no
-             * reason to end the trust in write-combined BOs. */
-            if(!kernelDram(physical)) {at+=chunk;continue;}
-            if(native_adreno_line_audit(physical,chunk,dirty,stale))return kIOReturnIOError;
-            *lines+=(uint32_t)(chunk/64);at+=chunk;
+    const Mapping *mapping=findIova(iova);
+    if(!mapping)return kIOReturnBadArgument;
+    const Mapping &m=*mapping;
+    if(!m.memory->writeCombined())return kIOReturnSuccess;   /* maintained before every submission anyway */
+    /* Whole lines; the range is clipped to its BO. */
+    size_t at=(size_t)(iova-m.iova)&~(size_t)63;
+    const size_t end=(size_t)(iova-m.iova)+bytes>m.memory->bytes()?m.memory->bytes():(size_t)(iova-m.iova)+bytes;
+    while(at<end) {
+        const NativeAdrenoPhysicalSpan *span=nullptr;
+        for(size_t j=0;j<m.memory->spanCount();++j) {
+            const auto &s=m.memory->spans()[j];
+            if(at>=s.offset && at-s.offset<s.bytes) {span=&s;break;}
         }
-        return kIOReturnSuccess;
+        if(!span)return kIOReturnBadArgument;
+        const uint64_t physical=span->physical+(at-span->offset);
+        size_t chunk=4096-(size_t)(physical&4095);
+        if(chunk>span->offset+span->bytes-at)chunk=span->offset+span->bytes-at;
+        if(chunk>end-at)chunk=(end-at+63)&~(size_t)63;
+        /* A page outside the kernel's DRAM (a pool BO) has no cacheable alias to compare with DRAM: nothing to audit, and no
+         * reason to end the trust in write-combined BOs. */
+        if(!kernelDram(physical)) {at+=chunk;continue;}
+        if(native_adreno_line_audit(physical,chunk,dirty,stale))return kIOReturnIOError;
+        *lines+=(uint32_t)(chunk/64);at+=chunk;
     }
-    return kIOReturnBadArgument;
+    return kIOReturnSuccess;
 }
 /* The DRAM word at offset of memory, through the board's uncached reader: system memory has no kernel mapping. */
 static bool dramWord(const NativeAdrenoMemory &memory,size_t offset,uint32_t *value)

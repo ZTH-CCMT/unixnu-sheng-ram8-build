@@ -17,6 +17,8 @@ extern "C" volatile uint64_t native_adreno_stall_log[32][8];
 extern "C" volatile uint32_t native_adreno_stall_log_count;
 extern "C" bool native_adreno_stall_pointers_copy(uint32_t index,uint32_t out[6]);
 extern "C" uint32_t native_adreno_ring_log_copy(uint32_t (*out)[116],uint32_t capacity);
+extern "C" bool native_adreno_timeline_range(uint64_t *generation,uint64_t *first,uint64_t *end);
+extern "C" bool native_adreno_timeline_copy(uint64_t generation,uint64_t index,uint64_t out[8]);
 
 IOReturn NativeAdrenoQueryCpu4K(NativeAdrenoCpuState *out)
 {CHECK(out);*out={};return kIOReturnSuccess;}
@@ -74,7 +76,7 @@ static int cbarrier(void *c){CHECK(c==&cp);++cp.barriers;return cp.barriers==cp.
 static int cpublish(void *c,const volatile uint32_t *w,size_t bytes)
 {CHECK(c==&cp && w && (bytes==32768 || bytes==4096));++cp.publish;return cp.publish==cp.fail_publish;}
 static int cacquire(void *c,volatile uint32_t *w,size_t bytes)
-{CHECK(c==&cp && w && bytes==4096);++cp.acquire;return cp.acquire==cp.fail_acquire;}
+{CHECK(c==&cp && w && (bytes==4096 || bytes==sizeof(*w)));++cp.acquire;return cp.acquire==cp.fail_acquire;}
 static uint64_t cnow(void *c){CHECK(c==&cp);return clock_us;}
 static int cidle(void *c){CHECK(c==&cp);clock_us+=1000;return 0;}
 struct Path {
@@ -339,6 +341,122 @@ static void testImmediateSwitchCompletion()
         CHECK(p.submit.retireCompleted()==kIOReturnSuccess && !p.submit.outstanding());
     }
     std::puts("PASS immediate STOP-clear claims completion under the submission lock");
+}
+
+static void testFenceSequenceExhaustion()
+{
+    DualRingPath p;
+    p.setup();
+    CHECK(p.ring.restart(UINT32_C(0x7ffffffe))==kIOReturnSuccess);
+    uint32_t fence=p.enqueue(0,9);
+    CHECK(fence==UINT32_C(0x7fffffff));
+    // A far-ahead unknown ID must not alias the retired end of the sequence.
+    CHECK(p.submit.wait(UINT32_MAX,&ringclock,0)==kIOReturnBadArgument);
+    CHECK(p.submit.observeFence(UINT32_MAX,&ringclock,0)==kIOReturnBadArgument);
+    fencemem[1]=fence;
+    CHECK(p.submit.retireCompleted()==kIOReturnSuccess);
+    fence=p.enqueue(0,9);
+    CHECK(fence==UINT32_C(0x80000000));
+    uint32_t submitted=0,retired=0;
+    CHECK(p.submit.fenceProgress(&submitted,&retired,nullptr));
+    CHECK(submitted==fence && retired==fence-1);
+    fencemem[1]=fence;
+    CHECK(p.submit.retireCompleted()==kIOReturnSuccess);
+    CHECK(p.ring.restart(UINT32_MAX-1)==kIOReturnSuccess);
+    fence=p.enqueue(0,9);
+    CHECK(fence==UINT32_MAX);
+    const unsigned cacheBefore=fixture.cache_calls;
+    const size_t writesBefore=cp.writes.size(),refsBefore=p.object.deviceReferences();
+    const NativeAdrenoSubmitBuffer buffer{p.handle,0x800000,4096};
+    uint32_t exhausted=1;
+    CHECK(p.submit.submit(&buffer,1,9,&exhausted)==kIOReturnNoResources && !exhausted);
+    CHECK(p.submit.stats().fence_exhaustions==1 && fixture.cache_calls==cacheBefore &&
+        cp.writes.size()==writesBefore && p.object.deviceReferences()==refsBefore);
+    CHECK(p.submit.wait(fence,&ringclock,0)==kIOReturnTimeout);
+    fencemem[1]=fence;
+    CHECK(p.submit.wait(fence,&ringclock,0)==kIOReturnSuccess);
+    CHECK(p.submit.detach()==kIOReturnSuccess);
+    std::puts("PASS monotonic GPU fences cross the sign boundary and reject reuse after UINT32_MAX");
+}
+
+static void testTimelineDetach()
+{
+    Path p;
+    native_adreno_diag=1;
+    CHECK(exposed(p)==kIOReturnSuccess);
+    NativeAdrenoSubmit second;
+    CHECK(second.attach(&p.vm,&p.ring)==kIOReturnSuccess);
+    native_adreno_diag=0;
+    uint64_t generation=0,first=1,end=1,row[8]{};
+    CHECK(native_adreno_timeline_range(&generation,&first,&end) && first==0 && end==0);
+    CHECK(!native_adreno_timeline_copy(generation,0,row));
+    const NativeAdrenoSubmitBuffer buffer{p.handle,0x800000,4096};
+    uint32_t fence=0;
+    CHECK(p.submit.submit(&buffer,1,0,&fence)==kIOReturnSuccess);
+    CHECK(p.submit.detach()==kIOReturnBusy && native_adreno_timeline_range(nullptr,nullptr,nullptr));
+    fencemem[1]=fence;
+    CHECK(p.submit.wait(fence,&ringclock,0)==kIOReturnSuccess);
+    CHECK(p.submit.detach()==kIOReturnSuccess && native_adreno_timeline_copy(generation,0,row));
+    CHECK(uint32_t(row[0])==fence);
+    CHECK(second.detach()==kIOReturnSuccess && !native_adreno_timeline_range(nullptr,nullptr,nullptr));
+    CHECK(!native_adreno_timeline_copy(generation,0,row));
+    native_adreno_diag=1;
+    CHECK(second.attach(&p.vm,&p.ring)==kIOReturnSuccess);
+    native_adreno_diag=0;
+    uint64_t newGeneration=0;
+    CHECK(native_adreno_timeline_range(&newGeneration,&first,&end) && newGeneration!=generation && first==0 && end==0);
+    CHECK(second.submit(&buffer,1,0,&fence)==kIOReturnSuccess);
+    fencemem[1]=fence;
+    CHECK(second.wait(fence,&ringclock,0)==kIOReturnSuccess);
+    CHECK(!native_adreno_timeline_copy(generation,0,row));
+    CHECK(native_adreno_timeline_copy(newGeneration,0,row) && uint32_t(row[0])==fence);
+    CHECK(second.detach()==kIOReturnSuccess && !native_adreno_timeline_range(nullptr,nullptr,nullptr));
+    std::puts("PASS job timeline is shared by active diagnostic submitters and retires with its last owner");
+}
+
+static void testDisablePreemptionRestoresPrimary()
+{
+    for(bool immediate:{false,true}) {
+        DualRingPath p;
+        p.setup();
+        const auto disable=[&] {return p.submit.setPreemption(nullptr,nullptr,{},false);};
+        const uint32_t lowFence=p.enqueue(1,5);
+        p.signalSwitch();
+        CHECK(p.low.current() && !p.ring.current() && disable()==kIOReturnBusy);
+        p.low_fences[1]=lowFence;
+        CHECK(p.submit.retireCompleted()==kIOReturnSuccess && !p.submit.outstanding());
+        const uint32_t target[2]={0,lowFence};
+        uint32_t retired[2]{};
+        // The fence is complete but CP has not yet consumed the final ring words.
+        CHECK(disable()==kIOReturnBusy && p.submit.preemptStats().triggers==1 && p.low.current());
+        p.low_fences[0]=p.low.writePointer();
+        cp.regs[0x0210]=1u<<23;
+        CHECK(disable()==kIOReturnBusy && p.submit.preemptStats().triggers==1 && p.low.current());
+        cp.regs[0x0210]=0;
+        cp.clear_stop_on_write=immediate;
+        const IOReturn result=disable();
+        if(!immediate) {
+            CHECK(result==kIOReturnBusy && p.submit.preemption() && p.keepalive);
+            CHECK(!p.low.current() && !p.ring.current());
+            CHECK(disable()==kIOReturnBusy && p.submit.preemptStats().triggers==2);
+            // A control-read failure cannot make the unfinished primary current.
+            cp.fail_read_reg=0x08a0;
+            CHECK(disable()==kIOReturnIOError && p.keepalive && p.submit.preemption());
+            cp.fail_read_reg=~0u;
+            cp.regs[0x08a0]&=~1u;
+            CHECK(disable()==kIOReturnSuccess); // The IRQ worker need not have run yet.
+        } else {
+            CHECK(result==kIOReturnSuccess);
+        }
+        CHECK(!p.submit.preemption() && p.ring.current() && !p.low.current() && !p.keepalive);
+        CHECK(p.submit.wait(lowFence,&ringclock,0)==kIOReturnSuccess);
+        CHECK(p.submit.observeFence(lowFence,&ringclock,0)==kIOReturnSuccess);
+        CHECK(p.submit.scanoutProgress(target,retired)==kIOReturnSuccess && retired[1]>=lowFence);
+        CHECK(p.enqueue(1,5)==lowFence+1 && p.ring.lastSubmitted()==lowFence+1);
+        fencemem[1]=lowFence+1;
+        CHECK(p.submit.retireCompleted()==kIOReturnSuccess && p.submit.detach()==kIOReturnSuccess);
+    }
+    std::puts("PASS disabling preemption drains secondary, confirms primary, and preserves fence sequence");
 }
 
 static void testSwitchCompletesBeforeRecovery()
@@ -1586,6 +1704,9 @@ int main(int argc,char **argv)
     testHiddenActiveFence();
     testSwitchCompletesWithoutInterrupt();
     testImmediateSwitchCompletion();
+    testDisablePreemptionRestoresPrimary();
+    testTimelineDetach();
+    testFenceSequenceExhaustion();
     testSwitchCompletesBeforeRecovery();
     testSwitchTimeoutRecovery(true);
     testSwitchTimeoutRecovery(false);
