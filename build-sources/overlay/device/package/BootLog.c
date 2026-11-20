@@ -217,6 +217,7 @@ extern volatile uint32_t native_pmic_rtc[3] __attribute__((weak_import));
 extern volatile uint32_t native_pmic_rtc_offset[3] __attribute__((weak_import));
 extern volatile uint32_t native_adreno_tl_count __attribute__((weak_import));
 extern volatile uint32_t native_adreno_stall_log_count __attribute__((weak_import));
+extern bool native_adreno_stall_pointers_copy(uint32_t index, uint32_t out[6]) __attribute__((weak_import));
 extern volatile uint32_t native_gpu_dcvs_log_count __attribute__((weak_import));
 extern volatile uint32_t native_gop_wait_reasons[4] __attribute__((weak_import));
 extern volatile uint32_t native_legacy_direct[14] __attribute__((weak_import));
@@ -352,8 +353,7 @@ extern volatile uint32_t native_cpufreq_throttle[9] __attribute__((weak_import))
 extern volatile uint64_t native_adreno_fence_phys __attribute__((weak_import));
 extern int (*native_adreno_dram_read32)(uint64_t, uint32_t *) __attribute__((weak_import));
 extern int (*native_adreno_cached_read32)(uint64_t, uint32_t *) __attribute__((weak_import));
-extern volatile uint32_t native_adreno_ring_log[4][4 + 112] __attribute__((weak_import));
-extern volatile uint32_t native_adreno_ring_log_count __attribute__((weak_import));
+extern uint32_t native_adreno_ring_log_copy(uint32_t (*out)[4 + 112], uint32_t capacity) __attribute__((weak_import));
 extern volatile uint32_t native_adreno_ib_log[4][4 + 28] __attribute__((weak_import));
 extern volatile uint32_t native_adreno_ib_log_count __attribute__((weak_import));
 extern unsigned native_legacy_properties_now(char *, unsigned) __attribute__((weak_import));
@@ -1007,10 +1007,11 @@ static size_t compose(char *out, size_t cap, uint32_t slot, unsigned now) {
   }
   // The four newest ring submissions (fence, ring range, then the words the CP reads) and the first words of their IBs: all that the
   // logs keep, so a stalled fence behind newer submissions is still shown.
-  if (log_gpu_on && (&native_adreno_ring_log_count && native_adreno_ring_log_count)) {
-    const uint32_t newest = native_adreno_ring_log_count - 1;
-    for (unsigned back = 0; back < 4 && back < native_adreno_ring_log_count; ++back) {
-      const volatile uint32_t *r = native_adreno_ring_log[(newest - back) & 3];
+  if (log_gpu_on && &native_adreno_ring_log_copy) {
+    uint32_t ring_rows[4][4 + 112];
+    const uint32_t count = native_adreno_ring_log_copy(ring_rows, 4);
+    for (uint32_t back = 0; back < count; ++back) {
+      const uint32_t *r = ring_rows[back];
       char row[130];
       snprintf(row, sizeof row, "[ring] fence=%u ring %x..%x words=%u", r[0], r[1], r[2], r[3]);
       at = put(out, at, cap, row, sizeof row);
@@ -1813,7 +1814,8 @@ static size_t compose(char *out, size_t cap, uint32_t slot, unsigned now) {
     const volatile uint32_t *w = native_legacy_swapstat;
     snprintf(row, sizeof row, "[swap stats] validated %u kicks %u refused(in flight %u not ready %u no head %u latch %u) fence waits %u copy %u blank %u flips %u latches %u retires %u slow %u longest %uus max depth %u | rings tl=%u stall=%u dcvs=%u | scanout waits deadline %u int %u other %u woken %u",
              w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8], w[9], w[10], w[11], w[12], w[13], w[15],
-             &native_adreno_tl_count ? native_adreno_tl_count : 0, &native_adreno_stall_log_count ? native_adreno_stall_log_count : 0,
+             &native_adreno_tl_count ? native_adreno_tl_count : 0,
+             &native_adreno_stall_log_count ? __atomic_load_n(&native_adreno_stall_log_count, __ATOMIC_RELAXED) : 0,
              &native_gpu_dcvs_log_count ? native_gpu_dcvs_log_count : 0,
              &native_gop_wait_reasons ? native_gop_wait_reasons[0] : 0, &native_gop_wait_reasons ? native_gop_wait_reasons[1] : 0,
              &native_gop_wait_reasons ? native_gop_wait_reasons[2] : 0, &native_gop_wait_reasons ? native_gop_wait_reasons[3] : 0);
@@ -2189,10 +2191,11 @@ static size_t compose(char *out, size_t cap, uint32_t slot, unsigned now) {
     }
   }
   // Fenced WPTR writes (NativeAdrenoRing.cpp writeWptr): writes, writes dropped at least once, repeated writes, writes still dropped.
-  if (log_gpu_on && (&native_adreno_wptr_fence && native_adreno_wptr_fence[0])) {
+  if (log_gpu_on && &native_adreno_wptr_fence && __atomic_load_n(&native_adreno_wptr_fence[0], __ATOMIC_RELAXED)) {
     char row[120];
-    snprintf(row, sizeof row, "[gpu wptr] writes=%u dropped=%u repeats=%u lost=%u", native_adreno_wptr_fence[0], native_adreno_wptr_fence[1],
-             native_adreno_wptr_fence[2], native_adreno_wptr_fence[3]);
+    snprintf(row, sizeof row, "[gpu wptr] writes=%u dropped=%u repeats=%u lost=%u",
+             __atomic_load_n(&native_adreno_wptr_fence[0], __ATOMIC_RELAXED), __atomic_load_n(&native_adreno_wptr_fence[1], __ATOMIC_RELAXED),
+             __atomic_load_n(&native_adreno_wptr_fence[2], __ATOMIC_RELAXED), __atomic_load_n(&native_adreno_wptr_fence[3], __ATOMIC_RELAXED));
     at = put(out, at, cap, row, sizeof row);
   }
   if (log_gpu_on && (&native_adreno_unstick && native_adreno_unstick[0])) {
@@ -2258,6 +2261,18 @@ static size_t compose(char *out, size_t cap, uint32_t slot, unsigned now) {
                (int)(j[0] >> 44 & 0xff) - 1, (unsigned)(j[0] >> 32 & 0xff), (unsigned long long)(j[2] >> 10), (unsigned long long)j[1],
                (unsigned)(j[0] >> 52 & 15), (unsigned)(j[3] >> 40 & 0xffff), (unsigned)(j[3] >> 32 & 0xff),
                (unsigned long long)(j[5] / 1000), (unsigned long long)j[6]);
+      at = put(out, at, cap, row, sizeof row);
+    }
+  }
+  // Complete before/after pointers for the latest stall actions and snapshots.
+  if (log_gpu_on && &native_adreno_stall_log_count && &native_adreno_stall_pointers_copy) {
+    const uint32_t count = __atomic_load_n(&native_adreno_stall_log_count, __ATOMIC_ACQUIRE);
+    for (uint32_t back = 0; back < 4 && back < count; ++back) {
+      uint32_t sample[6];
+      if (!native_adreno_stall_pointers_copy(count - 1 - back, sample)) continue;
+      char row[160];
+      snprintf(row, sizeof row, "[gpu stall pointers] fence=%u event=%u before=%08x/%08x after=%08x/%08x",
+               sample[0], sample[1], sample[2], sample[3], sample[4], sample[5]);
       at = put(out, at, cap, row, sizeof row);
     }
   }

@@ -92,7 +92,14 @@ static void testEvidence()
  CHECK(a.noteTimeout(nullptr));CHECK(!a.captureTimeoutEvidence(2,&out));
  p.failed_read=UINT32_MAX;p.cntl&=~1u;CHECK(a.complete()==SwitchState::Completed && a.releaseKeepalive());
  CHECK(!a.restart(0));CHECK(!std::memcmp(&out,&keep,sizeof out));
- CHECK(a.trigger(1,true));CHECK(!a.captureTimeoutEvidence(2,&out));
+ CHECK(a.trigger(1,true,nullptr,nullptr,nullptr,false));
+ CHECK(!a.captureTimeoutEvidence(2,&out));
+ p.cntl&=~1u;CHECK(a.complete()==NativeAdrenoSwitchState::Completed);
+ CHECK(a.trigger(0,true));CHECK(a.captureTimeoutEvidence(2,&out));
+ CHECK(out.from_ring==1 && out.to_ring==0 && out.before.valid_mask==0xf);
+ CHECK(out.published_tail.valid_mask==0 && out.published_tail.count==0);
+ CHECK(out.published_tail.hw_wptr==UINT32_MAX && out.published_tail.read_status[1]==-1);
+ CHECK(out.published_tail.words[0]==UINT32_MAX);
  p.cntl&=~1u;CHECK(a.complete()==SwitchState::Completed && a.releaseKeepalive() && !a.detach());
  std::puts("PASS timeout SQE even at equal ring pointers, explicit read validity, capture interval, pre-reset pages and one capture per switch");
 }

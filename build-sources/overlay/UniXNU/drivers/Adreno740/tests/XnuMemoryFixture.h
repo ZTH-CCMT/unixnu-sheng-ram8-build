@@ -174,7 +174,11 @@ public:
 using ppnum_t=uint32_t;
 inline uint64_t mach_absolute_time() {static uint64_t now;return ++now;}
 inline void nanoseconds_to_absolutetime(uint64_t ns,uint64_t *out) {*out=ns;}
-inline void IODelay(unsigned) {}
+inline unsigned fixture_delay_calls=0,fixture_delay_microseconds=0;
+inline void IODelay(unsigned microseconds) {
+    ++fixture_delay_calls;
+    fixture_delay_microseconds+=microseconds;
+}
 inline task_t current_task() {return reinterpret_cast<task_t>(2);}
 inline int task_get_gpu_role(task_t) {return fixture.gpu_role;}
 #endif

@@ -547,14 +547,22 @@ struct FrameAttribution {
 };
 static FrameAttribution gAttribution;
 // Who calls waitUntilCompleted: the caller's return address (the 36 low bits) and its caller's, with a count and the total wait.
-struct WaitCaller {std::atomic<uint64_t> lr{0},lr2{0};std::atomic<uint32_t> n{0};std::atomic<uint64_t> us{0};char thread[24]={0},symbol[28]={0};};
+struct WaitCaller {
+ std::atomic<uint64_t> lr{0},lr2{0};
+ std::atomic<uint32_t> n{0};
+ std::atomic<uint64_t> us{0};
+ std::atomic<bool> ready{false};
+ char thread[24]={0},symbol[28]={0};
+};
 static WaitCaller gWaitCallers[8];
 static void noteWaitCaller(uint64_t lr,uint64_t lr2,uint64_t us) {
+ if(!lr)return;
  for(unsigned i=0;i<8;i++) {
   uint64_t seen=gWaitCallers[i].lr.load();
   if(!seen){uint64_t zero=0;if(gWaitCallers[i].lr.compare_exchange_strong(zero,lr)){
    gWaitCallers[i].lr2=lr2;pthread_getname_np(pthread_self(),gWaitCallers[i].thread,sizeof gWaitCallers[i].thread);
    Dl_info info;if(dladdr((void*)(uintptr_t)lr2,&info)&&info.dli_sname)strlcpy(gWaitCallers[i].symbol,info.dli_sname,sizeof gWaitCallers[i].symbol);
+   gWaitCallers[i].ready.store(true,std::memory_order_release);
   }seen=gWaitCallers[i].lr.load();}
   if(seen==lr){gWaitCallers[i].n++;gWaitCallers[i].us+=us;return;}
  }
@@ -1092,9 +1100,33 @@ static MTLPurgeableState notePurgeable(unsigned kind,uint64_t answer,MTLPurgeabl
 @end
 
 // ---- resources ----
-// The wait takes a strong snapshot of already-committed buffers; new commits require the
-// caller's usual resource synchronization. Storage dependency checks are in the runtime.
-static NSMutableSet *gInFlight;
+// Commits and completions update only their shard. A resource wait still
+// takes one strong snapshot with all shards locked in ascending order.
+struct InFlightShard {
+ std::mutex lock;
+ NSMutableSet *buffers=nil;
+};
+static constexpr unsigned kInFlightShards=8;
+static InFlightShard gInFlight[kInFlightShards];
+static void trackInFlight(id buffer,uint32_t index) {
+ InFlightShard &shard=gInFlight[index%kInFlightShards];
+ std::lock_guard<std::mutex> lock(shard.lock);
+ if(!shard.buffers)shard.buffers=[NSMutableSet set];
+ [shard.buffers addObject:buffer];
+}
+static void untrackInFlight(id buffer,uint32_t index) {
+ InFlightShard &shard=gInFlight[index%kInFlightShards];
+ std::lock_guard<std::mutex> lock(shard.lock);
+ [shard.buffers removeObject:buffer];
+}
+static NSArray *inFlightSnapshot() {
+ std::array<std::unique_lock<std::mutex>,kInFlightShards> locks;
+ for(unsigned i=0;i<kInFlightShards;i++)locks[i]=std::unique_lock<std::mutex>(gInFlight[i].lock);
+ NSMutableArray *pending=[NSMutableArray array];
+ for(const auto &shard:gInFlight)
+  for(id buffer in shard.buffers)[pending addObject:buffer];
+ return pending;
+}
 static void waitForResource(id resource);
 // Resource SPI the runtime has no state for: no protected content (Metal's default options), and no owner transfer
 // (memory attribution is the kernel driver's, by the importing task), refused as not supported.
@@ -2433,7 +2465,7 @@ static std::mutex gRuntimeHandleLock;
 static void waitForResource(id resource) {
  encodeDrain();   // every committed command buffer's uses recorded
  const uint64_t began=nowUs();
- NSArray *pending;@synchronized(gInFlight){pending=gInFlight.allObjects;}
+ NSArray *pending=inFlightSnapshot();
  for(NBCommandBuffer *commandBuffer in pending) {
   int dependency=-1;
   {
@@ -2455,13 +2487,39 @@ static void waitForResource(id resource) {
 // Which pipeline formats draw into which pass targets (telemetry DF rows): a pass key (colour 0 format, load action, a surface, a big target)
 // with the bound pipeline's colour 0 format, counted at each pipeline bind. A state format that is not its target's is the case plain Metal
 // stores with the target's byte order (BGRA8 exchanges bytes 0 and 2).
-static std::mutex gPassFormatLock;
-static struct {uint64_t key,n;} gPassFormatRows[32];
-static unsigned gPassFormatCount;
+// Slots stay in place for the life of the telemetry table, so a render thread
+// can update a familiar pair without searching or taking a lock.
+struct PassFormatStats {
+ struct Row {std::atomic<uint64_t> key{0},count{0};};
+ static constexpr unsigned kSlots=32;
+ static constexpr uint64_t kPassMask=(UINT64_C(1)<<20)-1;
+ Row rows[kSlots];
+
+ static uint64_t compact(uint64_t key) {return ((key>>32)<<20)|(key&kPassMask);}
+ static uint64_t expanded(uint64_t key) {return ((key>>20)<<32)|(key&kPassMask);}
+ Row *findOrAdd(uint64_t key) {
+  uint64_t hash=key;
+  hash=(hash^(hash>>30))*UINT64_C(0xbf58476d1ce4e5b9);
+  hash=(hash^(hash>>27))*UINT64_C(0x94d049bb133111eb);
+  const unsigned start=unsigned(hash^(hash>>31))&(kSlots-1);
+  for(unsigned offset=0;offset<kSlots;offset++) {
+   Row &row=rows[(start+offset)&(kSlots-1)];
+   uint64_t present=row.key.load(std::memory_order_relaxed);
+   if(!present && row.key.compare_exchange_strong(present,key,std::memory_order_relaxed))return &row;
+   if(present==key)return &row;
+  }
+  return nullptr;
+ }
+};
+static PassFormatStats gPassFormats;
 static void noteFormats(uint64_t key) {
- std::lock_guard<std::mutex> lock(gPassFormatLock);
- for(unsigned i=0;i<gPassFormatCount;i++)if(gPassFormatRows[i].key==key){gPassFormatRows[i].n++;return;}
- if(gPassFormatCount<32){gPassFormatRows[gPassFormatCount].key=key;gPassFormatRows[gPassFormatCount].n=1;gPassFormatCount++;}
+ // The compact key uses 52 bits. Offset it so the all-zero format pair
+ // (for example, a depth-only pass) is distinct from an empty slot.
+ const uint64_t occupied=PassFormatStats::compact(key)+1;
+ static thread_local uint64_t lastKey=0;
+ static thread_local PassFormatStats::Row *lastRow=nullptr;
+ if(occupied!=lastKey){lastKey=occupied;lastRow=gPassFormats.findOrAdd(occupied);}
+ if(lastRow)lastRow->count.fetch_add(1,std::memory_order_relaxed);
 }
 static const bool gDrawStats=access("/private/var/ngpu/debug/draw-stats",F_OK)==0;
 enum : uint32_t {kDSPipeline=1,kDSBuffer=2,kDSOffset=4,kDSBytes=8,kDSTexture=16,kDSSampler=32,kDSDepth=64,kDSViewport=128,kDSOther=256,kDSFirst=512};
@@ -3502,7 +3560,7 @@ static char kUserDictionaryKey;
  frontStage(traceNumber,self.commitIndex,10);
  [_surfaces removeAllObjects];[self disown];
  self.wallpaperOutput=nil;
- @synchronized(gInFlight){[gInFlight removeObject:self];}
+ untrackInFlight(self,self.commitIndex);
  // Surfaces this command buffer kept alive may now have no other owner: their held imports go.
  trimHeldImports(false);
  frontStage(traceNumber,self.commitIndex,11);
@@ -3581,7 +3639,7 @@ static char kUserDictionaryKey;
   CommitRecord &r=gCommitRing[index%32];
   r={};r.index=index;r.committedUs=self.committedUs;r.ageUs=self.committedUs-createdUs;r.work=encodedWork;
  }
- @synchronized(gInFlight){[gInFlight addObject:self];}
+ trackInFlight(self,self.commitIndex);
  if(metalChainOn()){
   traceStartWriter();TraceRec r{};r.type=45;r.t0=nowUs();r.t1=traceNumber;
   r.t2=nmb_command_buffer_diagnostic_id(_handle);r.t3=self.commitIndex;
@@ -3699,7 +3757,7 @@ static char kUserDictionaryKey;
 // The scanout client: before it copies an offered frame, the GPU work committed up to then must be done.
 extern "C" void NBWaitInFlight(uint64_t beforeUs) {
  if(!earlyOn())return;
- NSArray *pending;@synchronized(gInFlight){pending=gInFlight.allObjects;}
+ NSArray *pending=inFlightSnapshot();
  for(NBCommandBuffer *commandBuffer in pending)
   if(commandBuffer.committed && !commandBuffer.failedLocally && commandBuffer.committedUs<=beforeUs)nmb_command_buffer_wait(commandBuffer.handle,0);
 }
@@ -3737,29 +3795,34 @@ static void completed(void *context) {
   }
   gTimeEncodeToCommit.count++;gTimeEncodeToCommit.total+=took;
   uint64_t seen=gTimeEncodeToCommit.slowest.load();while(took>seen && !gTimeEncodeToCommit.slowest.compare_exchange_weak(seen,took)){}
-  std::lock_guard<std::mutex> lock(gCommitLock);
-  CommitRecord &r=gCommitRing[commandBuffer.commitIndex%32];
-  if(r.index==commandBuffer.commitIndex) {
-   r.callbackUs=took;
-   {
-    traceStartWriter();traceNote(commandBuffer->createTid);
-    if(commandBuffer->commitTid!=commandBuffer->createTid)traceNote(commandBuffer->commitTid);
-    TraceRec rec={};rec.type=1;rec.idx=r.index;rec.t0=commandBuffer->createdUs;rec.t1=r.committedUs;rec.t2=r.scheduledUs>=0?r.committedUs+(uint64_t)r.scheduledUs:0;
-    rec.t3=r.committedUs+took;rec.a=r.work.passes;rec.b=r.work.draws;rec.c=(uint32_t)(r.work.pixels>>10);rec.d=r.work.blits;
-    rec.tid=commandBuffer->createTid;rec.cpu0=commandBuffer->createCpu;rec.cpu1=commandBuffer->commitCpu;rec.tid2=commandBuffer->commitTid;
-    tracePush(rec);
-   }
-   if(r.work.passes>0 && r.work.pixels>0) {
-    FrameAttribution &a=gAttribution;
-    const uint64_t interval=a.prevCommitUs?r.committedUs-a.prevCommitUs:0;
-    if(interval && interval<200000) {
-     FrameAttribution::Bin &b=a.bins[interval<11000?0:interval<16700?1:interval<33000?2:3];
-     b.n++;b.sumI+=interval;b.sumPg+=a.prevCtcUs;b.sumEnc+=r.ageUs;b.sumKpx+=a.prevKpx;
-     b.sumRes+=(int64_t)interval-(int64_t)a.prevCtcUs-(int64_t)r.ageUs;
-     if(a.prevKpx>30000)b.heavy++;
+  CommitRecord record{};
+  {
+   std::lock_guard<std::mutex> lock(gCommitLock);
+   CommitRecord &r=gCommitRing[commandBuffer.commitIndex%32];
+   if(r.index==commandBuffer.commitIndex) {
+    r.callbackUs=took;
+    record=r;
+    if(r.work.passes>0 && r.work.pixels>0) {
+     FrameAttribution &a=gAttribution;
+     const uint64_t interval=a.prevCommitUs?r.committedUs-a.prevCommitUs:0;
+     if(interval && interval<200000) {
+      FrameAttribution::Bin &b=a.bins[interval<11000?0:interval<16700?1:interval<33000?2:3];
+      b.n++;b.sumI+=interval;b.sumPg+=a.prevCtcUs;b.sumEnc+=r.ageUs;b.sumKpx+=a.prevKpx;
+      b.sumRes+=(int64_t)interval-(int64_t)a.prevCtcUs-(int64_t)r.ageUs;
+      if(a.prevKpx>30000)b.heavy++;
+     }
+     a.prevCommitUs=r.committedUs;a.prevCtcUs=took;a.prevKpx=r.work.pixels>>10;
     }
-    a.prevCommitUs=r.committedUs;a.prevCtcUs=took;a.prevKpx=r.work.pixels>>10;
    }
+  }
+  if(record.index) {
+   traceStartWriter();traceNote(commandBuffer->createTid);
+   if(commandBuffer->commitTid!=commandBuffer->createTid)traceNote(commandBuffer->commitTid);
+   TraceRec rec={};rec.type=1;rec.idx=record.index;rec.t0=commandBuffer->createdUs;rec.t1=record.committedUs;
+   rec.t2=record.scheduledUs>=0?record.committedUs+(uint64_t)record.scheduledUs:0;
+   rec.t3=record.committedUs+took;rec.a=record.work.passes;rec.b=record.work.draws;rec.c=(uint32_t)(record.work.pixels>>10);rec.d=record.work.blits;
+   rec.tid=commandBuffer->createTid;rec.cpu0=commandBuffer->createCpu;rec.cpu1=commandBuffer->commitCpu;rec.tid2=commandBuffer->commitTid;
+   tracePush(rec);
   }
  }
  [commandBuffer finish];
@@ -5302,7 +5365,7 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
  const bool newClass=!cls;
  if(newClass)cls=objc_allocateClassPair(base,"NativeBridgeMetalDevice",0);
  if(!cls || class_getSuperclass(cls)!=base)return nil;
- gMissing=missing;gInFlight=[NSMutableSet set];
+ gMissing=missing;
  if(cache && *cache){configureShaderDiskCache(cache);gCacheRoot=cache;}
  gDevice=nmb_device_open(loader,cache);
  if(loader)gLoaderPath=loader;
@@ -5803,8 +5866,17 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
  {
   // The five most used (pass target, pipeline) format pairs: p target format, s pipeline format, l load action, S an IOSurface, B a screen-size target.
   struct {uint64_t key,n;} top[5]={};
-  {std::lock_guard<std::mutex> lock(gPassFormatLock);
-   for(unsigned i=0;i<gPassFormatCount;i++)for(unsigned t=0;t<5;t++)if(gPassFormatRows[i].n>top[t].n){for(unsigned u=4;u>t;u--)top[u]=top[u-1];top[t]={gPassFormatRows[i].key,gPassFormatRows[i].n};break;}}
+  for(const auto &format:gPassFormats.rows) {
+   const uint64_t occupied=format.key.load(std::memory_order_relaxed);
+   if(!occupied)continue;
+   const uint64_t count=format.count.load(std::memory_order_relaxed);
+   if(!count)continue;
+   const uint64_t key=PassFormatStats::expanded(occupied-1);
+   for(unsigned t=0;t<5;t++)if(count>top[t].n) {
+    for(unsigned u=4;u>t;u--)top[u]=top[u-1];
+    top[t]={key,count};break;
+   }
+  }
   for(unsigned t=0;t<5 && top[t].n;t++)
    row("DF p%u s%u l%u %s%s n%llu",(unsigned)(top[t].key&0xffff),(unsigned)(top[t].key>>32),(unsigned)(top[t].key>>16&3),top[t].key>>18&1?"S":"-",
     top[t].key>>19&1?"B":"-",(ull)top[t].n);
@@ -5822,22 +5894,31 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
    (ull)gSurfaceRotations[3].load(),(ull)gSurfaceRotations[4].load());
  }
  {
-  std::lock_guard<std::mutex> lock(gCommitLock);
-  const uint32_t newest=(uint32_t)gCommits.load();
+  uint32_t newest;
+  CommitRecord recent[32];
+  FrameAttribution attribution;
+  {
+   std::lock_guard<std::mutex> lock(gCommitLock);
+   newest=(uint32_t)gCommits.load();
+   std::copy_n(gCommitRing,32,recent);
+   attribution=gAttribution;
+  }
   row("%s","Q timing v2: per-buffer API counts; ctc=commit-to-callback; age includes caller idle");
   for(unsigned i=0;i<8;i++) {
    const WaitCaller &w=gWaitCallers[i];
-   if(!w.n.load())continue;
-   row("WC%u lr=%llx n%u us%llu t=%.23s s=%.27s",i,(ull)w.lr.load(),w.n.load(),(ull)w.us.load(),w.thread,w.symbol);
+   if(!w.ready.load(std::memory_order_acquire))continue;
+   const uint32_t calls=w.n.load(std::memory_order_relaxed);
+   if(!calls)continue;
+   row("WC%u lr=%llx n%u us%llu t=%.23s s=%.27s",i,(ull)w.lr.load(),calls,(ull)w.us.load(),w.thread,w.symbol);
   }
   for(unsigned i=0;i<4;i++) {
-   const FrameAttribution::Bin &b=gAttribution.bins[i];
+   const FrameAttribution::Bin &b=attribution.bins[i];
    if(!b.n)continue;
    row("FA%u n%u I%llu pg%llu enc%llu res%lld kpx%llu hv%u",i,b.n,(ull)(b.sumI/b.n),(ull)(b.sumPg/b.n),
     (ull)(b.sumEnc/b.n),(long long)(b.sumRes/(int64_t)b.n),(ull)(b.sumKpx/b.n),b.heavy);
   }
   for(uint32_t k=0;k<20 && k<newest;k++) {
-   const CommitRecord &r=gCommitRing[(newest-k)%32];
+   const CommitRecord &r=recent[(newest-k)%32];
    if(r.index!=newest-k)continue;
    row("K%u t=%llu.%03llus rp%u dr%u kpx%llu cs%u bl%u ctc=%lluus",r.index,(ull)(r.committedUs/1000000),(ull)((r.committedUs/1000)%1000),
     r.work.passes,r.work.draws,(ull)(r.work.pixels>>10),r.work.dispatches,r.work.blits,(ull)r.callbackUs);

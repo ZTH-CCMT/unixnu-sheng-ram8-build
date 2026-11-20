@@ -98,9 +98,11 @@ class NativeRamBlock : public IOBlockStorageDevice {
   };
   StageWaiter *stageHead = nullptr, *stageTail = nullptr;  // poolLock held
   IOLock *poolLock = nullptr, *rangeLock = nullptr, *bitLock = nullptr, *flushMutex = nullptr;
-  IORWLock *flushRw = nullptr;
+  IORWLock *flushRw = nullptr;  // also protects RAM contents while the disk is in seed mode
   struct PageRange { uint64_t first, last; bool used; } ranges[kRanges] = {};
   uint32_t inflight = 0;   // work outside the gate (gate held to change it)
+  uint32_t ramInFlight = 0;  // gate held to admit or finish a RAM request
+  bool ramDraining = false;  // mode publication or synchronization is waiting for existing requests
   bool storeAttached = false, storeOpening = false;
   bool storeWindowOpen = false;
   uint64_t storeFirstLba = 0;
@@ -237,6 +239,13 @@ class NativeRamBlock : public IOBlockStorageDevice {
     }
   };
   IOReturn directReadWrite(IOMemoryDescriptor *buffer, uint64_t offset, uint64_t bytes, uint64_t *actual, uint64_t *waited);
+  IOReturn ramReadWrite(IOMemoryDescriptor *buffer, bool write, uint64_t offset, uint64_t bytes, uint64_t *actual,
+                        uint64_t *waited);
+  // gate held. Stop admitting RAM requests until existing copies have finished.
+  void drainRamRequests() {
+    ramDraining = true;
+    while (online && ramInFlight) IOLockSleep(gate, &ramInFlight, THREAD_UNINT);
+  }
   void configureDirectStore() {
     if (!direct) return;
     // The read-only overlay never enables a write cache.
@@ -272,7 +281,7 @@ public:
   void attachStore() {
     if (!gate) return;
     IOLockLock(gate);
-    while (online && storeOpening) IOLockSleep(gate, &storeOpening, THREAD_UNINT);
+    while (online && (storeOpening || ramDraining)) IOLockSleep(gate, &storeOpening, THREAD_UNINT);
     if (!online || storeAttached) { IOLockUnlock(gate); return; }
     const unsigned mode = &native_ufs_store_mode ? native_ufs_store_mode() : 0;
     if (!mode || !(sparse.pages || isBig) || !&native_ufs_store_open || !&native_ufs_store_read ||
@@ -334,6 +343,7 @@ public:
     storeFirstLba = first;
     native_data_persist_first_lba = first;
     native_data_persist_header = static_cast<uint32_t>(candidate.header);
+    if (online && candidate.active && result != persist::Open::Failed) drainRamRequests();
     if (online) {
       storeAttached = result != persist::Open::Failed;
       if (result == persist::Open::Failed) native_data_persist_state = 4;
@@ -360,6 +370,7 @@ public:
         configureDirectStore();
       }
     }
+    ramDraining = false;
     storeOpening = false;
     IOLockWakeup(gate, &storeOpening, false);
     IOLockUnlock(gate);
@@ -408,7 +419,18 @@ public:
   IOReturn doSynchronizeCache() override {
     if (!gate) return kIOReturnNotReady;
     IOLockLock(gate);
+    while (online && (storeOpening || ramDraining)) IOLockSleep(gate, &storeOpening, THREAD_UNINT);
     if (!online) { IOLockUnlock(gate); return kIOReturnNotReady; }
+    if (!direct) {
+      ++inflight;
+      drainRamRequests();
+      const bool ready = online;
+      ramDraining = false;
+      IOLockWakeup(gate, &storeOpening, false);
+      IOLockUnlock(gate);
+      finishIo();
+      return ready ? kIOReturnSuccess : kIOReturnNotReady;
+    }
     if (!writeBack) { IOLockUnlock(gate); return kIOReturnSuccess; }
     ++inflight;
     IOLockUnlock(gate);
@@ -424,8 +446,9 @@ public:
   }
   IOReturn setWriteCacheState(bool) override { return kIOReturnUnsupported; }
   IOReturn doAsyncReadWrite(IOMemoryDescriptor *, UInt64, UInt64, IOStorageAttributes *, IOStorageCompletion *) override;
-  void finishIo() {
+  void finishIo(bool ramRequest = false) {
     IOLockLock(gate);
+    if (ramRequest && !--ramInFlight && ramDraining) IOLockWakeup(gate, &ramInFlight, false);
     if (!--inflight && !online) IOLockWakeup(gate, &inflight, false);
     IOLockUnlock(gate);
   }
@@ -522,102 +545,77 @@ IOReturn NativeRamBlock::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 blo
     IOStorageAttributes *, IOStorageCompletion *completion)
 {
   if (!buffer || !completion || !completion->action || !count || block >= capacity ||
-      count > capacity - block || buffer->getLength() < count * 512 ||
-      (buffer->getDirection() != kIODirectionIn && buffer->getDirection() != kIODirectionOut)) return kIOReturnBadArgument;
+      count > capacity - block || buffer->getLength() < count * 512) return kIOReturnBadArgument;
+  const auto direction = buffer->getDirection();
+  if (direction != kIODirectionIn && direction != kIODirectionOut) return kIOReturnBadArgument;
   if (!gate) return kIOReturnNotReady;
+  const bool write = direction == kIODirectionOut;
   const uint64_t bytes = count * 512;
   const uint64_t entered = mach_absolute_time();
   IOLockLock(gate);
-  // A write must see either the original seed or the fully published overlay.
-  while (online && storeOpening && buffer->getDirection() == kIODirectionOut)
-    IOLockSleep(gate, &storeOpening, THREAD_UNINT);
-  const uint64_t gated = mach_absolute_time();
-  if (!online) { IOLockUnlock(gate); return kIOReturnNotReady; }
-  if (direct) {
-    ++inflight;
-    IOLockUnlock(gate);
-    uint64_t done = 0, waited = gated - entered;
-    const IOReturn result = directReadWrite(buffer, block * 512, bytes, &done, &waited);
-    const uint64_t spent = mach_absolute_time() - entered;
-    const bool out = buffer->getDirection() == kIODirectionOut;
-    __atomic_fetch_add(out ? &native_data_io_writes : &native_data_io_reads, 1, __ATOMIC_RELAXED);
-    __atomic_fetch_add(out ? &native_data_io_write_bytes : &native_data_io_read_bytes, bytes, __ATOMIC_RELAXED);
-    __atomic_fetch_add(out ? &native_data_io_write_ticks : &native_data_io_read_ticks, spent, __ATOMIC_RELAXED);
-    __atomic_fetch_add(out ? &native_ram_block_writes : &native_ram_block_reads, 1, __ATOMIC_RELAXED);
+  while (online && (ramDraining || (storeOpening && write))) IOLockSleep(gate, &storeOpening, THREAD_UNINT);
+  if (!online || (isBig && !direct && write)) { IOLockUnlock(gate); return kIOReturnNotReady; }
+  const bool useStore = direct;
+  ++inflight;
+  if (!useStore) ++ramInFlight;
+  IOLockUnlock(gate);
+
+  uint64_t done = 0, waited = mach_absolute_time() - entered;
+  const IOReturn result = useStore ? directReadWrite(buffer, block * 512, bytes, &done, &waited)
+                                  : ramReadWrite(buffer, write, block * 512, bytes, &done, &waited);
+  const uint64_t spent = mach_absolute_time() - entered;
+  __atomic_fetch_add(write ? &native_ram_block_writes : &native_ram_block_reads, 1, __ATOMIC_RELAXED);
+  if (result) __atomic_fetch_add(&native_ram_block_failures, 1, __ATOMIC_RELAXED);
+  if (useStore || !isBig) {
+    __atomic_fetch_add(write ? &native_data_io_writes : &native_data_io_reads, 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(write ? &native_data_io_write_bytes : &native_data_io_read_bytes, bytes, __ATOMIC_RELAXED);
+    __atomic_fetch_add(write ? &native_data_io_write_ticks : &native_data_io_read_ticks, spent, __ATOMIC_RELAXED);
     __atomic_fetch_add(&native_data_io_gate_ticks, waited, __ATOMIC_RELAXED);
     for (uint64_t seen = __atomic_load_n(&native_data_io_max_ticks, __ATOMIC_RELAXED); spent > seen &&
          !__atomic_compare_exchange_n(&native_data_io_max_ticks, &seen, spent, true, __ATOMIC_RELAXED, __ATOMIC_RELAXED);) {}
-    if (result) __atomic_fetch_add(&native_ram_block_failures, 1, __ATOMIC_RELAXED);
-    finishIo();
-    completion->action(completion->target, completion->parameter, result, done);
-    return kIOReturnSuccess;
   }
-  uint64_t actual;bool noMemory=false;
-  if(isBig) {
-    // Before the store is attached (APFS probes the disk for its volume UUID long before the kernel asks for the Data volume, which is what
-    // attaches the store) a disk this size is read from its seed alone; it has no volatile mode, so writes wait.
-    if(buffer->getDirection()==kIODirectionIn) {
-      struct SeedReadOps {
-        IOMemoryDescriptor *buffer;
-        uint64_t copy(uint64_t at,const void *p,uint64_t n){return buffer->writeBytes(at,p,n);}
-      } rops={buffer};
-      static const uint8_t zero[4096]={};
-      uint64_t done=0,offset=block*512;
-      while(done<bytes) {
-        uint64_t at=offset+done,index=at/4096,skip=at&4095,n=4096-skip;
-        if(n>bytes-done)n=bytes-done;
-        const uint8_t *page=big.find(index);
-        uint64_t got=rops.copy(done,(page?page:zero)+skip,n);
-        done+=got;if(got!=n)break;
-      }
-      __atomic_fetch_add(&native_ram_block_reads,1,__ATOMIC_RELAXED);
-      IOReturn early=done==bytes?kIOReturnSuccess:kIOReturnIOError;
-      if(early)__atomic_fetch_add(&native_ram_block_failures,1,__ATOMIC_RELAXED);
-      IOLockUnlock(gate);
-      completion->action(completion->target,completion->parameter,early,done);
-      return kIOReturnSuccess;
+  finishIo(!useStore);
+  completion->action(completion->target, completion->parameter, result, done);
+  return kIOReturnSuccess;
+}
+
+IOReturn NativeRamBlock::ramReadWrite(IOMemoryDescriptor *buffer, bool write, uint64_t offset, uint64_t bytes,
+                                     uint64_t *actual, uint64_t *waited)
+{
+  // Keep the gate free while waiting for the memory lock and copying data.
+  const uint64_t began = mach_absolute_time();
+  if (write) IORWLockWrite(flushRw);
+  else IORWLockRead(flushRw);
+  *waited += mach_absolute_time() - began;
+  bool noMemory = false;
+  if (isBig) {
+    // APFS reads the immutable seed to identify the volume before its store opens.
+    static const uint8_t zero[4096] = {};
+    while (*actual < bytes) {
+      const uint64_t at = offset + *actual, skip = at % 4096;
+      uint64_t length = 4096 - skip;
+      if (length > bytes - *actual) length = bytes - *actual;
+      const uint8_t *page = big.find(at / 4096);
+      const uint64_t got = buffer->writeBytes(*actual, (page ? page : zero) + skip, length);
+      *actual += got;
+      if (got != length) break;
     }
-    IOLockUnlock(gate);return kIOReturnNotReady;
-  }
-  if(sparse.pages){
+  } else if (sparse.pages) {
     struct Operations {
       IOMemoryDescriptor *buffer;
-      uint8_t *allocate(){return static_cast<uint8_t *>(IOMallocZero(4096));}
-      uint64_t read(uint64_t at,void *p,uint64_t n){return buffer->readBytes(at,p,n);}
-      uint64_t copy(uint64_t at,const void *p,uint64_t n){return buffer->writeBytes(at,p,n);}
-    } ops={buffer};
-    // Writable persistent overlays use directReadWrite above. In RAM mode,
-    // a read-only replay becomes the initial contents of the volatile disk.
-    const bool write=buffer->getDirection()==kIODirectionOut;
-    actual=ramSparseIO(sparse,write,block*512,bytes,ops,noMemory);
-    if(write)__atomic_fetch_add(&native_ram_block_writes,1,__ATOMIC_RELAXED);
-    else __atomic_fetch_add(&native_ram_block_reads,1,__ATOMIC_RELAXED);
-    native_ram_block_resident_bytes=sparse.resident;
-  }else if (buffer->getDirection() == kIODirectionIn) {
-    actual = buffer->writeBytes(0, memory + block * 512, bytes);
-    __atomic_fetch_add(&native_ram_block_reads, 1, __ATOMIC_RELAXED);
+      uint8_t *allocate() { return static_cast<uint8_t *>(IOMallocZero(4096)); }
+      uint64_t read(uint64_t at, void *p, uint64_t n) { return buffer->readBytes(at, p, n); }
+      uint64_t copy(uint64_t at, const void *p, uint64_t n) { return buffer->writeBytes(at, p, n); }
+    } ops = {buffer};
+    *actual = ramSparseIO(sparse, write, offset, bytes, ops, noMemory);
+    if (write) native_ram_block_resident_bytes = sparse.resident;
+  } else if (write) {
+    *actual = buffer->readBytes(0, memory + offset, bytes);
   } else {
-    actual = buffer->readBytes(0, memory + block * 512, bytes);
-    __atomic_fetch_add(&native_ram_block_writes, 1, __ATOMIC_RELAXED);
+    *actual = buffer->writeBytes(0, memory + offset, bytes);
   }
-  IOReturn status = actual == bytes ? kIOReturnSuccess : noMemory ? kIOReturnNoMemory : kIOReturnIOError;
-  if (status) __atomic_fetch_add(&native_ram_block_failures, 1, __ATOMIC_RELAXED);
-  const uint64_t left = mach_absolute_time(), spent = left - entered;
-  if (buffer->getDirection() == kIODirectionOut) {
-    __atomic_fetch_add(&native_data_io_writes, 1, __ATOMIC_RELAXED);
-    __atomic_fetch_add(&native_data_io_write_bytes, bytes, __ATOMIC_RELAXED);
-    __atomic_fetch_add(&native_data_io_write_ticks, spent, __ATOMIC_RELAXED);
-  } else {
-    __atomic_fetch_add(&native_data_io_reads, 1, __ATOMIC_RELAXED);
-    __atomic_fetch_add(&native_data_io_read_bytes, bytes, __ATOMIC_RELAXED);
-    __atomic_fetch_add(&native_data_io_read_ticks, spent, __ATOMIC_RELAXED);
-  }
-  __atomic_fetch_add(&native_data_io_gate_ticks, gated - entered, __ATOMIC_RELAXED);
-  for (uint64_t seen = __atomic_load_n(&native_data_io_max_ticks, __ATOMIC_RELAXED); spent > seen &&
-       !__atomic_compare_exchange_n(&native_data_io_max_ticks, &seen, spent, true, __ATOMIC_RELAXED, __ATOMIC_RELAXED);) {}
-  IOLockUnlock(gate);
-  completion->action(completion->target, completion->parameter, status, actual);
-  return kIOReturnSuccess;
+  IORWLockUnlock(flushRw);
+  return *actual == bytes ? kIOReturnSuccess : noMemory ? kIOReturnNoMemory : kIOReturnIOError;
 }
 
 // A direct-mode request, without the gate (see stagePool for what it locks). *waited gains the time spent waiting for locks.

@@ -264,7 +264,7 @@ bool NativeAdrenoPreempt::noteTimeout(const uint32_t progress[6],uint32_t *event
     return true;
 }
 bool NativeAdrenoPreempt::trigger(uint32_t ring,bool uses_gmem,
-    void (*capture_tail)(void *,NativeAdrenoPublishedTail *),void *tail_cookie,bool *ready)
+    void (*capture_tail)(void *,NativeAdrenoPublishedTail *),void *tail_cookie,bool *ready,bool capture_evidence)
 {
     if(ready)*ready=false;
     if(!attached_ || armed_ || ring>=NativeAdrenoPreemptRingCount || ring==loaded_)return false;
@@ -280,12 +280,17 @@ bool NativeAdrenoPreempt::trigger(uint32_t ring,bool uses_gmem,
     const uint64_t info=rings_.smmu_info[ring],record=rings_.record[ring];
     event_=openEvent(ring);
     evidence_valid_=false;evidence_captured_=false;
-    if(capture_tail) {
+    if(capture_evidence) {
         NativeAdrenoPublishedTail tail{};
-        const uint64_t begin=now_us_?now_us_(clock_cookie_):0;
-        capture_tail(tail_cookie,&tail);
-        evidenceTime(tail.begin_us,begin);
-        evidenceTime(tail.end_us,now_us_?now_us_(clock_cookie_):0);
+        tail.hw_rptr=tail.hw_wptr=tail.first=UINT32_MAX;
+        tail.read_status[0]=tail.read_status[1]=tail.barrier_status=-1;
+        for(auto &word:tail.words)word=UINT32_MAX;
+        if(capture_tail) {
+            const uint64_t begin=now_us_(clock_cookie_);
+            capture_tail(tail_cookie,&tail);
+            evidenceTime(tail.begin_us,begin);
+            evidenceTime(tail.end_us,now_us_(clock_cookie_));
+        }
         beginEvidence(tail);
     }
     if(io_.write32(io_.cookie,PreemptSmmuInfo,(uint32_t)info) ||

@@ -457,7 +457,9 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     int shownSlot=-1,pendingSlot=-1;
     uint32_t shownStride=0;
     // Keep the first successful fence snapshot for this request across pending and busy polls.
-    const OriginalLegacySwapRequest *fenceFor=nullptr;
+    const OriginalLegacySwapRequest *fenceFor=nullptr,*fenceReady=nullptr;
+    const uint64_t *fencePages;   // Spare direct slot kept intact while transferred is set.
+    unsigned fencePageCount;
     uint32_t fenceTarget=0;
     uint32_t scanoutTargets[2];
     uint64_t fenceSince=0;
@@ -579,10 +581,18 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     bool traceGpuComplete=false;
     bool gpuWrote(const OriginalLegacySwapRequest *request,const uint64_t *pages=nullptr,unsigned count=0) {
         traceGpuComplete=false;
+        if(fenceReady==request) {
+            // The timer already observed this head's fixed target. The
+            // immediate queue pass still checks the GPU epoch before flip.
+            traceGpuComplete=true;
+            return true;
+        }
         if(fenceFor!=request) {
             fenceFor=request;fenceTarget=0;fenceSince=0;fenceCaptured=false;fenceSlow=false;
             scanoutCaptured=false;scanoutTargets[0]=scanoutTargets[1]=0;
+            fencePages=nullptr;fencePageCount=0;
         }
+        if(pages && count) {fencePages=pages;fencePageCount=count;}
         uint32_t submitted=0,retired=0,detail[3]={0,0,4};
         // Preserve the CPU-only backend when no GPU fence interface is linked.
         if(!&native_adreno_fences_detail && !&native_adreno_fences) {
@@ -627,7 +637,8 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
                 if(us>native_legacy_direct[11])native_legacy_direct[11]=us;
                 if(us>=8000)native_legacy_direct[13]=native_legacy_direct[13]+1;
             }
-            fenceFor=nullptr;return true;
+            fenceFor=nullptr;fencePages=nullptr;fencePageCount=0;
+            return true;
         }
         if(!fenceSince) {fenceSince=mach_absolute_time();native_legacy_direct[9]=native_legacy_direct[9]+1;stat(6);note(2,-1,request);}
         uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time()-fenceSince,&ns);
@@ -638,13 +649,16 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         }
         gpuTraceEvent(GpuTraceDisplayFence,0,traceId(request),known?3:4,fenceTarget,submitted,retired,ns,detail[0],detail[1],detail[2]);
         transferred=true;
-        fenceTimer->setTimeoutUS(200);
+        // Keep the short interval for the first frame. A persistent wait
+        // needs fewer work-loop wakeups while keeping its original target.
+        const unsigned delay=ns<17000000ull?200:ns<50000000ull?1000:ns<250000000ull?4000:8000;
+        fenceTimer->setTimeoutUS(delay);
         return false;
     }
     void clearFenceWait() {
         if(fenceTimer)fenceTimer->cancelTimeout();
-        fenceFor=nullptr;fenceTarget=0;fenceSince=0;fenceCaptured=false;fenceSlow=false;traceGpuComplete=false;
-        scanoutCaptured=false;
+        fenceFor=nullptr;fenceReady=nullptr;fencePages=nullptr;fencePageCount=0;fenceTarget=0;
+        fenceSince=0;fenceCaptured=false;fenceSlow=false;traceGpuComplete=false;scanoutCaptured=false;
     }
     void discardGpuSwap(const OriginalLegacySwapRequest *request) {
         clearFenceWait();
@@ -681,7 +695,24 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         return !discardResetSwap(request);
     }
     static void fenceFired(OSObject *owner,IOTimerEventSource *) {static_cast<NativeLegacyDisplay *>(owner)->fenceTick();}
-    void fenceTick() {transferred=false;kickSwapQueue();}
+    void fenceTick() {
+        const OriginalLegacySwapRequest *request=fenceFor;
+        if(!request)return;   // A queued callback after cancellation cannot unblock a newer transfer.
+        if(!isValidated(request) || pendingSwapRequest()!=request) {
+            clearFenceWait();
+            transferred=false;
+            kickSwapQueue();
+            return;
+        }
+        if(!gpuWrote(request,fencePages,fencePageCount)) {
+            if(!fenceFor && rekick)kickSwapQueue();   // A reset or failed fence retired this head.
+            return;
+        }
+        fenceReady=request;
+        transferred=false;
+        kickSwapQueue();
+        fenceReady=nullptr;
+    }
     static void latchFired(OSObject *owner,IOTimerEventSource *) {static_cast<NativeLegacyDisplay *>(owner)->latchTick();}
     void latchTick() {
         if(pendingSlot<0)return;
@@ -694,7 +725,7 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
                 latchTimedOut=true;
             }
             // Either slot may still be scanned. Keep both pinned until hardware acknowledges the flip.
-            latchTimer->setTimeoutUS(latchTimedOut?8000:500);
+            latchTimer->setTimeoutUS(latchTimedOut?8000:ns<17000000ull?500:2000);
             return;
         }
         const uint32_t us=uint32_t(ns/1000);
@@ -869,12 +900,15 @@ public:
             display->primary=false;
             stopSurfaceSamples(display);
             display->stopTransferEvents();
+#if defined(NATIVE_LEGACY_MACOS) && NATIVE_LEGACY_MACOS
+            display->clearHeldSwapInfo();
+#endif
             display->transferred=false;display->gpuRequest=nullptr;display->gpuRetired=false;
             for(unsigned i=0;i<8;++i)if(display->validated[i])display->removeValidated(display->validated[i]);
             display->directToBoot();
             display->latchRequest=nullptr;display->pendingSlot=-1;
+            display->clearFenceWait();
             if(display->fenceTimer) {
-                display->fenceTimer->cancelTimeout();
                 if(IOWorkLoop *loop=display->getWorkLoop())loop->removeEventSource(display->fenceTimer);
                 OSSafeReleaseNULL(display->fenceTimer);
             }
@@ -1275,9 +1309,11 @@ public:
     // 0, and the swap's two completion words.
     struct SwapInfo {uint32_t swapID,pad;uint64_t words[5];};
     static_assert(sizeof(SwapInfo)==48,"IOMobileFramebufferLegacy::SwapInfoBlob");
-    static constexpr unsigned kSwapInfoRing=6;
-    SwapInfo swapInfo[kSwapInfoRing];   // no initializers: IOKit objects are allocated zeroed (see validatedAt)
-    unsigned swapInfoRead,swapInfoWrite;
+    static constexpr unsigned kSwapInfoRing=64;   // Half a second of held notifications at 120 Hz.
+    // Give the family persistent blob storage, including for the unheld path.
+    SwapInfo swapInfo[kSwapInfoRing],immediateSwapInfo;   // IOKit objects are allocated zeroed (see validatedAt).
+    unsigned swapInfoRead,swapInfoQueued,swapInfoDropped;
+    void clearHeldSwapInfo() {swapInfoRead=swapInfoQueued=swapInfoDropped=0;}
     IOReturn collectCompletionReports(uint32_t swapID,void *,uint32_t *count,uint32_t) override {
         if(count)*count=0;
         auto self=reinterpret_cast<unsigned char *>(this);
@@ -1285,19 +1321,35 @@ public:
         uint32_t dropped=0;
         if(swap)memcpy(&dropped,swap+kRequestDropReasons,4);
         if(!swap || dropped)return kIOReturnUnsupported;
-        SwapInfo &info=swapInfo[swapInfoWrite];
-        info={};info.swapID=swapID;
+        SwapInfo info={};
+        info.swapID=swapID;
         memcpy(&info.words[0],self+kLegacySwapInfoTime,8);
         memcpy(&info.words[2],swap+kRequestSwapInfoA,8);
         uint32_t second=0;memcpy(&second,swap+kRequestSwapInfoB,4);info.words[3]=second;
         uint16_t held=0;memcpy(&held,self+kLegacySwapInfoHeld,2);
         if(held){
-            swapInfoWrite=(swapInfoWrite+1)%kSwapInfoRing;
-            if(swapInfoWrite==swapInfoRead)swapInfoRead=(swapInfoRead+1)%kSwapInfoRing;
+            if(swapInfoQueued==kSwapInfoRing) {
+                // Bound kernel memory even if the family holds notifications indefinitely.
+                if(!swapInfoDropped)IOLog("NativeLegacyDisplay: held swap notifications overflow\n");
+                if(swapInfoDropped<UINT32_MAX)++swapInfoDropped;
+                swapInfoRead=(swapInfoRead+1)%kSwapInfoRing;
+                --swapInfoQueued;
+            }
+            swapInfo[(swapInfoRead+swapInfoQueued)%kSwapInfoRing]=info;
+            ++swapInfoQueued;
             return kIOReturnSuccess;
         }
-        for(;swapInfoRead!=swapInfoWrite;swapInfoRead=(swapInfoRead+1)%kSwapInfoRing)native_legacy_swap_info_dispatch(this,&swapInfo[swapInfoRead]);
-        native_legacy_swap_info_dispatch(this,&info);
+        if(swapInfoDropped) {
+            IOLog("NativeLegacyDisplay: %u held swap notifications dropped\n",swapInfoDropped);
+            swapInfoDropped=0;
+        }
+        while(swapInfoQueued) {
+            native_legacy_swap_info_dispatch(this,&swapInfo[swapInfoRead]);
+            swapInfoRead=(swapInfoRead+1)%kSwapInfoRing;
+            --swapInfoQueued;
+        }
+        immediateSwapInfo=info;
+        native_legacy_swap_info_dispatch(this,&immediateSwapInfo);
         return kIOReturnSuccess;
     }
     // The client's async result: the mask, the swap ID and each word the mask asks for (word 1 is the time since its previous

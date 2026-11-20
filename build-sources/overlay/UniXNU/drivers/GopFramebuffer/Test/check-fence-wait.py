@@ -35,6 +35,7 @@ diagnostics = (
     fragment('// The boot-log writer enables', 'extern "C" void native_legacy_gpu_fallback_observed')
 )
 blank = fragment('        if(!accepted && reason==2 && !surface', '        if(accepted && !addValidated')
+held_swap = fragment('    struct SwapInfo {', "    // The client's async result").replace(' override', '')
 methods = []
 # The cancellation method ends at its closing brace: it answers differently on macOS inside its own conditional block.
 for start, end, keep in [('    bool isValidated(', '    uint64_t traceRequestIds[8]', ''),
@@ -42,6 +43,7 @@ for start, end, keep in [('    bool isValidated(', '    uint64_t traceRequestIds
                          ('    bool addValidated(', '    const OriginalLegacySwapRequest *gpuRequest=', ''),
                          ('    static void sortScanoutPages(', '    int directSlot(', ''),
                          ('    bool gpuWrote(', '    static void fenceFired(', ''),
+                         ('    void fenceTick()', '    static void latchFired(', ''),
                          ('    void latchTick()', '    // Back to the boot loader', ''),
                          ('    void startTransferEvents()', '    void forgetDirectDisplay()', ''),
                          ('    void finishGpuSwap(', '    // Hands the pending head', ''),
@@ -53,6 +55,7 @@ for start, end, keep in [('    bool isValidated(', '    uint64_t traceRequestIds
 harness = r'''
 #include <atomic>
 #include <cassert>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -95,7 +98,9 @@ static uint32_t native_legacy_direct[14];
 static uint64_t native_legacy_swap_timeouts;
 static bool queryKnown,resetDuringQuery;
 static uint32_t querySubmitted,queryRetired,queryReason;
+static unsigned queryCalls;
 static bool detail(uint32_t *submitted,uint32_t *retired,uint32_t *extra) {
+    ++queryCalls;
     if(resetDuringQuery){resetEpoch+=2;resetDuringQuery=false;}
     extra[2]=queryReason;
     if(queryKnown){*submitted=querySubmitted;*retired=queryRetired;}
@@ -170,7 +175,9 @@ struct Display : OSObject {
     const OriginalLegacySwapRequest *retireRequest=nullptr,*head=nullptr;
     IOTimerEventSource *retireTimer=nullptr;
     const OriginalLegacySwapRequest *pendingSwapRequest() const {return head;}
-    const OriginalLegacySwapRequest *fenceFor=nullptr,*gpuRequest=nullptr,*validated[8]={};
+    const OriginalLegacySwapRequest *fenceFor=nullptr,*fenceReady=nullptr,*gpuRequest=nullptr,*validated[8]={};
+    const uint64_t *fencePages=nullptr;
+    unsigned fencePageCount=0;
     uint32_t fenceTarget=0,validatedGpuEpoch[8]={};
     uint32_t scanoutTargets[2]={};
     uint64_t traceRequestIds[8]={},validatedAt[8]={};
@@ -205,7 +212,8 @@ struct Display : OSObject {
     uint32_t mdp[1]={};
     static constexpr uint32_t kCtlFlush=0;
     unsigned kicks=0,finished=0;
-    void kickSwapQueue() {++kicks;}
+    void (*kickBody)(Display &)=nullptr;
+    void kickSwapQueue() {++kicks;if(kickBody)kickBody(*this);}
     unsigned waits=0,passed=0;
     uint64_t traceId(const OriginalLegacySwapRequest *) {return 1;}
     void stat(unsigned) {}
@@ -465,7 +473,10 @@ static void testLatch() {
     d.latchStart=clockNow;d.mdp[0]=3;
     d.latchTick();
     assert(d.latch.delay==500 && d.shownSlot==0 && d.pendingSlot==1 && !d.finished);
-    clockNow+=50000000ull;
+    clockNow+=17000000ull;
+    d.latchTick();
+    assert(d.latch.delay==2000 && d.shownSlot==0 && d.pendingSlot==1 && !d.finished);
+    clockNow+=33000000ull;
     d.latchTick();d.latchTick();
     assert(d.latch.delay==8000 && d.shownSlot==0 && d.pendingSlot==1 && !d.finished);
     assert(native_legacy_direct[3]==1);
@@ -479,6 +490,74 @@ static void testLatch() {
     d.latchTick();
     assert(d.shownSlot==2 && d.pendingSlot==-1 && d.finished==1 && !d.transferred);
     std::puts("PASS: full validation queue and delayed display latch after swap cancellation");
+}
+
+static unsigned scopedPolls;
+static uint64_t scopedPages[]={0x1000,0x2000};
+static IOReturn scopedFence(const uint64_t *pages,unsigned count,bool *captured,uint32_t *targets,uint32_t *) {
+    ++scopedPolls;
+    assert(pages==scopedPages && count==2);
+    if(scopedPolls<3)return kIOReturnBusy;
+    *captured=true;targets[0]=191;
+    return kIOReturnSuccess;
+}
+static void testPendingFenceTimer() {
+    OriginalLegacySwapRequest request;
+    Display d;
+    d.head=&request;
+    d.addValidated(&request,resetEpoch);
+    d.kickBody=[](Display &display) {
+        int slot=-1;
+        assert(display.prepareDirectSwap(display.head,nullptr,nullptr,slot));
+        assert(slot==2 && display.traceGpuComplete);
+    };
+    const uint64_t start=clockNow;
+    const unsigned before=queryCalls;
+    query(true,190,189);
+    assert(!d.gpuWrote(&request) && d.timer.delay==200 && d.transferred);
+    const struct {uint64_t elapsed;unsigned delay;} intervals[]={
+        {200000,200},{17000000,1000},{50000000,4000},{250000000,8000},
+    };
+    for(const auto &sample:intervals) {
+        clockNow=start+sample.elapsed;
+        d.fenceTick();
+        assert(d.timer.delay==sample.delay && d.transferred && !d.kicks && !d.directMaps);
+        assert(d.fenceTarget==190);
+    }
+    query(true,192,190);
+    d.fenceTick();
+    assert(d.kicks==1 && d.directMaps==1 && queryCalls==before+6);
+    assert(!d.fenceFor && !d.fenceReady && !d.transferred);
+    d.transferred=true;
+    d.fenceTick();   // An old wakeup cannot release an unrelated transfer.
+    assert(d.transferred && d.kicks==1 && queryCalls==before+6);
+
+    Display scanout;
+    scanout.head=&request;
+    scanout.addValidated(&request,resetEpoch);
+    scanout.mappedPages=scopedPages;
+    scanout.directSlots[2].pageCount=2;
+    queryScanout=scopedFence;
+    int slot=-1;
+    assert(!scanout.prepareDirectSwap(&request,nullptr,nullptr,slot));
+    assert(scanout.directMaps==1 && scopedPolls==1 && !scanout.scanoutCaptured);
+    scanout.fenceTick();
+    assert(scanout.directMaps==1 && scopedPolls==2 && !scanout.kicks);
+    scanout.kickBody=d.kickBody;
+    scanout.fenceTick();
+    assert(scanout.directMaps==2 && scopedPolls==3 && scanout.kicks==1);
+    queryScanout=nullptr;
+
+    Display cancelled;
+    cancelled.head=&request;
+    cancelled.addValidated(&request,resetEpoch);
+    query(true,200,199);
+    assert(!cancelled.gpuWrote(&request));
+    assert(cancelled.cancelSwapsAfterTimeout());
+    const unsigned beforeCancel=queryCalls;
+    cancelled.fenceTick();
+    assert(!cancelled.kicks && !cancelled.directMaps && queryCalls==beforeCancel);
+    std::puts("PASS: fence timer polls only its held target, backs off slow waits and kicks exactly once on completion");
 }
 
 static void testRetirement() {
@@ -662,11 +741,78 @@ static void testBlankValidation() {
     assert(!validator.accepts(request,2,nullptr));
     std::puts("PASS: blank swap branch obeys the cached validation option and rejects unexpected layers and options");
 }
+struct FamilySwap {uint32_t dropped,pad;uint64_t first;uint32_t second;};
+struct FamilyState {FamilySwap *swap;uint64_t time;uint16_t held;};
+constexpr auto kLegacyCurrentSwap=offsetof(FamilyState,swap);
+constexpr auto kLegacySwapInfoTime=offsetof(FamilyState,time);
+constexpr auto kLegacySwapInfoHeld=offsetof(FamilyState,held);
+constexpr auto kRequestDropReasons=offsetof(FamilySwap,dropped);
+constexpr auto kRequestSwapInfoA=offsetof(FamilySwap,first);
+constexpr auto kRequestSwapInfoB=offsetof(FamilySwap,second);
+static unsigned logOverflow,logDropCount;
+static void IOLog(const char *) {++logOverflow;}
+static void IOLog(const char *,unsigned count) {logDropCount=count;}
+static std::vector<uint32_t> notified;
+static size_t heldObjectBytes;
+static void native_legacy_swap_info_dispatch(void *owner,void *blob) {
+    const auto address=reinterpret_cast<uintptr_t>(blob),start=reinterpret_cast<uintptr_t>(owner);
+    assert(address>=start && address-start<=heldObjectBytes-48);
+    auto *bytes=static_cast<unsigned char *>(blob);
+    uint32_t id=0;
+    memcpy(&id,bytes,sizeof(id));
+    uint64_t time=0,first=0,second=0;
+    memcpy(&time,bytes+8,8);memcpy(&first,bytes+24,8);memcpy(&second,bytes+32,8);
+    assert(time==uint64_t(id)*100 && first==uint64_t(id)*200 && second==id+1);
+    notified.push_back(id);
+}
+struct HeldNotice {
+    FamilyState family;
+#include "held-swap.inc"
+};
+static void testHeldSwapNotices() {
+    HeldNotice queue{};
+    heldObjectBytes=sizeof(queue);
+    FamilySwap swap{};
+    auto publish=[&](uint32_t id) {
+        queue.family.swap=&swap;
+        queue.family.time=uint64_t(id)*100;
+        swap.first=uint64_t(id)*200;swap.second=id+1;
+        uint32_t count=99;
+        assert(queue.collectCompletionReports(id,nullptr,&count,0)==kIOReturnSuccess && !count);
+    };
+    queue.family.held=1;
+    for(uint32_t id=1;id<=queue.kSwapInfoRing;++id)publish(id);
+    assert(notified.empty() && !logOverflow && !logDropCount);
+    queue.family.held=0;
+    publish(queue.kSwapInfoRing+1);
+    assert(notified.size()==queue.kSwapInfoRing+1);
+    for(uint32_t i=0;i<notified.size();++i)assert(notified[i]==i+1);
+
+    notified.clear();
+    queue.family.held=1;
+    for(uint32_t id=1;id<=queue.kSwapInfoRing+3;++id)publish(id);
+    assert(notified.empty() && logOverflow==1 && !logDropCount);
+    queue.family.held=0;
+    publish(queue.kSwapInfoRing+4);
+    assert(notified.size()==queue.kSwapInfoRing+1 && logDropCount==3);
+    for(uint32_t i=0;i<notified.size();++i)assert(notified[i]==i+4);
+
+    notified.clear();
+    queue.family.held=1;
+    publish(1);
+    queue.clearHeldSwapInfo();
+    queue.family.held=0;
+    publish(2);
+    assert(notified.size()==1 && notified[0]==2);
+    std::puts("PASS: held swap notifications drain oldest first, record overflow and discard old-connection entries at stop");
+}
 int main() {
+    testHeldSwapNotices();
     testSwapRing();
     testSurfaceSamples();
     testBlankValidation();
     testLatch();
+    testPendingFenceTimer();
     testRetirement();
     testGpuHandoff();
     OriginalLegacySwapRequest a,b;
@@ -776,6 +922,7 @@ with tempfile.TemporaryDirectory(prefix='gop-fence-wait-') as directory:
     (root / 'gpu.inc').write_text('\n'.join(gpu_methods))
     (root / 'diagnostics.inc').write_text(diagnostics)
     (root / 'blank.inc').write_text(blank)
+    (root / 'held-swap.inc').write_text(held_swap)
     (root / 'test.cpp').write_text(harness)
     subprocess.run([os.environ.get('CXX', 'c++'), '-std=c++17', '-Wall', '-Wextra', '-Werror',
                     f'-DTEST_ADRENO={int(bool(gpu_methods))}',

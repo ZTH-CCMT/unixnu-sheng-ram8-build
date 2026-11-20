@@ -31,7 +31,8 @@ enum : uint32_t {SubmitIndirectBuffer=0x3f,SubmitIbWords=3,
 extern "C" {volatile uint32_t native_adreno_coherence[8];}
 /* IBs per submission: [0] submissions, [1] IBs, [2] the most in one, [3] submissions with more than 16 (one frame was several before). */
 extern "C" {volatile uint32_t native_adreno_submit_ibs[4];}
-/* The submission (1-based count) at which the write-combine audit found a dirty IB line or failed; 0 = never. */
+/* The submission attempt (1-based native_adreno_submit_ibs[0]) where the
+ * write-combine audit found a dirty IB line or failed. Zero means never. */
 extern "C" {volatile uint32_t native_adreno_wc_distrusted;}
 /* The write-combine audit before each submission while trusted: [0] submissions audited, [1] IB lines compared, [2] dirty lines,
  * [3] stale clean lines, [4] the last audit failure (any failure also ends the trust), [5] pages found back at the default attribute
@@ -150,6 +151,36 @@ extern "C" {volatile uint64_t (*native_adreno_tl)[8]=nullptr;volatile uint32_t n
  * 4 snapshot, 0 the stall ended) | timed-out waits << 8, [3] time the fence had been pending (us), [4] read and write pointer before | after << 32 for
  * events 1 and 3, [5] client queue, [6] the job's first buffer handle | its buffer count << 48, [7] the sequence number. */
 extern "C" {volatile uint64_t native_adreno_stall_log[32][8];volatile uint32_t native_adreno_stall_log_count;}
+/* Companion rows retain the full hardware/software pointers. The legacy
+ * packed 16-bit columns stay in their original locations for existing readers. */
+static uint64_t stall_pointer_sequence[32];
+static uint32_t stall_pointer_log[32][6];   // fence, event, before RPTR/WPTR, after RPTR/WPTR
+static void recordStallPointers(uint32_t index,uint32_t fence,uint32_t event,
+    uint32_t before_r,uint32_t before_w,uint32_t after_r,uint32_t after_w)
+{
+    const uint32_t slot=index&31;
+    const uint32_t values[]={fence,event,before_r,before_w,after_r,after_w};
+    __atomic_store_n(&stall_pointer_sequence[slot],UINT64_C(0),__ATOMIC_SEQ_CST);
+    for(unsigned i=0;i<6;++i)__atomic_store_n(&stall_pointer_log[slot][i],values[i],__ATOMIC_SEQ_CST);
+    __atomic_store_n(&stall_pointer_sequence[slot],uint64_t(index)+1,__ATOMIC_SEQ_CST);
+}
+extern "C" bool native_adreno_stall_pointers_copy(uint32_t index,uint32_t out[6])
+{
+    if(!out)return false;
+    const uint32_t slot=index&31;
+    const uint64_t expected=uint64_t(index)+1;
+    if(__atomic_load_n(&stall_pointer_sequence[slot],__ATOMIC_SEQ_CST)!=expected)return false;
+    uint32_t sample[6];
+    for(unsigned i=0;i<6;++i)sample[i]=__atomic_load_n(&stall_pointer_log[slot][i],__ATOMIC_SEQ_CST);
+    if(__atomic_load_n(&stall_pointer_sequence[slot],__ATOMIC_SEQ_CST)!=expected)return false;
+    for(unsigned i=0;i<6;++i)out[i]=sample[i];
+    return true;
+}
+static uint64_t packLegacyStallPointers(uint32_t before_r,uint32_t before_w,uint32_t after_r,uint32_t after_w)
+{
+    return uint64_t(before_r&0xffff)|uint64_t(before_w&0xffff)<<16|
+        uint64_t(after_r&0xffff)<<32|uint64_t(after_w&0xffff)<<48;
+}
 extern "C" volatile uint32_t native_gpu_dcvs[15] __attribute__((weak_import));
 extern "C" {volatile uint32_t native_adreno_job_time[8];volatile uint64_t native_adreno_long_jobs[8][8],native_adreno_slow_jobs[16][8];
     volatile uint32_t native_adreno_stall_kick[26];}
@@ -376,7 +407,7 @@ void NativeAdrenoSubmit::driveSwitch(const NativeAdrenoRingClock *clock)
             static_cast<NativeAdrenoRing *>(cookie)->capturePublishedTail(out);
         };
         bool ready=false;
-        if(preempt_.trigger(i,true,capture?+capture_tail:nullptr,ring(loaded),&ready)) {
+        if(preempt_.trigger(i,true,+capture_tail,ring(loaded),&ready,capture)) {
             aging_grant_=i==1 && high;ring(0)->setCurrent(false);ring(1)->setCurrent(false);
             // The CP can finish before the interrupt worker acquires the submission lock.
             if(ready)(void)completeSwitch();
@@ -408,14 +439,14 @@ bool NativeAdrenoSubmit::completeSwitch(bool *read_error)
     exposed_through_[index]=now->lastSubmitted();
     const bool restorePending=now->restorePending();
     const uint32_t latestWptr=now->writePointer();
-    const uint32_t exhaustedBefore=native_adreno_wptr_fence[3];
+    const uint32_t exhaustedBefore=__atomic_load_n(&native_adreno_wptr_fence[3],__ATOMIC_RELAXED);
     const IOReturn restoreStatus=now->restoreWptr();
     if((restorePending || latestWptr!=switch_saved_wptr_) && &native_gpu_trace_enabled && native_gpu_trace_enabled()) {
         uint32_t rptr,wptr;
         const uint32_t valid=now->readHardwarePointers(rptr,wptr);
         const uint64_t sampled=clock_now_?clock_now_(clock_cookie_):0;
         const uint64_t values[]={sampled,switch_saved_fence_,now->lastSubmitted(),switch_saved_wptr_,latestWptr,
-            restorePending,uint32_t(restoreStatus),rptr,wptr,valid,native_adreno_wptr_fence[3]-exhaustedBefore};
+            restorePending,uint32_t(restoreStatus),rptr,wptr,valid,__atomic_load_n(&native_adreno_wptr_fence[3],__ATOMIC_RELAXED)-exhaustedBefore};
         publishWptrSample(native_adreno_wptr_handoff[index],values);
     }
     if(restoreStatus) {markPreemptDead(6);return false;}
@@ -633,7 +664,8 @@ IOReturn NativeAdrenoSubmit::submit(NativeAdrenoVm *vm,const NativeAdrenoSubmitB
         const uint64_t now=clock->now_us(clock->cookie);
         laps[slot]=now-lap_us;lap_us=now;
     };
-    native_adreno_submit_ibs[0]=native_adreno_submit_ibs[0]+1;native_adreno_submit_ibs[1]=native_adreno_submit_ibs[1]+(uint32_t)count;
+    const uint32_t submission=native_adreno_submit_ibs[0]+1;
+    native_adreno_submit_ibs[0]=submission;native_adreno_submit_ibs[1]=native_adreno_submit_ibs[1]+(uint32_t)count;
     if(count>native_adreno_submit_ibs[2])native_adreno_submit_ibs[2]=(uint32_t)count;
     if(count>16)native_adreno_submit_ibs[3]=native_adreno_submit_ibs[3]+1;
     /* Every buffer is validated against the live VM before any reference. */
@@ -712,7 +744,7 @@ IOReturn NativeAdrenoSubmit::submit(NativeAdrenoVm *vm,const NativeAdrenoSubmitB
         }
         if(dirty || (audited && audited!=kIOReturnUnsupported)) {
             vm_->distrustWriteCombined();
-            native_adreno_wc_distrusted=native_adreno_coherence[0]+1;
+            native_adreno_wc_distrusted=submission?submission:UINT32_MAX;
         }
     }
     /* The driver's own buffers (ring, memptrs, SQE, preemption records) are not cleaned at every submission: their writers keep the
@@ -720,7 +752,7 @@ IOReturn NativeAdrenoSubmit::submit(NativeAdrenoVm *vm,const NativeAdrenoSubmitB
      * head of each one as a CPU cache and DRAM hold it (the ring lines the submission before stored are among them); a dirty line (a
      * writer that stored through a cacheable mapping and did not clean) ends that trust for good, and from this submission on they
      * are cleaned every time. */
-    if((native_adreno_submit_ibs[0]<=8 || !(native_adreno_submit_ibs[0]&1023)) && !native_adreno_sync_audit[4] && auditsWanted()) {
+    if((submission<=8 || !(submission&1023)) && !native_adreno_sync_audit[4] && auditsWanted()) {
         uint32_t lines=0,dirty=0,stale=0;
         const IOReturn audited=vm_->auditSynchronized(&lines,&dirty,&stale);
         if(audited!=kIOReturnUnsupported) {   /* no board hook (host): nothing to compare */
@@ -875,12 +907,14 @@ IOReturn NativeAdrenoSubmit::noteStall(uint32_t observed,const NativeAdrenoRingC
     }
     const uint64_t now=clock && clock->now_us?clock->now_us(clock->cookie):0;
     auto log=[&](uint32_t fence,uint32_t event,uint64_t pending,uint32_t before_r,uint32_t before_w) {
-        const uint32_t n=native_adreno_stall_log_count;volatile uint64_t *slot=native_adreno_stall_log[n&31];
+        const uint32_t n=__atomic_load_n(&native_adreno_stall_log_count,__ATOMIC_RELAXED);volatile uint64_t *slot=native_adreno_stall_log[n&31];
         const Job *owner=find(fence);
         slot[0]=now;slot[1]=fence;slot[2]=(uint64_t)event|(uint64_t)stall_timeouts<<8;slot[3]=pending;
-        slot[4]=(uint64_t)before_r|(uint64_t)before_w<<16|(uint64_t)stalled->readPointer()<<32|(uint64_t)(stalled->writePointer()&0xffff)<<48;
+        const uint32_t after_r=stalled->readPointer(),after_w=stalled->writePointer();
+        slot[4]=packLegacyStallPointers(before_r,before_w,after_r,after_w);
         slot[5]=owner?owner->queue:0;slot[6]=owner?(owner->handles[0]&0xffffffffffffull)|(uint64_t)owner->count<<48:0;slot[7]=n;
-        native_adreno_stall_log_count=n+1;
+        recordStallPointers(n,fence,event,before_r,before_w,after_r,after_w);
+        __atomic_store_n(&native_adreno_stall_log_count,n+1,__ATOMIC_RELEASE);
     };
     if(next!=stall_fence) {
         if(stall_timeouts && now) {
@@ -944,7 +978,7 @@ IOReturn NativeAdrenoSubmit::noteStall(uint32_t observed,const NativeAdrenoRingC
      * progress, measured in time (a timed-out wait is one poll, 100 us or less), and so does the snapshot below. */
     if(kick_due) {
         native_adreno_unstick[0]=native_adreno_unstick[0]+1;native_adreno_unstick[1]=stall_fence;stall_stage=StallKicked;
-        const uint32_t r0=stalled->readPointer(),w0=stalled->writePointer()&0xffff;
+        const uint32_t r0=stalled->readPointer(),w0=stalled->writePointer();
         uint64_t handoffSample[11]{};
         if(preemption() && stalled->current()) {
             const auto &handoff=native_adreno_wptr_handoff[stalled==ring(1)?1:0];
@@ -959,18 +993,18 @@ IOReturn NativeAdrenoSubmit::noteStall(uint32_t observed,const NativeAdrenoRingC
         const uint64_t actions[]={stall_fence,now,uint32_t(invalidateStatus),uint32_t(kickStatus)};
         publishWptrSample(native_adreno_stall_actions,actions);
         stall_kick_us=now;
-        log(stall_fence,1,pending,r0&0xffff,w0);
+        log(stall_fence,1,pending,r0,w0);
     }
     /* Still stopped well after that: the way a6xx drains the bus before a reset, which lets a write that was never acknowledged end. */
     if(now && stage_due(stall_stage,StallKicked,pending,200000)) {
         uint32_t ack[2]={};
         native_adreno_unstick[4]=native_adreno_unstick[4]+1;native_adreno_unstick[7]=stall_fence;
-        const uint32_t r0=stalled->readPointer(),w0=stalled->writePointer()&0xffff;
+        const uint32_t r0=stalled->readPointer(),w0=stalled->writePointer();
         const IOReturn status=stalled->drainBus(ack);
         stall_stage=status?StallDrainFailed:StallDrained;
         native_adreno_unstick[5]=ack[0];native_adreno_unstick[6]=ack[1];
         native_adreno_unstick[14]=uint32_t(status);
-        log(stall_fence,status?5u:3u,pending,r0&0xffff,w0);    /* 5 = drain failed */
+        log(stall_fence,status?5u:3u,pending,r0,w0);    /* 5 = drain failed */
         return status;
     }
     return kIOReturnSuccess;
@@ -981,12 +1015,14 @@ void NativeAdrenoSubmit::snapshot(uint32_t next,uint32_t waited,uint64_t now,uin
     uint32_t words[NativeAdrenoRingStallWords]={},fault[4]={};
     if(stalled->stallState(words))return;
     {
-        const uint32_t n=native_adreno_stall_log_count;volatile uint64_t *slot=native_adreno_stall_log[n&31];
+        const uint32_t n=__atomic_load_n(&native_adreno_stall_log_count,__ATOMIC_RELAXED);volatile uint64_t *slot=native_adreno_stall_log[n&31];
         const Job *owner=find(next);
         slot[0]=now;slot[1]=next;slot[2]=4u|(uint64_t)stall_timeouts<<8;slot[3]=pending;
-        slot[4]=(uint64_t)(words[8]&0xffff)|(uint64_t)(words[9]&0xffff)<<16|(uint64_t)stalled->readPointer()<<32|(uint64_t)(stalled->writePointer()&0xffff)<<48;
+        const uint32_t after_r=stalled->readPointer(),after_w=stalled->writePointer();
+        slot[4]=packLegacyStallPointers(words[8],words[9],after_r,after_w);
         slot[5]=owner?owner->queue:0;slot[6]=owner?(owner->handles[0]&0xffffffffffffull)|(uint64_t)owner->count<<48:0;slot[7]=n;
-        native_adreno_stall_log_count=n+1;
+        recordStallPointers(n,next,4,words[8],words[9],after_r,after_w);
+        __atomic_store_n(&native_adreno_stall_log_count,n+1,__ATOMIC_RELEASE);
     }
     (void)vm_->faultState(fault);
     for(uint32_t i=0;i<4;++i)native_adreno_stall_mem[i]=fault[i];

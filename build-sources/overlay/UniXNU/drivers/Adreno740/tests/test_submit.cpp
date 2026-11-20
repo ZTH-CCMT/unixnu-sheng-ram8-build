@@ -15,6 +15,8 @@ extern "C" volatile uint64_t native_adreno_wptr_handoff[3][11];
 extern "C" volatile uint32_t native_adreno_unstick[15];
 extern "C" volatile uint64_t native_adreno_stall_log[32][8];
 extern "C" volatile uint32_t native_adreno_stall_log_count;
+extern "C" bool native_adreno_stall_pointers_copy(uint32_t index,uint32_t out[6]);
+extern "C" uint32_t native_adreno_ring_log_copy(uint32_t (*out)[116],uint32_t capacity);
 
 IOReturn NativeAdrenoQueryCpu4K(NativeAdrenoCpuState *out)
 {CHECK(out);*out={};return kIOReturnSuccess;}
@@ -700,7 +702,9 @@ static void testInterleavedDiagnosticFences()
         const uint32_t fence=p.enqueue(index,index?7:8);
         CHECK(fence==i+1);
         const volatile uint32_t *ib=native_adreno_ib_log[(native_adreno_ib_log_count-1)&3];
-        const volatile uint32_t *log=native_adreno_ring_log[(native_adreno_ring_log_count-1)&3];
+        uint32_t snapshot[1][116]={};
+        CHECK(native_adreno_ring_log_copy(snapshot,1)==1);
+        const uint32_t *log=snapshot[0];
         CHECK(ib[0]==fence && log[0]==fence);
         const uint32_t *words=index?p.low_words:ringmem;
         const uint32_t address=index?0x208004:0x108004;
@@ -968,9 +972,17 @@ static void testStallDrainStatus()
     clock_us+=1;
     CHECK(p.submit.wait(sampled_fence,&ringclock,0)==kIOReturnTimeout && !p.ring.poisoned());
     cp.fail_read_reg=UINT32_MAX;
+    cp.regs[0x0806]=0x12345u;cp.regs[0x0807]=0x23456u;
     clock_us+=50000;
     CHECK(p.submit.wait(sampled_fence,&ringclock,0)==kIOReturnTimeout);
     CHECK(native_adreno_stall_kick[20]==(1u<<8));
+    const uint32_t last=native_adreno_stall_log_count;
+    uint32_t pointers[6]={};
+    CHECK(native_adreno_stall_pointers_copy(last-2,pointers));
+    CHECK(pointers[0]==sampled_fence && pointers[1]==4 && pointers[2]==0x12345u && pointers[3]==0x23456u);
+    CHECK((native_adreno_stall_log[(last-2)&31][4]&0xffffffffu)==0x34562345u);
+    CHECK(!native_adreno_stall_pointers_copy(last,pointers) && pointers[2]==0x12345u);
+    cp.regs[0x0806]=0;
     fencemem[1]=sampled_fence;
     CHECK(p.submit.wait(sampled_fence,&ringclock,0)==kIOReturnSuccess);
     for(const auto &test:cases) {
@@ -1271,8 +1283,9 @@ int main(int argc,char **argv)
         fencemem[1]=1;CHECK(!p.submit.fencePending(1));
         CHECK(p.submit.wait(1,&ringclock,1000)==kIOReturnSuccess && !p.submit.fencePending(1));
         dirty_lines=2;
+        const uint32_t dirty_submission=native_adreno_submit_ibs[0]+1;
         CHECK(p.submit.submit(&buffer,1,0,&fence)==kIOReturnSuccess && fence==2);
-        CHECK(!p.vm.writeCombinedTrusted() && native_adreno_wc_distrusted);
+        CHECK(!p.vm.writeCombinedTrusted() && native_adreno_wc_distrusted==dirty_submission);
         CHECK(fixture.physical_calls>physical);   /* this submission maintained the write-combined BO */
         const size_t calls=audited.size();
         fencemem[1]=2;CHECK(p.submit.wait(2,&ringclock,1000)==kIOReturnSuccess);

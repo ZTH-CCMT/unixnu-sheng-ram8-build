@@ -401,15 +401,19 @@ int main()
         const uint32_t one[1]={0xabc};uint32_t end=0;
         size_t before=0;for(auto &w:peer.writes)before+=w.first==0x0807;
         dropped=3;fence_reads=0;
+        fixture_delay_calls=fixture_delay_microseconds=0;
         CHECK(r.submit(one,1,&end)==kIOReturnSuccess);
+        CHECK(fixture_delay_calls==3 && fixture_delay_microseconds==30);
         size_t after=0;for(auto &w:peer.writes)after+=w.first==0x0807;
         CHECK(after-before==4 && fence_clears==3 && fence_reads==4);   /* the first write and three repeats */
         dropped=0;CHECK(r.kick()==kIOReturnSuccess);
+        CHECK(fixture_delay_calls==3 && fixture_delay_microseconds==30);
     }
     {
         reset();NativeAdrenoRing r;
         NativeAdrenoRingIo fenced=io;fenced.fence_cookie=&peer;fenced.fence_status=fence_status;
         CHECK(r.attach(&fenced,&cache,ring,sizeof(ring),0x100000,fence,sizeof(fence),0x108000)==kIOReturnSuccess);
+        fixture_delay_calls=fixture_delay_microseconds=0;
         const uint32_t exhausted=native_adreno_wptr_fence[3];
         const size_t first_write=peer.writes.size();
         dropped=201; // Initial write plus the entire 200-retry budget.
@@ -418,6 +422,7 @@ int main()
         CHECK(r.submit(&word,1,&issued)==kIOReturnSuccess && issued==1 && !r.poisoned());
         CHECK(native_adreno_wptr_fence[3]==exhausted+1 && !dropped && !flagged);
         CHECK(fence_reads==201 && fence_clears==201 && peer.writes.size()==first_write+201);
+        CHECK(fixture_delay_calls==200 && fixture_delay_microseconds==2000);
         for(size_t i=first_write;i<peer.writes.size();++i)
             CHECK(peer.writes[i].first==0x0807 && peer.writes[i].second==r.writePointer());
         // Exhaustion does not retire the job. A later kick can publish the pointer again.

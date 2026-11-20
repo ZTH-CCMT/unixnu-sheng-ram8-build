@@ -109,9 +109,11 @@ public:
     static bool setRecordWptr(uint8_t *record,uint32_t wptr);
     static uint32_t recordWord(const uint8_t *record,uint32_t byte_offset);
     /* Switch the CP to `ring`, which must not be the loaded one: its SMMU info and record go out first, then the control word
-     * with STOP. `uses_gmem` asks for GMEM save and restore. `ready` reports a successful readback with STOP already clear. */
+     * with STOP. `uses_gmem` asks for GMEM save and restore. `ready` reports a successful readback with STOP already clear.
+     * Timeout evidence can be armed without supplying the optional published-tail callback. */
     bool trigger(uint32_t ring,bool uses_gmem,
-        void (*capture_tail)(void *,NativeAdrenoPublishedTail *)=nullptr,void *tail_cookie=nullptr,bool *ready=nullptr);
+        void (*capture_tail)(void *,NativeAdrenoPublishedTail *)=nullptr,void *tail_cookie=nullptr,bool *ready=nullptr,
+        bool capture_evidence=true);
     /* Read-only diagnostics, called under the submission lock before noteTimeout
      * and before any reset. At most once for the active trigger; false leaves
      * out untouched. No scheduling, completion or poison changes. */

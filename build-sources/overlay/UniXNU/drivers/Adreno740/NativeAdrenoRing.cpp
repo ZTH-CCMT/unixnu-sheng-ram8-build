@@ -102,6 +102,33 @@ static uint32_t ilog2(size_t value)
 /* The last submissions as the CP will read them: [slot] fence, start index, end index, word count, then up to 112 ring words from the start. The board log
  * prints them, so a fence the GPU never wrote can be compared with the packets that should have written it. */
 extern "C" {volatile uint32_t native_adreno_ring_log[4][4+112];volatile uint32_t native_adreno_ring_log_count;}
+static IOLock *ring_log_lock;
+static uint64_t ring_log_total;
+static IOLock *ringLogLock()
+{
+    IOLock *lock=__atomic_load_n(&ring_log_lock,__ATOMIC_ACQUIRE);
+    if(lock)return lock;
+    IOLock *candidate=IOLockAlloc();
+    if(!candidate)return nullptr;
+    if(__atomic_compare_exchange_n(&ring_log_lock,&lock,candidate,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE))
+        return candidate;
+    IOLockFree(candidate);
+    return lock;
+}
+extern "C" uint32_t native_adreno_ring_log_copy(uint32_t (*out)[4+112],uint32_t capacity)
+{
+    IOLock *lock=__atomic_load_n(&ring_log_lock,__ATOMIC_ACQUIRE);
+    if(!out || !capacity || !lock)return 0;
+    IOLockLock(lock);
+    const uint32_t kept=ring_log_total<4?uint32_t(ring_log_total):4;
+    const uint32_t rows=capacity<kept?capacity:kept;
+    for(uint32_t i=0;i<rows;++i) {
+        const volatile uint32_t *const src=native_adreno_ring_log[(ring_log_total-1-i)&3];
+        for(uint32_t k=0;k<4+112;++k)out[i][k]=src[k];
+    }
+    IOLockUnlock(lock);
+    return rows;
+}
 /* GPU page table switches: [0] by the CP (CP_SMMU_TABLE_UPDATE in a framed prologue), [1] by the CPU while the GPU was idle, [2] process
  * tables made, [3] process tables freed, [4] live process tables, [5] their peak, [6] the last failure (IOReturn), [7] its step. */
 extern "C" {volatile uint32_t native_adreno_table_switches[8];}
@@ -116,23 +143,24 @@ IOReturn NativeAdrenoRing::poison()
 extern "C" {volatile uint32_t native_adreno_wptr_fence[4];}
 IOReturn NativeAdrenoRing::writeWptr(uint32_t value)
 {
-    native_adreno_wptr_fence[0]=native_adreno_wptr_fence[0]+1;
+    __atomic_fetch_add(&native_adreno_wptr_fence[0],1u,__ATOMIC_RELAXED);
     if(io_.write32(io_.cookie,RingWptr,value))return poison();
     if(!io_.fence_status)return kIOReturnSuccess;
     uint32_t status=0;
     for(unsigned tries=0;;++tries) {
         if(io_.barrier(io_.cookie) || io_.fence_status(io_.fence_cookie,0,&status))return poison();
-        if(!(status&1u)) {
-            if(tries)native_adreno_wptr_fence[1]=native_adreno_wptr_fence[1]+1;
-            return kIOReturnSuccess;
-        }
+        if(!(status&1u))return kIOReturnSuccess;
+        if(!tries)__atomic_fetch_add(&native_adreno_wptr_fence[1],1u,__ATOMIC_RELAXED);
         if(tries==200) {
-            native_adreno_wptr_fence[3]=native_adreno_wptr_fence[3]+1;
+            __atomic_fetch_add(&native_adreno_wptr_fence[3],1u,__ATOMIC_RELAXED);
             if(io_.fence_status(io_.fence_cookie,1,&status))return poison();
             return kIOReturnSuccess;   /* the stall handler gives WPTR again later */
         }
-        native_adreno_wptr_fence[2]=native_adreno_wptr_fence[2]+1;
+        __atomic_fetch_add(&native_adreno_wptr_fence[2],1u,__ATOMIC_RELAXED);
         if(io_.fence_status(io_.fence_cookie,1,&status))return poison();
+        // Match msm fenced_write's delay to let the GPU power domain come up.
+        // A successful first write pays no delay. The 200 retries budget 2 ms.
+        IODelay(10);
         if(io_.write32(io_.cookie,RingWptr,value))return poison();
     }
 }
@@ -674,13 +702,15 @@ IOReturn NativeAdrenoRing::submitWords(const uint32_t *words,size_t word_count,u
     if(status)return status;
     /* A submission may wrap. One publication covers both pieces. Sheng's
      * non-cacheable ring mapping needs only an ordering barrier here. */
-    {
-        const uint32_t slot=native_adreno_ring_log_count&3;
+    if(IOLock *const lock=ringLogLock()) {
+        IOLockLock(lock);
         const uint32_t total=(end-next_)&mask;
-        volatile uint32_t *record=native_adreno_ring_log[slot];
+        volatile uint32_t *const record=native_adreno_ring_log[ring_log_total&3];
         record[0]=number;record[1]=next_;record[2]=end;record[3]=total;
         for(uint32_t i=0;i<112;++i)record[4+i]=i<total?ring_[(next_+i)&mask]:0;
-        native_adreno_ring_log_count=native_adreno_ring_log_count+1;
+        ++ring_log_total;
+        __atomic_store_n(&native_adreno_ring_log_count,uint32_t(ring_log_total),__ATOMIC_RELEASE);
+        IOLockUnlock(lock);
     }
     if(cache_.publish(cache_.cookie,ring_,ring_bytes_))return poison();
     if(io_.barrier(io_.cookie))return poison();

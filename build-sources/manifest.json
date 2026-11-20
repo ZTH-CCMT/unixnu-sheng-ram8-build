@@ -28,13 +28,13 @@
       "repository": "UniXNU/drivers/Adreno740",
       "path": "NativeAdrenoPreempt.cpp",
       "before_sha256": "62b5bc2078be1b57eccaaf709ed7d66e215c119b98470bb38ae8bd18644ca58a",
-      "sha256": "7953d20f5a1d88725566efc85cc493a7655539417bbbe56ab698c56fa3df1ab1"
+      "sha256": "d37b004ac2f0a39d371d16608f11303ff507fe80ee8466a240d79f4419ee46e3"
     },
     "UniXNU/drivers/Adreno740/NativeAdrenoPreempt.h": {
       "repository": "UniXNU/drivers/Adreno740",
       "path": "NativeAdrenoPreempt.h",
       "before_sha256": "33b1804ba28d36d5a8aa3c67ec6476f737803e1864c049804bb6fcd3512d91b6",
-      "sha256": "7a52722972d7fca5a007b618848104ba55737054b4cd0d7d00ff54696bc7a0f3"
+      "sha256": "8514e14b0624506bab8dab7272c0addc0e4bb706cbf0172204624646df67d561"
     },
     "UniXNU/drivers/Adreno740/NativeAdrenoPublish.cpp": {
       "repository": "UniXNU/drivers/Adreno740",
@@ -46,7 +46,7 @@
       "repository": "UniXNU/drivers/Adreno740",
       "path": "NativeAdrenoSubmit.cpp",
       "before_sha256": "6343e5fc8fbf8c1d8d1c053b07744372a452021018283da0db9f74ddf566461e",
-      "sha256": "02366f1ca9e1edf79fbac759fe4beea04b518a2a686da953875a9fab819db496"
+      "sha256": "639f5127c0d6608fdecd647aeb6277fd523f7c26a60cea2ec2f8171facb9fe62"
     },
     "UniXNU/drivers/Adreno740/NativeAdrenoSubmit.h": {
       "repository": "UniXNU/drivers/Adreno740",
@@ -58,19 +58,19 @@
       "repository": "UniXNU/drivers/Adreno740",
       "path": "tests/XnuMemoryFixture.h",
       "before_sha256": "18f716267f696945de407b2927897b572b21f7bb4a6e91df8a63ee857d91a7f0",
-      "sha256": "0d2fbd92c87e8b6d66ad2ae9ae26491a74d4b70455501f43abe4cb031476d1a7"
+      "sha256": "9f9e7162e589fc8b32976847be29c14de9348223682b77623acd7438c891561f"
     },
     "UniXNU/drivers/Adreno740/tests/test_preempt.cpp": {
       "repository": "UniXNU/drivers/Adreno740",
       "path": "tests/test_preempt.cpp",
       "before_sha256": "e9be5cead892741646432e069bc26c443e584359ca82b403049ea6a859129cdb",
-      "sha256": "1067586c1009da2858905061da0c6845e6c0f00fcb0b5b8b8285a23dfae0932e"
+      "sha256": "9192a16c2644b9a153a33143f9635b8ddbf1f6808c0848ed7679be6531a46a3a"
     },
     "UniXNU/drivers/Adreno740/tests/test_submit.cpp": {
       "repository": "UniXNU/drivers/Adreno740",
       "path": "tests/test_submit.cpp",
       "before_sha256": "ea56b6eb4d9cf9936f472ed5bf622d7e9fe74773f2b11a78beb0ba1d7601a4fa",
-      "sha256": "6955a3ef41be9fc26a6742d856c39c6b7e145b980c5a680bd3e793684bc500ec"
+      "sha256": "379951b452c4d171a7f801a100628ad23e247dfc7119feede35a3699529a3ed5"
     },
     "UniXNU/drivers/ArmCpu/ArmCpu.cpp": {
       "repository": "UniXNU/drivers/ArmCpu",
@@ -82,19 +82,19 @@
       "repository": "UniXNU/drivers/GopFramebuffer",
       "path": "NativeLegacyDisplay.cpp",
       "before_sha256": "465f5ebfe1df7228c66ecebd2b17a9971a7af64882efd132a907b1b0abacb78a",
-      "sha256": "d14a1b3eda5e75e720432c125d0073e7061a8d211372caeb14efd492332993c5"
+      "sha256": "7fdf55baa56d8938700f4c0bf92bc97d7f34e12f0a9ed0f986f031b9148d7056"
     },
     "UniXNU/drivers/GopFramebuffer/Test/check-fence-wait.py": {
       "repository": "UniXNU/drivers/GopFramebuffer",
       "path": "Test/check-fence-wait.py",
       "before_sha256": "7815e789ac9f7a6d250fe3e5334b70ad0b879794442d96691593102ef8bdb792",
-      "sha256": "5300e15f955f5f17f21f57036968ec8580c791338175f0012050e17a7d73c6e2"
+      "sha256": "3c35c52550ff97ea1c2f056990483acbbd7299ddc39360f70a0a193f900bd344"
     },
     "UniXNU/drivers/RamBlock/NativeRamBlock.cpp": {
       "repository": "UniXNU/drivers/RamBlock",
       "path": "NativeRamBlock.cpp",
       "before_sha256": "772d47a069c50c9bf92f6c9292668340e005a61d996651033d9af2b6474b897c",
-      "sha256": "8f0ae9a4c73463e81fe72025047f31d183c44586ddb970956bc1f44dd49d1e8f"
+      "sha256": "bd9e4b43429484e8c5b257ae61d6527233b8f26ad5926816b0ef30fc3d5a07c9"
     },
     "UniXNU/kits/XnuPrelink/fileset_layout.py": {
       "repository": "UniXNU/kits/XnuPrelink",
@@ -238,7 +238,7 @@
       "repository": "device",
       "path": "package/BootLog.c",
       "before_sha256": "5c880128ff6bd54d60dec13cd9b18acb47d2d801ebfa6aac920b308d74f238c2",
-      "sha256": "4fe30f2a138c7f442aaa173b6e58dc76a7302e904c51c5560d3b3419f2ff9b3f"
+      "sha256": "00c7d214e566c45b5bc37fef57b24a806bf06936a23e78fd921c1df3a69ddc15"
     },
     "device/package/LegacyDisplayProbe.cpp": {
       "repository": "device",
@@ -298,7 +298,7 @@
       "repository": "UniXNU/drivers/Adreno740",
       "path": "NativeAdrenoRing.cpp",
       "before_sha256": "436a5f46dc3c6d20dd3d94058c16f83e19bc5c81cbf5c131b90678ebc54a728e",
-      "sha256": "22e80cb59f388eb5f7baba45910f4f9078657058469aed089c0b3cdb7af1cf75"
+      "sha256": "8f06b57ba02d516c258f17a7a2810f733190f191b2c02a08769419a7da366aca"
     },
     "UniXNU/drivers/Adreno740/NativeAdrenoRing.h": {
       "repository": "UniXNU/drivers/Adreno740",
@@ -322,7 +322,7 @@
       "repository": "UniXNU/drivers/Adreno740",
       "path": "tests/test_ring.cpp",
       "before_sha256": "9fc453e9b9dca88caa594f4e75397c39bc3380228e11415d93cde09457da1f77",
-      "sha256": "55044c4bb76a0ef6510a34fe77ac34aa866f15a258c822199856901edebc7a29"
+      "sha256": "7b8f9101a926c245460bae77b09eeccf93838375aade0dff8eed7c8d35671878"
     },
     "device/package/GpuPowerProbe.cpp": {
       "repository": "device",
@@ -394,7 +394,7 @@
       "repository": "UniXNU/drivers/AdrenoMetal",
       "path": "NativeBridgeMetalFrontend.mm",
       "before_sha256": "39cb6dd476349dc98423a4c7b9339f6c8a2492fd2d5817e729ae55be0bd65236",
-      "sha256": "f37030f8f8bd0eb04dea3fd1847f9e25b1ad6502829225926ef8e4e4a318ec93"
+      "sha256": "08fff8a7216457c091ab1430e98d8cf559cb25968a77208aea915a4d25688ab2"
     },
     "UniXNU/drivers/AdrenoMetal/PrimeShaders.h": {
       "repository": "UniXNU/drivers/AdrenoMetal",
