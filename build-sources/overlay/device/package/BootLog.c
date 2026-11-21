@@ -164,6 +164,7 @@ extern volatile uint32_t native_adreno_fence_wait[8] __attribute__((weak_import)
 extern volatile uint32_t native_adreno_stall[24] __attribute__((weak_import));
 extern volatile uint32_t native_adreno_stall_mem[59] __attribute__((weak_import));
 extern volatile uint32_t native_adreno_unstick[15] __attribute__((weak_import));
+extern volatile uint32_t native_adreno_vm_tail_resume[2] __attribute__((weak_import));
 extern volatile uint32_t native_adreno_fence_pending[8] __attribute__((weak_import));
 extern volatile uint32_t native_adreno_wptr_fence[4] __attribute__((weak_import));
 extern volatile uint64_t native_adreno_wait_outer[5] __attribute__((weak_import));
@@ -2211,6 +2212,15 @@ static size_t compose(char *out, size_t cap, uint32_t slot, unsigned now) {
              native_adreno_unstick[5], native_adreno_unstick[6], native_adreno_unstick[9], native_adreno_unstick[10],
              native_adreno_unstick[11], native_adreno_unstick[12], native_adreno_unstick[13], native_adreno_unstick[14]);
     at = put(out, at, cap, row, sizeof row);
+  }
+  if (log_gpu_on && &native_adreno_vm_tail_resume) {
+    const uint32_t high = __atomic_load_n(&native_adreno_vm_tail_resume[0], __ATOMIC_RELAXED);
+    const uint32_t low = __atomic_load_n(&native_adreno_vm_tail_resume[1], __ATOMIC_RELAXED);
+    if (high || low) {
+      char row[96];
+      snprintf(row, sizeof row, "[gpu vm close] tail resume requests high=%u low=%u", high, low);
+      at = put(out, at, cap, row, sizeof row);
+    }
   }
   if (log_gpu_on && (&native_adreno_fence_pending)) {
     char row[160];

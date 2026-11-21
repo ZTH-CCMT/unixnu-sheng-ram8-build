@@ -14,6 +14,7 @@ static bool gpu_trace_enabled;
 extern "C" int native_gpu_trace_enabled() {return gpu_trace_enabled;}
 extern "C" volatile uint64_t native_adreno_wptr_handoff[3][11];
 extern "C" volatile uint32_t native_adreno_unstick[15];
+extern "C" volatile uint32_t native_adreno_vm_tail_resume[2];
 extern "C" volatile uint64_t native_adreno_stall_log[32][8];
 extern "C" volatile uint32_t native_adreno_stall_log_count;
 extern "C" bool native_adreno_stall_pointers_copy(uint32_t index,uint32_t out[6]);
@@ -1330,8 +1331,11 @@ struct TableWriteProbe {
     unsigned calls=0,reads=0;
 };
 
+// The ring has written its fence but has not executed the final yield packet.
+static constexpr uint32_t ContextSwitchYieldDwords=5;
+
 static void installAndRetireProcessTable(DualRingPath &path,Path &process,
-    ArmSmmu4KContextConfig &config,TableWriteProbe &write)
+    ArmSmmu4KContextConfig &config,TableWriteProbe &write,bool leaveTail=false)
 {
     path.setup();
     const auto record=[](void *cookie,uint64_t ttbr0)->IOReturn {
@@ -1352,7 +1356,7 @@ static void installAndRetireProcessTable(DualRingPath &path,Path &process,
     uint32_t fence=0;
     path.submit.nextPriority(0);
     CHECK(path.submit.submit(&process.vm,&buffer,1,8,&fence,&ringclock)==kIOReturnSuccess);
-    fencemem[0]=path.ring.writePointer();
+    fencemem[0]=path.ring.writePointer()-(leaveTail?ContextSwitchYieldDwords:0);
     fencemem[1]=fence;
     // The host peer models the CP's TTBR0 writeback before its fence.
     write.hardware=process.vm.ttbr0();
@@ -1447,8 +1451,67 @@ static void testForgetUnreplacedVm()
     std::puts("PASS mode-2 teardown restores the executed page table only after the ring and GPU are idle");
 }
 
+static void testForgetInactiveTail(bool highTail)
+{
+    DualRingPath path;
+    Path process;
+    ArmSmmu4KContextConfig config{};
+    TableWriteProbe write;
+    installAndRetireProcessTable(path,process,config,write,highTail);
+
+    const uint32_t low=path.enqueue(1,9);
+    path.signalSwitch();
+    path.low_fences[0]=path.low.writePointer()-(highTail?0:ContextSwitchYieldDwords);
+    path.low_fences[1]=low;
+    if(!highTail) {
+        const NativeAdrenoSubmitBuffer buffer{process.handle,0x800000,4096};
+        uint32_t high=0;
+        path.submit.nextPriority(0);
+        CHECK(path.submit.submit(&process.vm,&buffer,1,8,&high,&ringclock)==kIOReturnSuccess);
+        path.signalSwitch();
+        fencemem[0]=path.ring.writePointer();
+        fencemem[1]=high;
+    }
+    CHECK(path.submit.retireCompleted()==kIOReturnSuccess && !path.submit.outstanding());
+    auto &target=highTail?path.ring:path.low;
+    auto &rptr=highTail?fencemem[0]:path.low_fences[0];
+    CHECK(!target.current() && target.commandsConsumed()==kIOReturnTimeout);
+    CHECK(!(cp.regs[0x08a0]&1) && !write.calls);
+
+    const unsigned targetIndex=highTail?0u:1u;
+    const uint32_t resumes=native_adreno_vm_tail_resume[targetIndex];
+    const uint32_t otherResumes=native_adreno_vm_tail_resume[1-targetIndex];
+    // A close must leave the current ring alone until the CP is idle.
+    cp.regs[0x0210]=1u<<23;
+    CHECK(path.submit.forgetVm(&process.vm,&ringclock,0)==kIOReturnTimeout);
+    CHECK(!(cp.regs[0x08a0]&1) && !write.calls);
+    cp.regs[0x0210]=0;
+
+    // There are no jobs left to trigger the normal scheduler.
+    CHECK(path.submit.forgetVm(&process.vm,&ringclock,0)==kIOReturnTimeout);
+    CHECK((cp.regs[0x08a0]&1) && path.keepalive && !write.calls);
+    CHECK(cp.regs[0x08a1]==(highTail?0x400000u:0x600000u));
+    const size_t switchWrites=cp.writes.size();
+    CHECK(path.submit.forgetVm(&process.vm,&ringclock,0)==kIOReturnTimeout);
+    CHECK(cp.writes.size()==switchWrites && !write.calls);
+
+    path.signalSwitch();
+    CHECK(target.current() && !path.keepalive);
+    CHECK(path.submit.forgetVm(&process.vm,&ringclock,0)==kIOReturnTimeout);
+    CHECK(!(cp.regs[0x08a0]&1) && !write.calls);
+    rptr=target.writePointer();
+    CHECK(path.submit.forgetVm(&process.vm,&ringclock,0)==kIOReturnSuccess);
+    CHECK(write.calls==1 && write.ttbr0==path.vm.ttbr0());
+    CHECK(native_adreno_vm_tail_resume[targetIndex]==resumes+1);
+    CHECK(native_adreno_vm_tail_resume[1-targetIndex]==otherResumes);
+    std::printf("PASS VM close resumes fenced %s ring tail before restoring TTBR0\n",highTail?"high":"low");
+}
+
 int main(int argc,char **argv)
 {
+    if(argc==3 && !std::strcmp(argv[1],"--forget-inactive-tail")) {
+        testForgetInactiveTail(!std::strcmp(argv[2],"high"));return 0;
+    }
     if(argc==2 && !std::strcmp(argv[1],"--forget-displaced-vm")) {
         testForgetDisplacedVm();return 0;
     }
@@ -1970,6 +2033,8 @@ int main(int argc,char **argv)
     testBoardExecutionResetAndSecondHangKeepFenceHistory();
     testForgetDisplacedVm();
     testForgetUnreplacedVm();
+    testForgetInactiveTail(true);
+    testForgetInactiveTail(false);
 }
 /* Physical-page maintenance (imported BOs): record it; no host page is touched. */
 /* Host double: the page attribute change of user BOs has no host equivalent (no host page is touched). */

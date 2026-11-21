@@ -46,7 +46,7 @@
       "repository": "UniXNU/drivers/Adreno740",
       "path": "NativeAdrenoSubmit.cpp",
       "before_sha256": "6343e5fc8fbf8c1d8d1c053b07744372a452021018283da0db9f74ddf566461e",
-      "sha256": "0fda5fe7c0fe8bd70acbf06053342c6f6714e782d87c8d44a4277d3a170cf733"
+      "sha256": "efc85c383df30616abcc0f97daeef36f20c2d561e54b0b53337d364de420ad63"
     },
     "UniXNU/drivers/Adreno740/NativeAdrenoSubmit.h": {
       "repository": "UniXNU/drivers/Adreno740",
@@ -70,7 +70,7 @@
       "repository": "UniXNU/drivers/Adreno740",
       "path": "tests/test_submit.cpp",
       "before_sha256": "ea56b6eb4d9cf9936f472ed5bf622d7e9fe74773f2b11a78beb0ba1d7601a4fa",
-      "sha256": "3df42d6ae5190be178939c424e680646d997ba1013ff84cbada9052d9bc75a78"
+      "sha256": "953b9073d9c1a2009e6d264efd358e92643547bbd1e0f6c8094881452516a81b"
     },
     "UniXNU/drivers/ArmCpu/ArmCpu.cpp": {
       "repository": "UniXNU/drivers/ArmCpu",
@@ -238,7 +238,7 @@
       "repository": "device",
       "path": "package/BootLog.c",
       "before_sha256": "5c880128ff6bd54d60dec13cd9b18acb47d2d801ebfa6aac920b308d74f238c2",
-      "sha256": "e264c62e2f612bdfed2dcbf2ca599774aeb10ad2fe334b5f95e9bb8b80271c65"
+      "sha256": "86bc7f6f6a42824f900257d7be6a189b1b5f13505cb973ac2649a562f18d7043"
     },
     "device/package/LegacyDisplayProbe.cpp": {
       "repository": "device",

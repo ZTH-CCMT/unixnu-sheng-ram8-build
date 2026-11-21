@@ -125,6 +125,8 @@ extern "C" {volatile uint32_t native_adreno_fence_pending[8];}
 /* [4] bus drain attempts, [5]/[6] client/arbiter halt acknowledge, [7] last drain fence, [9..11] ended by stage,
  * [12] longest stall in timeouts, [13] last wait timeout in us, [14] last drain IOReturn. */
 extern "C" {volatile uint32_t native_adreno_unstick[15];}
+// Resume requests during VM close after all tracked jobs have retired.
+extern "C" {volatile uint32_t native_adreno_vm_tail_resume[NativeAdrenoPreemptRingCount];}
 /* The IBs of the last submissions: [slot] fence, iova low/high, bytes, then the first 28 dwords of the first IB. The words are a
  * diagnostic (diag=1, zero otherwise) and are read through NativeAdrenoVm::headWords: the board's uncached reader makes and removes
  * a kernel mapping for every word, 28 pairs a submission under the driver's lock. */
@@ -422,13 +424,22 @@ IOReturn NativeAdrenoSubmit::tryForgetVm(NativeAdrenoVm *vm,const NativeAdrenoRi
     // Fence retirement can precede the CP's tail packets. Before a CPU bank
     // write, prove all ring tails are consumed and the loaded ring is idle.
     const unsigned loaded=preemption()?preempt_.loaded():0u;
-    for(unsigned i=0;i<ring_count_;++i)if(i!=loaded) {
-        if(ring(i)->restorePending())return kIOReturnTimeout;
-        status=ring(i)->commandsConsumed();
-        if(status)return ring(i)->poisoned()?poison():status;
-    }
     status=ring(loaded)->idle(clock,0);
     if(status)return ring(loaded)->poisoned()?poison():status;
+    for(unsigned i=0;i<ring_count_;++i)if(i!=loaded) {
+        NativeAdrenoRing *const inactive=ring(i);
+        status=inactive->commandsConsumed();
+        if(status && status!=kIOReturnTimeout)return inactive->poisoned()?poison():status;
+        if(!status && !inactive->restorePending())continue;
+        // The regular scheduler only sees unfinished fences. Resume this
+        // tail once the loaded ring is idle, so its own tail can finish
+        // before we leave it. Client close polls again outside its lock.
+        if(!single_ring_after_reset_) {
+            __atomic_fetch_add(&native_adreno_vm_tail_resume[i],1u,__ATOMIC_RELAXED);
+            startSwitch(i,false);
+        }
+        return kIOReturnTimeout;
+    }
     status=installCpuTable(vm_);
     if(status)return status;
     const uint64_t fallback=vm_->ttbr0();
