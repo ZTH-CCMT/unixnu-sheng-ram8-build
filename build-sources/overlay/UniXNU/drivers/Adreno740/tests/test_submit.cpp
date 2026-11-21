@@ -1319,13 +1319,142 @@ static void testForgetUnusedVm()
     CHECK(primary.submit.forgetVm(&process.vm,&ringclock,1000)==kIOReturnTimeout && !installed);
     CHECK(primary.submit.fencePending(pending) && process.object.deviceReferences()==2);
     fencemem[1]=pending;
+    cp.regs[0x0806]=primary.ring.writePointer();
     CHECK(primary.submit.forgetVm(&process.vm,&ringclock,1000)==kIOReturnSuccess);
     CHECK(installed==primary.vm.ttbr0() && process.object.deviceReferences()==1);
     std::puts("PASS unused VM skips unrelated GPU work; used VM still waits and restores the kernel table");
 }
 
+struct TableWriteProbe {
+    uint64_t ttbr0=0,hardware=0;
+    unsigned calls=0,reads=0;
+};
+
+static void installAndRetireProcessTable(DualRingPath &path,Path &process,
+    ArmSmmu4KContextConfig &config,TableWriteProbe &write)
+{
+    path.setup();
+    const auto record=[](void *cookie,uint64_t ttbr0)->IOReturn {
+        auto &probe=*static_cast<TableWriteProbe *>(cookie);
+        ++probe.calls;
+        probe.hardware=probe.ttbr0=ttbr0;
+        return kIOReturnSuccess;
+    };
+    const auto read=[](void *cookie,uint64_t *ttbr0)->IOReturn {
+        auto &probe=*static_cast<TableWriteProbe *>(cookie);
+        ++probe.reads;
+        *ttbr0=probe.hardware;
+        return kIOReturnSuccess;
+    };
+    CHECK(path.submit.setTableSwitching(2,record,&write,read)==kIOReturnSuccess);
+    attachProcess(process,config);
+    const NativeAdrenoSubmitBuffer buffer{process.handle,0x800000,4096};
+    uint32_t fence=0;
+    path.submit.nextPriority(0);
+    CHECK(path.submit.submit(&process.vm,&buffer,1,8,&fence,&ringclock)==kIOReturnSuccess);
+    fencemem[0]=path.ring.writePointer();
+    fencemem[1]=fence;
+    // The host peer models the CP's TTBR0 writeback before its fence.
+    write.hardware=process.vm.ttbr0();
+    CHECK(path.ring.resetExecutedTable(process.vm.ttbr0())==kIOReturnSuccess);
+    CHECK(path.submit.retireCompleted()==kIOReturnSuccess && !path.submit.outstanding());
+    CHECK(process.object.deviceReferences()==1 && !write.calls);
+}
+
+static void testForgetDisplacedVm()
+{
+    DualRingPath path;
+    Path process;
+    ArmSmmu4KContextConfig config{};
+    TableWriteProbe write;
+    installAndRetireProcessTable(path,process,config,write);
+
+    const uint32_t other=path.enqueue(0,9);
+    // The new command's prologue switches to the kernel table. Its fence
+    // is still pending, so draining all jobs would time out.
+    CHECK(path.ring.resetExecutedTable(path.vm.ttbr0())==kIOReturnSuccess);
+    const uint64_t began=clock_us;
+    CHECK(path.submit.fencePending(other) && path.object.deviceReferences()==2);
+    // The software shadows alone are insufficient while the real bank
+    // still names the retiring VM.
+    CHECK(path.submit.forgetVm(&process.vm,&ringclock,0)==kIOReturnTimeout);
+    CHECK(clock_us==began && !write.calls && path.submit.fencePending(other));
+    write.hardware=path.vm.ttbr0();
+    const uint32_t low=path.enqueue(1,10);
+    clock_us+=300000;   // Force a switch while both unrelated fences remain pending.
+    CHECK(path.submit.retireCompleted()==kIOReturnSuccess && path.keepalive);
+    CHECK(cp.regs[0x08a0]&1);
+    const unsigned readsBeforeSwitch=write.reads;
+    CHECK(path.submit.forgetVm(&process.vm,&ringclock,0)==kIOReturnTimeout);
+    CHECK(!write.calls && write.reads==readsBeforeSwitch);
+    path.signalSwitch();
+
+    const uint64_t resumed=clock_us;
+    const unsigned reads=write.reads;
+    CHECK(path.submit.forgetVm(&process.vm,&ringclock,3000)==kIOReturnSuccess);
+    CHECK(clock_us==resumed && !write.calls && write.reads>reads);
+    CHECK(path.submit.fencePending(other) && path.submit.fencePending(low));
+    CHECK(path.object.deviceReferences()==3 && process.object.deviceReferences()==1);
+    std::puts("PASS mode-2 teardown leaves unrelated work pending and refuses an in-flight ring switch");
+}
+
+static void testForgetUnreplacedVm()
+{
+    DualRingPath path;
+    Path process;
+    ArmSmmu4KContextConfig config{};
+    TableWriteProbe write;
+    installAndRetireProcessTable(path,process,config,write);
+
+    // Fill the ring with raw NOPs. The replacement command is refused
+    // before the CP can execute its page-table switch.
+    uint32_t nop=0;
+    CHECK(AdrenoPM4Type7(0x10,0,&nop)==AdrenoPM4Success);
+    const std::vector<uint32_t> raw(8181,nop);
+    CHECK(path.ring.submitUnfenced(raw.data(),raw.size())==kIOReturnSuccess);
+    const NativeAdrenoSubmitBuffer kernel{path.handle,0x800000,4096};
+    uint32_t refused=0;
+    path.submit.nextPriority(0);
+    CHECK(path.submit.submit(&path.vm,&kernel,1,9,&refused,&ringclock)==kIOReturnBusy && !refused);
+    CHECK(!path.submit.outstanding() && path.object.deviceReferences()==1);
+    CHECK(path.ring.tablePending() && path.ring.table()==path.vm.ttbr0());
+    uint64_t executed=0;
+    CHECK(path.ring.executedTable(&executed)==kIOReturnSuccess && executed==process.vm.ttbr0());
+    CHECK(fencemem[0]!=path.ring.writePointer());
+    for(auto &saved:path.smmu_info)
+        CHECK(NativeAdrenoPreempt::writeSmmuInfo(saved,process.vm.ttbr0(),uint32_t(process.vm.ttbr0()>>48),0));
+    const auto checkStillInUse=[&] {
+        CHECK(path.submit.forgetVm(&process.vm,&ringclock,0)==kIOReturnTimeout);
+        CHECK(!write.calls && !path.submit.poisoned() && process.object.deviceReferences()==1);
+        CHECK(path.ring.executedTable(&executed)==kIOReturnSuccess && executed==process.vm.ttbr0());
+    };
+    checkStillInUse();   // No tracked jobs, but the hardware RPTR has not caught up.
+    fencemem[0]=path.ring.writePointer();
+    cp.regs[0x0210]=1u<<23;   // RPTR caught up, but RBBM_STATUS still reports GPU busy.
+    checkStillInUse();
+    cp.regs[0x0210]=0;
+
+    CHECK(path.submit.forgetVm(&process.vm,&ringclock,1000)==kIOReturnSuccess);
+    CHECK(write.calls==1 && write.ttbr0==path.vm.ttbr0() && write.hardware==path.vm.ttbr0());
+    CHECK(!path.ring.tablePending() && path.ring.table()==path.vm.ttbr0());
+    CHECK(path.ring.executedTable(&executed)==kIOReturnSuccess && executed==path.vm.ttbr0());
+    CHECK(path.low.executedTable(&executed)==kIOReturnSuccess && executed==path.vm.ttbr0());
+    for(const auto &saved:path.smmu_info) {
+        uint64_t ttbr0=0;
+        std::memcpy(&ttbr0,saved+8,sizeof(ttbr0));
+        CHECK(ttbr0==path.vm.ttbr0());
+    }
+    std::puts("PASS mode-2 teardown restores the executed page table only after the ring and GPU are idle");
+}
+
 int main(int argc,char **argv)
 {
+    if(argc==2 && !std::strcmp(argv[1],"--forget-displaced-vm")) {
+        testForgetDisplacedVm();return 0;
+    }
+    if(argc==2 && !std::strcmp(argv[1],"--forget-unreplaced-vm")) {
+        testForgetUnreplacedVm();return 0;
+    }
     if(argc==2 && !std::strcmp(argv[1],"--forget-vm")) {
         testForgetUnusedVm();return 0;
     }
@@ -1839,6 +1968,8 @@ int main(int argc,char **argv)
     testBoardResetKeepsFirstLowWorkOnPrimary(true);
     testBoardResetReplayAndLowQueueContinuation();
     testBoardExecutionResetAndSecondHangKeepFenceHistory();
+    testForgetDisplacedVm();
+    testForgetUnreplacedVm();
 }
 /* Physical-page maintenance (imported BOs): record it; no host page is touched. */
 /* Host double: the page attribute change of user BOs has no host equivalent (no host page is touched). */

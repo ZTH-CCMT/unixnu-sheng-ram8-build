@@ -673,7 +673,16 @@ IOReturn AGXDeviceUserClient::clientClose()
             }
         }
         if(!status && close_stage_==CloseTable) {
-            if(space_)status=g.submit->forgetVm(space_->vm(),&g.clock,CloseFenceTimeoutUs);
+            if(space_) {
+                NativeAdrenoVm *const vm=space_->vm();
+                const uint64_t began=g.clock.now_us?g.clock.now_us(g.clock.cookie):0;
+                while((status=g.submit->forgetVm(vm,&g.clock,0))==kIOReturnTimeout) {
+                    IOLockUnlock(g.lock);
+                    const bool retry=g.clock.waitForPoll(began,CloseFenceTimeoutUs);
+                    IOLockLock(g.lock);
+                    if(!retry) {status=g.submit->forgetVm(vm,&g.clock,0);break;}
+                }
+            }
             if(!status)__atomic_store_n(&close_stage_,CloseAddressSpace,__ATOMIC_RELEASE);
         }
         if(!status && space_) {status=g.context->destroyVm(space_);if(!status)space_=nullptr;}
@@ -1572,7 +1581,8 @@ extern "C" IOReturn native_adreno_publish(NativeAdrenoVm *vm,NativeAdrenoSubmit 
     g.context=NativeAdrenoGpuContextObject();
     IOReturn switching=g.context?g.context->enableSwitching():kIOReturnNotReady;
     if(!switching)switching=submit->setTableSwitching(tableMode(),
-        [](void *cookie,uint64_t ttbr0)->IOReturn {return static_cast<NativeAdrenoGpuContext *>(cookie)->writeTtbr0(ttbr0);},g.context);
+        [](void *cookie,uint64_t ttbr0)->IOReturn {return static_cast<NativeAdrenoGpuContext *>(cookie)->writeTtbr0(ttbr0);},g.context,
+        [](void *cookie,uint64_t *ttbr0)->IOReturn {return static_cast<NativeAdrenoGpuContext *>(cookie)->readTtbr0(ttbr0);});
     native_adreno_table_switches[6]=uint32_t(switching);
     if(switching)g.context=nullptr;
     else if(submit->tableMode()==2) {

@@ -624,6 +624,14 @@ bool NativeAdrenoRingClock::waitForPoll(uint64_t start_us,uint32_t timeout_us) c
     IODelay(interval<remaining?interval:remaining);
     return true;
 }
+IOReturn NativeAdrenoRing::commandsConsumed()
+{
+    if(!attached_ || poisoned_)return kIOReturnNotReady;
+    uint32_t rptr=0;
+    const IOReturn status=readRptr(&rptr);
+    if(status)return status;
+    return rptr==next_?kIOReturnSuccess:kIOReturnTimeout;
+}
 IOReturn NativeAdrenoRing::idle(const NativeAdrenoRingClock *clock,uint32_t timeout_us)
 {
     enum : uint32_t {RbbmStatus=0x0210,GpuBusyIgnAhb=1u<<23};
@@ -631,13 +639,12 @@ IOReturn NativeAdrenoRing::idle(const NativeAdrenoRingClock *clock,uint32_t time
     if(!clock || !clock->now_us)return kIOReturnBadArgument;
     const uint64_t start=clock->now_us(clock->cookie);
     for(;;) {
-        uint32_t rptr=0,status=0;
-        IOReturn read=readRptr(&rptr);
-        if(read)return read;
-        if(rptr==next_) {
+        const IOReturn consumed=commandsConsumed();
+        if(!consumed) {
+            uint32_t status=0;
             if(io_.read32(io_.cookie,RbbmStatus,&status))return poison();
             if(!(status&GpuBusyIgnAhb))return kIOReturnSuccess;
-        }
+        } else if(consumed!=kIOReturnTimeout)return consumed;
         if(!clock->waitForPoll(start,timeout_us))return kIOReturnTimeout;
     }
 }

@@ -191,6 +191,8 @@ public:
     IOReturn submitUnfenced(const uint32_t *words,size_t word_count);
     /* a6xx_idle: the CP read every ring word (RPTR == WPTR), then RBBM_STATUS GPU_BUSY_IGN_AHB clear. */
     IOReturn idle(const NativeAdrenoRingClock *,uint32_t timeout_us);
+    /* A zero-wait check of this ring's writeback, including when it is inactive. */
+    IOReturn commandsConsumed();
     /* a6xx_progress's CP state: IB1 base (lo, hi), IB2 base (lo, hi), IB1 remaining and IB2 remaining dwords, each remaining count plus
      * what the ROQ fetched but the SQE has not consumed (CP_ROQ_AVAIL_IB1/IB2 bits 31:16). */
     IOReturn progressState(uint32_t out[6]);

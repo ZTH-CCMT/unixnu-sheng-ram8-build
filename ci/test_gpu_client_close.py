@@ -33,8 +33,10 @@ struct Clock {
     size_t next = 0;
     bool waitForPoll(uint64_t began, uint32_t timeout);
 };
+struct NativeAdrenoVm {};
 struct Space {
-    void *vm() { return this; }
+    NativeAdrenoVm table;
+    NativeAdrenoVm *vm() { return &table; }
 };
 struct Core {
     uint64_t peak = 17ull << 20;
@@ -50,11 +52,13 @@ struct Submit {
     Space *space = nullptr;
     IOReturn observe_error = kIOReturnSuccess, forget_result = kIOReturnSuccess;
     unsigned forgets = 0;
-    uint32_t signaled = 0;
+    uint32_t signaled = 0, other_fence = 0;
     std::vector<uint32_t> observations, waits;
     IOReturn observeFence(uint32_t fence, Clock *, uint32_t);
     IOReturn wait(uint32_t fence, Clock *, uint32_t);
-    IOReturn forgetVm(void *vm, Clock *, uint32_t);
+    IOReturn forgetVm(NativeAdrenoVm *vm, Clock *, uint32_t);
+    void submitOther(uint32_t fence);
+    void retireOther(uint32_t fence);
 };
 struct Context {
     unsigned destroys = 0;
@@ -119,15 +123,26 @@ IOReturn Submit::wait(uint32_t fence, Clock *clock, uint32_t timeout)
     if (core->oldestOwnFence() == fence) core->fences.erase(core->fences.begin());
     return kIOReturnSuccess;
 }
-IOReturn Submit::forgetVm(void *vm, Clock *clock, uint32_t timeout)
+IOReturn Submit::forgetVm(NativeAdrenoVm *vm, Clock *clock, uint32_t timeout)
 {
-    CHECK(g.lock->held && vm == space && clock == &g.clock && timeout == 2000000);
+    CHECK(g.lock->held && vm == space->vm() && clock == &g.clock && !timeout);
     ++forgets;
-    return forget_result;
+    if (forget_result) return forget_result;
+    return other_fence ? kIOReturnTimeout : kIOReturnSuccess;
+}
+void Submit::submitOther(uint32_t fence)
+{
+    CHECK(g.lock->held && fence && !other_fence);
+    other_fence = fence;
+}
+void Submit::retireOther(uint32_t fence)
+{
+    CHECK(g.lock->held && fence == other_fence);
+    other_fence = 0;
 }
 IOReturn Context::destroyVm(Space *requested)
 {
-    CHECK(g.lock->held && requested == space);
+    CHECK(g.lock->held && requested == space && !g.submit->other_fence);
     ++destroys;
     return result;
 }
@@ -264,7 +279,50 @@ int main() {
         CHECK(f.client.clientClose() == kIOReturnSuccess);
         f.closed(17);
     }
-    std::puts("PASS close waits outside the global lock and retries each teardown stage exactly once");
+    {
+        Fixture f;
+        IOLockLock(g.lock);
+        f.submit.submitOther(31);
+        IOLockUnlock(g.lock);
+        g.clock.pauses = {
+            [&] {
+                CHECK(f.submit.forgets == 1 && !f.context.destroys);
+                CHECK(!f.client.active() && f.client.clientClose() == kIOReturnBusy);
+                IOLockLock(g.lock);
+                f.submit.retireOther(31);
+                f.submit.submitOther(39);
+                IOLockUnlock(g.lock);
+                return true;
+            },
+            [&] {
+                CHECK(f.submit.forgets == 2 && !f.context.destroys);
+                IOLockLock(g.lock);
+                f.submit.retireOther(39);
+                IOLockUnlock(g.lock);
+                return false; // Completion at the deadline needs a final probe.
+            }
+        };
+        CHECK(f.client.clientClose() == kIOReturnSuccess);
+        CHECK(f.submit.forgets == 3 && f.core.releases == 1 && f.context.destroys == 1);
+        f.closed(17);
+    }
+    {
+        Fixture f;
+        IOLockLock(g.lock);
+        f.submit.submitOther(31);
+        IOLockUnlock(g.lock);
+        g.clock.pauses = {[] { return false; }};
+        CHECK(f.client.clientClose() == kIOReturnTimeout);
+        f.stillOwned(false);
+        CHECK(f.submit.forgets == 2 && f.core.releases == 1 && !f.context.destroys);
+        IOLockLock(g.lock);
+        f.submit.retireOther(31);
+        IOLockUnlock(g.lock);
+        CHECK(f.client.clientClose() == kIOReturnSuccess);
+        CHECK(f.submit.forgets == 3 && f.core.releases == 1 && f.context.destroys == 1);
+        f.closed(17);
+    }
+    std::puts("PASS close polls fences and tables outside the global lock, revalidates at the deadline and retries failed stages");
 }
 """
 

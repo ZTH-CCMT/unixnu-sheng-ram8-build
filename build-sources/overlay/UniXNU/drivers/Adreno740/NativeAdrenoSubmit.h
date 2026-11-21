@@ -128,6 +128,9 @@ private:
     NativeAdrenoVm *table_vm_=nullptr;
     void *table_cookie_=nullptr;
     IOReturn (*write_table_)(void *,uint64_t ttbr0)=nullptr;
+    IOReturn (*read_table_)(void *,uint64_t *ttbr0)=nullptr;
+    IOReturn checkDisplacedTable(NativeAdrenoVm *,bool &displaced);
+    IOReturn tryForgetVm(NativeAdrenoVm *,const NativeAdrenoRingClock *);
     IOReturn installCpuTable(NativeAdrenoVm *);
     IOReturn useVm(NativeAdrenoVm *,const NativeAdrenoRingClock *,unsigned index=0);
     IOReturn useVmForReplay(NativeAdrenoVm *,const NativeAdrenoRingClock *,uint32_t restart_fence);
@@ -285,10 +288,11 @@ public:
         const NativeAdrenoRingClock *);
     /* Turns on table switching (mode 1 or 2, see table_mode_); write installs a TTBR0 from the CPU (used by mode 1 and to leave a
      * table that is about to be freed). Only with no job outstanding. */
-    IOReturn setTableSwitching(unsigned mode,IOReturn (*write)(void *,uint64_t),void *cookie);
+    IOReturn setTableSwitching(unsigned mode,IOReturn (*write)(void *,uint64_t),void *cookie,
+        IOReturn (*read)(void *,uint64_t *)=nullptr);
     unsigned preemptionMode() const {return preempt_setup_.mode;}
     unsigned tableMode() const {return table_mode_;}
-    /* Before a VM is freed: waits for every job, and when the GPU's table is that VM's, installs the default table from the CPU. */
+    /* Confirm no live or resumable hardware state uses this VM. With timeout 0, the caller can retry between lock acquisitions. */
     IOReturn forgetVm(NativeAdrenoVm *,const NativeAdrenoRingClock *,uint32_t timeout_us);
     NativeAdrenoVm *defaultVm() const {return vm_;}
     bool queueOutstanding(uint64_t queue) const;

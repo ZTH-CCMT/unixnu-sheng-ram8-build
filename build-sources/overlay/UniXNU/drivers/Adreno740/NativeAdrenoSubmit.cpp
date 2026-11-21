@@ -326,11 +326,12 @@ IOReturn NativeAdrenoSubmit::attach(NativeAdrenoVm *vm,NativeAdrenoRing *ring)
     timeline_user_=native_adreno_diag && retainJobTimeline();
     return kIOReturnSuccess;
 }
-IOReturn NativeAdrenoSubmit::setTableSwitching(unsigned mode,IOReturn (*write)(void *,uint64_t),void *cookie)
+IOReturn NativeAdrenoSubmit::setTableSwitching(unsigned mode,IOReturn (*write)(void *,uint64_t),void *cookie,
+    IOReturn (*read)(void *,uint64_t *))
 {
     if(!attached_ || poisoned_)return kIOReturnNotReady;
     if(mode>2 || (mode && !write) || outstanding())return kIOReturnBadArgument;
-    table_mode_=mode;write_table_=write;table_cookie_=cookie;table_vm_=vm_;
+    table_mode_=mode;write_table_=write;read_table_=read;table_cookie_=cookie;table_vm_=vm_;
     for(unsigned i=0;i<ring_count_;++i) {
         if(mode==2)ring(i)->tableInstalled(vm_->ttbr0());
         if(preemption() && ring(i)->resetExecutedTable(vm_->ttbr0()))return poison();
@@ -373,27 +374,80 @@ IOReturn NativeAdrenoSubmit::useVmForReplay(NativeAdrenoVm *vm,const NativeAdren
     }
     return installCpuTable(vm);
 }
-IOReturn NativeAdrenoSubmit::forgetVm(NativeAdrenoVm *vm,const NativeAdrenoRingClock *clock,uint32_t timeout_us)
+IOReturn NativeAdrenoSubmit::checkDisplacedTable(NativeAdrenoVm *vm,bool &displaced)
+{
+    displaced=false;
+    if(table_mode_!=2 || !preemption() || !read_table_ || table_vm_==vm)return kIOReturnSuccess;
+    const uint64_t retiring=vm->ttbr0();
+    for(unsigned i=0;i<ring_count_;++i) {
+        NativeAdrenoRing *const r=ring(i);
+        const uint64_t requested=r->table();
+        if(!requested || requested==retiring || r->tablePending() || r->restorePending())return kIOReturnSuccess;
+        uint64_t executed=0;
+        const IOReturn status=r->executedTable(&executed);
+        if(status==kIOReturnNotReady)return kIOReturnSuccess;
+        if(status)return r->poisoned()?poison():status;
+        if(executed!=requested)return kIOReturnSuccess;
+    }
+    // The restore records are rewritten from executedTable before every STOP.
+    // No STOP is in flight and no queued job can bring back the retiring table.
+    uint64_t hardware=0;
+    const IOReturn status=read_table_(table_cookie_,&hardware);
+    if(status)return status;
+    displaced=hardware==ring(preempt_.loaded())->table();
+    return kIOReturnSuccess;
+}
+
+IOReturn NativeAdrenoSubmit::tryForgetVm(NativeAdrenoVm *vm,const NativeAdrenoRingClock *clock)
 {
     if(!attached_ || poisoned_)return kIOReturnNotReady;
     if(!vm || vm==vm_)return kIOReturnBadArgument;
-    // A process table that never reached submission cannot be installed or
-    // saved in a preemption record. The caller still invalidates its ASID.
     if(!vm->may_have_run_)return kIOReturnSuccess;
-    IOReturn status=waitAll(clock,timeout_us);
+    if(preemption() && preempt_dead_)return kIOReturnTimeout;
+    IOReturn status=retireCompleted();
     if(status)return status;
-    bool used=table_vm_==vm;
-    for(unsigned i=0;i<ring_count_;++i)used=used || ring(i)->table()==vm->ttbr0();
-    if(!used)return kIOReturnSuccess;
-    /* The GPU is idle and every queued switch has run: the CPU puts the default table back. */
-    status=write_table_?write_table_(table_cookie_,vm_->ttbr0()):kIOReturnNotReady;
-    if(status)return poison();
-    native_adreno_table_switches[1]=native_adreno_table_switches[1]+1;
-    for(unsigned i=0;i<ring_count_;++i) {
-        if(table_mode_==2)ring(i)->tableInstalled(vm_->ttbr0());
-        if(preemption() && ring(i)->resetExecutedTable(vm_->ttbr0()))return poison();
+    if(preemption() && (preempt_.inFlight() || preempt_dead_))return kIOReturnTimeout;
+
+    bool pending=false;
+    for(const auto &job:jobs_)if(job.active) {
+        if(job.vm==vm)return kIOReturnTimeout;
+        pending=true;
     }
-    table_vm_=vm_;return kIOReturnSuccess;
+    bool displaced=false;
+    status=checkDisplacedTable(vm,displaced);
+    if(status || displaced)return status;
+    if(pending)return kIOReturnTimeout;
+    if(!table_mode_)return kIOReturnSuccess;
+
+    // Fence retirement can precede the CP's tail packets. Before a CPU bank
+    // write, prove all ring tails are consumed and the loaded ring is idle.
+    const unsigned loaded=preemption()?preempt_.loaded():0u;
+    for(unsigned i=0;i<ring_count_;++i)if(i!=loaded) {
+        if(ring(i)->restorePending())return kIOReturnTimeout;
+        status=ring(i)->commandsConsumed();
+        if(status)return ring(i)->poisoned()?poison():status;
+    }
+    status=ring(loaded)->idle(clock,0);
+    if(status)return ring(loaded)->poisoned()?poison():status;
+    status=installCpuTable(vm_);
+    if(status)return status;
+    const uint64_t fallback=vm_->ttbr0();
+    for(unsigned i=0;i<ring_count_;++i) {
+        if(table_mode_==2)ring(i)->tableInstalled(fallback);
+        if(preemption() && (ring(i)->resetExecutedTable(fallback) ||
+            !NativeAdrenoPreempt::writeSmmuInfo(preempt_setup_.pages.smmu_cpu[i],fallback,uint32_t(fallback>>48),0)))
+            return poison();
+    }
+    if(preemption() && preempt_setup_.io.barrier(preempt_setup_.io.cookie))return poison();
+    return kIOReturnSuccess;
+}
+
+IOReturn NativeAdrenoSubmit::forgetVm(NativeAdrenoVm *vm,const NativeAdrenoRingClock *clock,uint32_t timeout_us)
+{
+    const uint64_t start=timeout_us && clock && clock->now_us?clock->now_us(clock->cookie):0;
+    IOReturn status=tryForgetVm(vm,clock);
+    while(status==kIOReturnTimeout && clock && clock->waitForPoll(start,timeout_us))status=tryForgetVm(vm,clock);
+    return status;
 }
 /* The two rings share one fence numbering: the fence's low bits name its ring in a table the switch fills as each ring issues
  * (FenceMap entries; a fence is 32 bits, so the table is indexed by its low bits and checked against the fence it holds). Fences of
@@ -721,7 +775,7 @@ IOReturn NativeAdrenoSubmit::detach()
     fence_tag_=nullptr;fence_ring_=nullptr;fence_issued_=retired_dual_through_=0;
     rings_[0]=rings_[1]=nullptr;ring_count_=0;
     attached_=false;vm_=table_vm_=nullptr;ring_=nullptr;
-    table_mode_=0;write_table_=nullptr;table_cookie_=nullptr;
+    table_mode_=0;write_table_=nullptr;read_table_=nullptr;table_cookie_=nullptr;
     return kIOReturnSuccess;
 }
 bool NativeAdrenoSubmit::queueOutstanding(uint64_t queue) const

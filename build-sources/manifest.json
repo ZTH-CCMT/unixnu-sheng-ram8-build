@@ -40,19 +40,19 @@
       "repository": "UniXNU/drivers/Adreno740",
       "path": "NativeAdrenoPublish.cpp",
       "before_sha256": "ffb7601c5c16a44d2dd4e79bfc22024c985ef60680650c42c899c637ec707a48",
-      "sha256": "6426883c1fbbaaaaaff95f442bf684a21f2b24e1035f8ba4052629fd986d0730"
+      "sha256": "44d8198a49c8a8ab617f7d6dea88fec826a9acbdf926558372c4265457a27209"
     },
     "UniXNU/drivers/Adreno740/NativeAdrenoSubmit.cpp": {
       "repository": "UniXNU/drivers/Adreno740",
       "path": "NativeAdrenoSubmit.cpp",
       "before_sha256": "6343e5fc8fbf8c1d8d1c053b07744372a452021018283da0db9f74ddf566461e",
-      "sha256": "553f612ac648d8fa0965bd7b3edb23f8b30e354e4d24444dc6f380b25daaad2d"
+      "sha256": "0fda5fe7c0fe8bd70acbf06053342c6f6714e782d87c8d44a4277d3a170cf733"
     },
     "UniXNU/drivers/Adreno740/NativeAdrenoSubmit.h": {
       "repository": "UniXNU/drivers/Adreno740",
       "path": "NativeAdrenoSubmit.h",
       "before_sha256": "493d849685162d4efa3cd7fe0c0963685e50b11266673f2e56268d984aa4f9bb",
-      "sha256": "600e22667408d0834c2487c20e78d775f1c10ac5e0e0c8d947a4e59e17ff967a"
+      "sha256": "8df18a0292ff606c1981fd99fd15686f2701541a37ccc864757c814b6b9b0c81"
     },
     "UniXNU/drivers/Adreno740/tests/XnuMemoryFixture.h": {
       "repository": "UniXNU/drivers/Adreno740",
@@ -70,7 +70,7 @@
       "repository": "UniXNU/drivers/Adreno740",
       "path": "tests/test_submit.cpp",
       "before_sha256": "ea56b6eb4d9cf9936f472ed5bf622d7e9fe74773f2b11a78beb0ba1d7601a4fa",
-      "sha256": "adbc1234258f01d53d3d963372d213d981e6d0edeca6e464454f5958b220525e"
+      "sha256": "3df42d6ae5190be178939c424e680646d997ba1013ff84cbada9052d9bc75a78"
     },
     "UniXNU/drivers/ArmCpu/ArmCpu.cpp": {
       "repository": "UniXNU/drivers/ArmCpu",
@@ -298,13 +298,13 @@
       "repository": "UniXNU/drivers/Adreno740",
       "path": "NativeAdrenoRing.cpp",
       "before_sha256": "436a5f46dc3c6d20dd3d94058c16f83e19bc5c81cbf5c131b90678ebc54a728e",
-      "sha256": "ee7b8d523140ca5bed426193f54a3279462027d215447f853ed83410dfed8963"
+      "sha256": "630ce1faecda0c6138b5fef9089bcf6d29f4a5b9579daf149e189965d05b2997"
     },
     "UniXNU/drivers/Adreno740/NativeAdrenoRing.h": {
       "repository": "UniXNU/drivers/Adreno740",
       "path": "NativeAdrenoRing.h",
       "before_sha256": "37e75406bb33c5b93b6eab298267249c1355b9668dd4ba45d47d6194157b9d4b",
-      "sha256": "e4089402e5a670c5ee83a3200374af6496e927716083bdcb91615611d024fd91"
+      "sha256": "1a1f63a8b3204af424012b10426cb08475489502eee1dab3980e05206f4c2653"
     },
     "UniXNU/drivers/Adreno740/NativeAdrenoSqeSnapshot.h": {
       "repository": "UniXNU/drivers/Adreno740",
