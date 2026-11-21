@@ -3,19 +3,45 @@
 import base64
 import concurrent.futures
 import hashlib
+import http.client
 import json
 import os
 from pathlib import Path
+import sys
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
 ROOT = Path(__file__).resolve().parents[1]
-pins = json.loads((ROOT / 'scripts/data/adreno-inputs.json').read_text())
+RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
 
 
 # Anonymous GitHub API calls share a small per-address quota that hosted CI runners exhaust
 # (HTTP 403); a token in GITHUB_TOKEN or GH_TOKEN is sent to GitHub hosts only.
 TOKEN = os.environ.get('GITHUB_TOKEN') or os.environ.get('GH_TOKEN')
+
+
+def download(url, headers, name):
+    request = urllib.request.Request(url, headers=headers)
+    host = urllib.parse.urlsplit(url).hostname
+    for delay in (2, 5, 10, None):
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                return response.read()
+        except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.IncompleteRead) as error:
+            if isinstance(error, urllib.error.HTTPError):
+                error.close()
+                reason = f'HTTP {error.code}'
+                retryable = error.code in RETRYABLE_STATUS
+            else:
+                reason = str(error)
+                retryable = True
+            if not retryable or delay is None:
+                raise RuntimeError(f'{name}: download from {host} failed ({reason})') from error
+            print(f'{name}: {host} download failed ({reason}), retrying in {delay}s',
+                  file=sys.stderr, flush=True)
+            time.sleep(delay)
 
 
 def fetch(item):
@@ -26,9 +52,7 @@ def fetch(item):
         headers = {'User-Agent': 'sheng-offline-adreno-audit'}
         if TOKEN and urllib.parse.urlsplit(url).hostname in ('api.github.com', 'raw.githubusercontent.com'):
             headers['Authorization'] = f'Bearer {TOKEN}'
-        request = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(request, timeout=30) as response:
-            data = response.read()
+        data = download(url, headers, path.name)
         if encoding == 'gitiles-base64':
             data = base64.b64decode(data, validate=False)
     if hashlib.sha256(data).hexdigest() != expected['sha256'] or (expected.get('bytes') and len(data) != expected['bytes']):
@@ -42,6 +66,7 @@ def fetch(item):
 
 
 if __name__ == '__main__':
+    pins = json.loads((ROOT / 'scripts/data/adreno-inputs.json').read_text())
     jobs = []
     linux = pins['linux']
     for name, expected in linux['files'].items():

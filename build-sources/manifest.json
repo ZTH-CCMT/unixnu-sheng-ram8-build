@@ -352,7 +352,7 @@
       "repository": "UniXNU",
       "path": "scripts/fetch-adreno-inputs.py",
       "before_sha256": "a854723a3a5530811aa628172b09096def25b6f319609b5f35dc29fe54b2fa15",
-      "sha256": "aa264d5df189a96563bcd80954d9cc1f86082b2ab6631af0634bdbe534105d2d"
+      "sha256": "401fe405b818a8a8b53100870d300d8d870e24540d22754ba10c0155633763bf"
     },
     "UniXNU/drivers/AdrenoMetal/bridge/FrontendChecks.h": {
       "repository": "UniXNU/drivers/AdrenoMetal",
