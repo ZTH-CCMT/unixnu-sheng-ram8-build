@@ -1498,7 +1498,7 @@ void metalRows() {
         // ... a<attach> x<selectors that reached the driver> c<calls done> f<method running now + 1, 0 = none> l<last method>/<its status>
         // ... c<calls done> f<method running now + 1> l<last method>/<status> g<stage reached in the free/unmap path: 1-4 freeBo, 10-14 VM unmap, 30-34 release>
         snprintf(row, sizeof row, "S%s x%u c%u f%u l%u/%x g%u u%u", list, d.ext_entries, d.calls, d.inflight, d.last_selector,
-                 d.last_status & 0xfff, native_adreno_trace_stage, d.forced_unmaps);
+                 d.last_status & 0xfff, __atomic_load_n(&native_adreno_trace_stage, __ATOMIC_RELAXED), d.forced_unmaps);
         setRow(5, row);
     }
 }

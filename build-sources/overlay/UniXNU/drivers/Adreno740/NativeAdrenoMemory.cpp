@@ -491,50 +491,46 @@ IOReturn NativeAdrenoMemory::declareSynchronized()
 /* Frees of an owned BO whose first pages a user task still maps: [0] count, [1] the last mapping's page number. */
 extern "C" {volatile uint32_t native_adreno_free_user_mapped[2];}
 extern "C" unsigned int native_pmap_user_mappings(ppnum_t,void **,uint64_t *,char *) __attribute__((weak_import));
-IOReturn NativeAdrenoMemory::release()
+IOReturn NativeAdrenoMemory::unwireForRelease()
 {
-    native_adreno_trace_stage=30;
+    __atomic_store_n(&native_adreno_trace_stage,30,__ATOMIC_RELAXED);
     if(device_references_ || quarantined_)return kIOReturnBusy;
-    /* System memory's pages go back to the VM with the default attribute (vm_object_reap), as they came. */
-    if(system_)write_combined_=false;
-    if(write_combined_) {
-        /* The pages go back to the VM cacheable, as they came. */
+    if(!prepared_ || (!imported_ && !descriptor_))return kIOReturnSuccess;
+    /* The VM restores system memory's default attribute when it takes its pages back. */
+    if(write_combined_ && !system_) {
         const IOReturn status=NativeAdrenoSetPagesCacheMode(spans_,span_count_,false);
         if(status) {quarantined_=true;return status;}
         write_combined_=false;
     }
-    if(imported_) {
-        if(prepared_) {
-            IOReturn status=imported_->complete();
-            if(status!=kIOReturnSuccess) {quarantined_=true;return status;}
-            prepared_=false;
-        }
-        imported_->release();imported_=nullptr;
-    }
     if(descriptor_ && !system_ && native_pmap_user_mappings && spans_) {
-        /* A page a user task still maps (a BO view over physical pages holds no reference to them) is counted before the pages are freed:
-         * the first page of up to 64 spans, then which process maps it. XNU frees such a page under the mapping (pmap_assert_free). A view
-         * of system memory maps its VM object, which keeps the pages until the view goes. */
+        /* A diagnostic look at the first page of up to 64 spans. The caller owns
+         * the mapping lifetime and serializes CPU views with the release. */
         for(size_t i=0;i<span_count_ && i<64;++i) {
             char name[17]={};void *pmap=nullptr;uint64_t va=0;
             if(native_pmap_user_mappings((ppnum_t)(spans_[i].physical>>12),&pmap,&va,name)) {
-                native_adreno_free_user_mapped[0]=native_adreno_free_user_mapped[0]+1;
-                native_adreno_free_user_mapped[1]=(uint32_t)(va>>12);
+                __atomic_fetch_add(&native_adreno_free_user_mapped[0],1,__ATOMIC_RELAXED);
+                __atomic_store_n(&native_adreno_free_user_mapped[1],(uint32_t)(va>>12),__ATOMIC_RELAXED);
                 break;
             }
         }
     }
+    __atomic_store_n(&native_adreno_trace_stage,31,__ATOMIC_RELAXED);
+    const IOReturn status=imported_?imported_->complete():descriptor_->complete();
+    __atomic_store_n(&native_adreno_trace_stage,32,__ATOMIC_RELAXED);
+    if(status) {quarantined_=true;return status;}
+    prepared_=false;
+    return kIOReturnSuccess;
+}
+IOReturn NativeAdrenoMemory::release()
+{
+    const IOReturn status=unwireForRelease();
+    if(status)return status;
+    if(system_)write_combined_=false;
+    if(imported_) {imported_->release();imported_=nullptr;}
     if(descriptor_) {
-        if(prepared_) {
-            native_adreno_trace_stage=31;
-            IOReturn status=descriptor_->complete();
-            native_adreno_trace_stage=32;
-            if(status!=kIOReturnSuccess) {quarantined_=true;return status;}
-            prepared_=false;
-        }
-        native_adreno_trace_stage=33;
+        __atomic_store_n(&native_adreno_trace_stage,33,__ATOMIC_RELAXED);
         descriptor_->release();descriptor_=nullptr;
-        native_adreno_trace_stage=34;
+        __atomic_store_n(&native_adreno_trace_stage,34,__ATOMIC_RELAXED);
     }
     /* Pool pages: the BO's reference goes; the pages return to the pool once no client view holds the grant. */
     if(grant_) {NativeAdrenoPoolRelease(grant_);grant_=nullptr;prepared_=false;}

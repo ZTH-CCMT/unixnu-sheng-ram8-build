@@ -155,6 +155,9 @@ public:
     /* Refuses device references/quarantine; only clears ownership after real
      * descriptor complete() succeeds. No automatic reset or resource recycling. */
     IOReturn release();
+    /* Restore CPU attributes and unwire after all device references are gone.
+     * The caller must reserve this object against reuse until release() runs. */
+    IOReturn unwireForRelease();
     /* release() for a BO of system memory whose pages may go after the driver's lock: its descriptor (still wired) or its pool grant
      * is handed to out, for discardSystem to unwire and free, or to give back to the pool, once the lock is let go. Any other BO, or
      * an out that holds pages, is released here. A quarantined BO is refused before either: its pool pages stay out of the pool. */

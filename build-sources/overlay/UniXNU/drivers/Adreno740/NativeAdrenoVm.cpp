@@ -438,13 +438,13 @@ IOReturn NativeAdrenoVm::map(NativeAdrenoMemory *memory,unsigned upper,uint64_t 
 }
 IOReturn NativeAdrenoVm::unmap(uint64_t handle)
 {
-    native_adreno_trace_stage=10;
+    __atomic_store_n(&native_adreno_trace_stage,10,__ATOMIC_RELAXED);
     result_={};if(!attached_ || poisoned_)return kIOReturnNotReady;
     Mapping *record=find(handle);if(!record)return kIOReturnBadArgument;
     if(record->jobs)return kIOReturnBusy;
     PhaseClock clock;
     ArmSmmu4KStatus status=observeCheap();
-    native_adreno_trace_stage=11;
+    __atomic_store_n(&native_adreno_trace_stage,11,__ATOMIC_RELAXED);
     if(status)return fail(status);
     clock.lap(1,1);
     const unsigned upper=record->upper;
@@ -468,16 +468,16 @@ IOReturn NativeAdrenoVm::unmap(uint64_t handle)
     }
     ArmSmmu4KLiveRegion lower=upper?region(0):region(0,changes_,spans),high=upper?region(1,changes_,spans):region(1);
     ArmSmmu4KLiveResult update;
-    native_adreno_trace_stage=12;
+    __atomic_store_n(&native_adreno_trace_stage,12,__ATOMIC_RELAXED);
     status=ArmSmmu4KLiveUpdateContextBatch(&io_,streams_->bank,context_,lower.arena?&lower:nullptr,
         high.arena?&high:nullptr,upper,&visibility_[upper],changes_,spans,0,budget_,&update);
-    native_adreno_trace_stage=13;
+    __atomic_store_n(&native_adreno_trace_stage,13,__ATOMIC_RELAXED);
     if(status)return fail(status);
     clock.lap(1,3);
     if(!erase(record))return fail(ArmSmmu4KStateMismatch);
     delist(record);
     record->mapped_spans=0;result_.completed_spans=spans;
-    native_adreno_trace_stage=14;
+    __atomic_store_n(&native_adreno_trace_stage,14,__ATOMIC_RELAXED);
     clock.lap(1,4);
     if(record->memory->retireAfterQuiescence()!=kIOReturnSuccess)return fail(ArmSmmu4KStateMismatch);
     clock.lap(1,5);clock.done(1,record->memory->bytes());

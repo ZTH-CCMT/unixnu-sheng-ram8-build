@@ -422,6 +422,7 @@ class AGXDeviceUserClient : public IOUserClient {
     View *viewSlot(uint32_t token) {return views_ && token && token<=view_capacity_?&views_[token-1]:nullptr;}
     View *views_=nullptr;   /* on the heap, grown to the highest token (growViews) */
     size_t view_capacity_=0;
+    unsigned unwiring_bos_=0;  /* g.lock; close waits until reservations have finished */
     uint32_t retiring_view_token_=0;  /* g.lock, kept set until IOKit has removed the last view's maps */
     bool growViews(uint32_t token);
     View takeView(View &slot);
@@ -651,7 +652,7 @@ IOReturn AGXDeviceUserClient::clientClose()
         mailboxOwner=gMailboxOwner;mailbox=gMailbox;
         gMailboxOwner=nullptr;gMailbox=nullptr;gMailboxWords=nullptr;gMailboxMapped=false;
     }
-    while(retiring_view_token_)IOLockSleep(g.lock,&retiring_view_token_,THREAD_UNINT);
+    while(retiring_view_token_ || unwiring_bos_)IOLockSleep(g.lock,&retiring_view_token_,THREAD_UNINT);
     IOLockUnlock(g.lock);
 
     if(mailboxOwner)mailboxOwner->release();
@@ -734,6 +735,8 @@ IOReturn AGXDeviceUserClient::clientMemoryForType(UInt32 type,IOOptionBits *opti
     IOLockLock(g.lock);
     if(!active()){IOLockUnlock(g.lock);return kIOReturnNotReady;}
     if(type==retiring_view_token_ && type){IOLockUnlock(g.lock);return kIOReturnBusy;}
+    NativeAdrenoMemory *backing=core_->memoryForToken(type);
+    if(!backing){IOLockUnlock(g.lock);return kIOReturnNotFound;}
     View *v=viewSlot(type);
     if(v && v->descriptor && v->token==type) {
         v->descriptor->retain();*memory=v->descriptor;
@@ -742,8 +745,6 @@ IOReturn AGXDeviceUserClient::clientMemoryForType(UInt32 type,IOOptionBits *opti
         IOLockUnlock(g.lock);
         return kIOReturnSuccess;
     }
-    NativeAdrenoMemory *backing=core_->memoryForToken(type);
-    if(!backing){IOLockUnlock(g.lock);return kIOReturnNotFound;}
     if(!growViews(type)){IOLockUnlock(g.lock);return kIOReturnNoMemory;}
     v=viewSlot(type);
     if(backing && backing->system() && backing->descriptor() && v && !v->descriptor) {
@@ -962,6 +963,7 @@ static IOReturn runCore(AGXDeviceUserClient *connection,uint32_t method,const vo
         }
         /* i e38a0b1eb: a BoFree held the lock up to 38 ms, unwiring and freeing a large BO's pages; they now go after the lock. */
         NativeAdrenoSystemPages freed{};
+        NativeAdrenoUserClient::DeferredUnwire pending{};
         const bool freeing=method==NativeAdrenoMethodBoFree;
         const bool unmapping=method==NativeAdrenoMethodBoCpuUnmap;
         const bool changesLease=freeing || unmapping || method==NativeAdrenoMethodBoCpuMap;
@@ -982,10 +984,17 @@ static IOReturn runCore(AGXDeviceUserClient *connection,uint32_t method,const vo
         spans=native_adreno_bo_memory[1];
         /* Offered for every BoAlloc, held or not: allocateSystem then knows it runs under the lock and leaves the pool alone. */
         if(connection->active())connection->core_->offerSystemPages(alloc?&pages:nullptr);
-        if(connection->active() && freeing)connection->core_->collectFreedPages(&freed);
+        if(connection->active() && freeing) {
+            connection->core_->collectFreedPages(&freed);
+            connection->core_->deferUnwire(&pending);
+        }
         status=connection->active()?connection->core_->dispatch(method,input,input_size,output,output_size,&g.clock):kIOReturnNotReady;
         if(connection->active())connection->core_->offerSystemPages(nullptr);
-        if(connection->active() && freeing)connection->core_->collectFreedPages(nullptr);
+        if(connection->active() && freeing) {
+            connection->core_->collectFreedPages(nullptr);
+            connection->core_->deferUnwire(nullptr);
+            if(pending.memory)++connection->unwiring_bos_;
+        }
         if(unmapping && !status) {
             NativeAdrenoAbiBoCpuUnmap request{};
             memcpy(&request,input,sizeof(request));  /* dispatch checked the size, handle, token and reservation. */
@@ -1012,6 +1021,14 @@ static IOReturn runCore(AGXDeviceUserClient *connection,uint32_t method,const vo
         const bool taken=offered && !pages.held();
         NativeAdrenoMemory::discardSystem(&pages);
         if(freed.held()) {native_adreno_freed_outside=native_adreno_freed_outside+1;NativeAdrenoMemory::discardSystem(&freed);}
+        if(pending.memory) {
+            const IOReturn unwired=pending.memory->unwireForRelease();
+            lockTimed(lockWait);
+            status=connection->core_->finishDeferredUnwire(pending,unwired);
+            --connection->unwiring_bos_;
+            IOLockWakeup(g.lock,&connection->retiring_view_token_,false);
+            unlockTimed(lockWait);
+        }
         if(alloc && request.bytes>=(UINT64_C(256)<<10))
             if(void (*hook)(const NativeAdrenoBoTrace *)=native_adreno_bo_hook) {
                 NativeAdrenoBoTrace trace{};

@@ -15,6 +15,9 @@
  * first and then releases the backing object; both steps must succeed.
  * Objects, queues and jobs are limited by memory and ring space only (msm's are: a fixed 4096-entry table crashed backboardd, i567). */
 class NativeAdrenoUserClient final {
+public:
+    struct DeferredUnwire {NativeAdrenoMemory *memory=nullptr;uint64_t handle=0;};
+private:
     struct Queue {uint32_t id=0;bool active=false;};
     struct Entry {
         NativeAdrenoMemory memory;
@@ -23,7 +26,7 @@ class NativeAdrenoUserClient final {
         uint64_t iova=0;
         bool used=false;
         bool mapped_state=false;
-        bool unreleasable=false;
+        bool unreleasable=false;  /* Release reserved or backing quarantined; reject new access. */
         bool imported=false;
         uint32_t imported_pid=0;
         uint32_t metadata_bytes=0;
@@ -77,10 +80,12 @@ class NativeAdrenoUserClient final {
     uint64_t next_handle_=1;
     bool open_=false;
     NativeAdrenoSystemPages *offered_pages_=nullptr,*freed_pages_=nullptr;
+    DeferredUnwire *deferred_unwire_=nullptr;
     Entry *find(uint64_t);
     Entry *free();
     void clear(Entry &);
     void publish(Entry &);
+    IOReturn finishFreeBo(Entry &,IOReturn status);
 public:
     /* The GPU priorities this process's Metal queues asked for: the next submission's ring (0 high, 1 low). */
     IOReturn setPriority(uint32_t foreground,uint32_t background);
@@ -124,6 +129,11 @@ public:
     /* Where the next freeBo under the lock leaves a system BO's pages (NativeAdrenoMemory::releaseSystemInto), for the caller to unwire
      * and free once the lock is let go (null: freed under it). */
     void collectFreedPages(NativeAdrenoSystemPages *pages) {freed_pages_=pages;}
+    /* Offers a place for freeBo to leave a non-system BO reserved, with no GPU
+     * mappings or CPU leases. Unwire it without the driver's lock and finish
+     * under that lock before closing the connection or reusing the entry. */
+    void deferUnwire(DeferredUnwire *pending) {deferred_unwire_=pending;}
+    IOReturn finishDeferredUnwire(const DeferredUnwire &,IOReturn status);
     /* What prepareSystem needs before the lock: whether this client's BOs are write-combined, and its largest BO. */
     static bool systemWriteCombined();
     uint64_t boLimit() const {return maxBoBytes();}
