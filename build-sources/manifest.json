@@ -40,19 +40,19 @@
       "repository": "UniXNU/drivers/Adreno740",
       "path": "NativeAdrenoPublish.cpp",
       "before_sha256": "ffb7601c5c16a44d2dd4e79bfc22024c985ef60680650c42c899c637ec707a48",
-      "sha256": "6f459830319808186a4187f680209f99059c79ad7aa78cfa2be9a0bbbf1329e2"
+      "sha256": "86c6e822e28e4a57989a2162a3a154fe6f02b7ce676469f1733072579da81dac"
     },
     "UniXNU/drivers/Adreno740/NativeAdrenoSubmit.cpp": {
       "repository": "UniXNU/drivers/Adreno740",
       "path": "NativeAdrenoSubmit.cpp",
       "before_sha256": "6343e5fc8fbf8c1d8d1c053b07744372a452021018283da0db9f74ddf566461e",
-      "sha256": "f19d987d25880d59651074e6740041cbb66f9c2bf34393fec7a5e4f389e8eec2"
+      "sha256": "553f612ac648d8fa0965bd7b3edb23f8b30e354e4d24444dc6f380b25daaad2d"
     },
     "UniXNU/drivers/Adreno740/NativeAdrenoSubmit.h": {
       "repository": "UniXNU/drivers/Adreno740",
       "path": "NativeAdrenoSubmit.h",
       "before_sha256": "493d849685162d4efa3cd7fe0c0963685e50b11266673f2e56268d984aa4f9bb",
-      "sha256": "0d137f54c4e489beee1ac69e9b275616369446a7c13c07f71df60ee5594f192e"
+      "sha256": "600e22667408d0834c2487c20e78d775f1c10ac5e0e0c8d947a4e59e17ff967a"
     },
     "UniXNU/drivers/Adreno740/tests/XnuMemoryFixture.h": {
       "repository": "UniXNU/drivers/Adreno740",
@@ -70,7 +70,7 @@
       "repository": "UniXNU/drivers/Adreno740",
       "path": "tests/test_submit.cpp",
       "before_sha256": "ea56b6eb4d9cf9936f472ed5bf622d7e9fe74773f2b11a78beb0ba1d7601a4fa",
-      "sha256": "997117f8ccf519d9f4e822408c102c5ac4ade103b7dd85af127bb369e3dec465"
+      "sha256": "adbc1234258f01d53d3d963372d213d981e6d0edeca6e464454f5958b220525e"
     },
     "UniXNU/drivers/ArmCpu/ArmCpu.cpp": {
       "repository": "UniXNU/drivers/ArmCpu",
@@ -551,6 +551,12 @@
       "path": "NativeAdrenoRingLog.h",
       "before_sha256": null,
       "sha256": "916020991502005e61e4a44baa8b0eb2dea9963f366ee954a5f1f1ece5d0dc76"
+    },
+    "UniXNU/drivers/Adreno740/NativeAdrenoUserClient.h": {
+      "repository": "UniXNU/drivers/Adreno740",
+      "path": "NativeAdrenoUserClient.h",
+      "before_sha256": "d0f3bc1ff3e79d0e9c368231072371c63352f4a5e8e0362eef8f58b573620260",
+      "sha256": "5be8f686dfebdaa1e63ecc4137436455291322f025a8d80bba9852c2172986a1"
     }
   },
   "candidate_version": "V6.3",

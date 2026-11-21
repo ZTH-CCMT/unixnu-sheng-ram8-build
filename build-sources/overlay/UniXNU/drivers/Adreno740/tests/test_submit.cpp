@@ -1165,6 +1165,10 @@ static void testDualRingHaltRecovery(bool reset_ok)
     CHECK(p.submit.retireCompleted()==kIOReturnSuccess);
     const uint32_t high=p.enqueue(0,8);
     const uint32_t low=p.enqueue(1,7);
+    CHECK(p.submit.oldestFenceInRange(7,1)==low);
+    CHECK(p.submit.oldestFenceInRange(8,1)==high);
+    CHECK(p.submit.oldestFenceInRange(7,2)==high);
+    CHECK(!p.submit.oldestFenceInRange(7,0) && !p.submit.oldestFenceInRange(9,1));
     CHECK(p.ring.current() && !p.low.current());
     CHECK(p.submit.wait(high,&ringclock,0)==kIOReturnTimeout);
     ++cp.regs[0x0928];clock_us+=50000;

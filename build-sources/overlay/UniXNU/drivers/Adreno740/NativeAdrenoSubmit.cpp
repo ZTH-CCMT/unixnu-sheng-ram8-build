@@ -733,6 +733,13 @@ bool NativeAdrenoSubmit::rangeOutstanding(uint64_t first,uint64_t count) const
     for(const auto &job:jobs_)if(job.active && job.queue-first<count)return true;
     return false;
 }
+uint32_t NativeAdrenoSubmit::oldestFenceInRange(uint64_t first,uint64_t count) const
+{
+    uint32_t oldest=0;
+    for(const auto &job:jobs_)
+        if(job.active && job.fence && job.queue-first<count && (!oldest || job.fence<oldest))oldest=job.fence;
+    return oldest;
+}
 size_t NativeAdrenoSubmit::outstanding() const
 {
     size_t count=0;for(const auto &job:jobs_)if(job.active)++count;return count;
@@ -1245,10 +1252,8 @@ IOReturn NativeAdrenoSubmit::waitAll(const NativeAdrenoRingClock *clock,uint32_t
 IOReturn NativeAdrenoSubmit::waitRange(uint64_t first,uint64_t count,const NativeAdrenoRingClock *clock,uint32_t timeout_us)
 {
     if(!attached_ || poisoned_)return kIOReturnNotReady;
-    while(rangeOutstanding(first,count)) {
-        Job *oldest=nullptr;
-        for(auto &job:jobs_)if(job.active && job.queue-first<count && (!oldest || job.fence<oldest->fence))oldest=&job;
-        const IOReturn status=wait(oldest->fence,clock,timeout_us);
+    while(const uint32_t fence=oldestFenceInRange(first,count)) {
+        const IOReturn status=wait(fence,clock,timeout_us);
         if(status)return status;
     }
     return kIOReturnSuccess;

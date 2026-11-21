@@ -393,8 +393,15 @@ void NativeAdrenoPoolView::free()
 class AGXDeviceUserClient : public IOUserClient {
     OSDeclareDefaultStructors(AGXDeviceUserClient)
     bool live_=false,closing_=false;
+    enum : uint8_t {CloseCore,CloseTable,CloseAddressSpace};
+    uint8_t close_stage_=CloseCore;  // Written under g.lock, also read by lockless entry points.
+    uint64_t close_peak_=0;
+    bool closing() const {
+        return __atomic_load_n(&closing_,__ATOMIC_ACQUIRE) ||
+            __atomic_load_n(&close_stage_,__ATOMIC_ACQUIRE)!=CloseCore;
+    }
     bool active() const {
-        return __atomic_load_n(&live_,__ATOMIC_ACQUIRE) && !__atomic_load_n(&closing_,__ATOMIC_ACQUIRE);
+        return __atomic_load_n(&live_,__ATOMIC_ACQUIRE) && !closing();
     }
     bool handoffOnly_=false;
     bool kernel_=false;
@@ -420,6 +427,7 @@ class AGXDeviceUserClient : public IOUserClient {
     View takeView(View &slot);
     void removeView(const View &view);
     void dropViews();
+    IOReturn waitForCloseWork();
     static IOReturn action(OSObject *target,void *reference,IOExternalMethodArguments *arguments);
     IOReturn run(uint32_t method,const void *input,size_t input_size,void *output,size_t output_size);
     IOReturn runTimed(uint32_t method,const void *input,size_t input_size,void *output,size_t output_size,uint64_t *lockWait);
@@ -611,6 +619,27 @@ bool AGXDeviceUserClient::growViews(uint32_t token)
     views_=made;view_capacity_=size;
     return true;
 }
+static constexpr uint32_t CloseFenceTimeoutUs=2000000;
+IOReturn AGXDeviceUserClient::waitForCloseWork()
+{
+    // closing_ blocks new submissions. Keep only the fence number across
+    // a pause because completion can retire and reuse a job slot.
+    while(const uint32_t fence=core_->oldestOwnFence()) {
+        const uint64_t began=g.clock.now_us?g.clock.now_us(g.clock.cookie):0;
+        IOReturn status=kIOReturnSuccess;
+        while((status=g.submit->observeFence(fence,&g.clock,0))==kIOReturnTimeout) {
+            IOLockUnlock(g.lock);
+            const bool retry=g.clock.waitForPoll(began,CloseFenceTimeoutUs);
+            IOLockLock(g.lock);
+            if(!retry)break;
+        }
+        if(status && status!=kIOReturnTimeout)return status;
+        // Retire under the lock, or report the original timeout diagnostics.
+        status=g.submit->wait(fence,&g.clock,0);
+        if(status)return status;
+    }
+    return kIOReturnSuccess;
+}
 IOReturn AGXDeviceUserClient::clientClose()
 {
     IOLockLock(g.lock);
@@ -631,12 +660,22 @@ IOReturn AGXDeviceUserClient::clientClose()
     IOLockLock(g.lock);
     IOReturn status=kIOReturnSuccess;
     if(live_) {
-        const uint64_t peak=core_->windowPeak();
-        status=core_->releaseAll(&g.clock,2000000);
-        /* The address space goes once the GPU no longer runs it: idle, and the kernel table back in the bank if it was installed. */
-        if(!status && space_)status=g.submit->forgetVm(space_->vm(),&g.clock,2000000);
+        // releaseAll closes the core. If a later step fails, resume at that
+        // step without reopening the connection or repeating completed work.
+        if(close_stage_==CloseCore) {
+            const uint64_t peak=core_->windowPeak();
+            status=waitForCloseWork();
+            if(!status)status=core_->releaseAll(&g.clock,0);
+            if(!status) {
+                close_peak_=peak;
+                __atomic_store_n(&close_stage_,CloseTable,__ATOMIC_RELEASE);
+            }
+        }
+        if(!status && close_stage_==CloseTable) {
+            if(space_)status=g.submit->forgetVm(space_->vm(),&g.clock,CloseFenceTimeoutUs);
+            if(!status)__atomic_store_n(&close_stage_,CloseAddressSpace,__ATOMIC_RELEASE);
+        }
         if(!status && space_) {status=g.context->destroyVm(space_);if(!status)space_=nullptr;}
-        /* A failed teardown leaves the objects (and the address space) live: nothing is forced or reused. */
         if(!status) {
             __atomic_store_n(&live_,false,__ATOMIC_RELEASE);
             if(kernel_)g.kernel_client=false;
@@ -645,7 +684,7 @@ IOReturn AGXDeviceUserClient::clientClose()
             ++g.closed;native_adreno_metal_diag.closes=native_adreno_metal_diag.closes+1;
             if(NativeAdrenoClientRecord *record=clientRecord(name_)) {
                 record->closes=record->closes+1;record->slot=0xff;
-                if(peak>>20>record->peak_mib)record->peak_mib=uint32_t(peak>>20);
+                if(close_peak_>>20>record->peak_mib)record->peak_mib=uint32_t(close_peak_>>20);
             }
         }
     }
@@ -658,8 +697,8 @@ void AGXDeviceUserClient::free()
 {
     dropViews();
     if(views_) {IODelete(views_,View,view_capacity_);views_=nullptr;view_capacity_=0;}
-    /* Still live only when a teardown failed: its objects stay referenced by the VM and the ring, so the core is kept, not freed. */
-    if(core_ && !live_) {delete core_;core_=nullptr;}
+    /* An open core can still hold objects referenced by the VM and ring. */
+    if(core_ && (!live_ || close_stage_!=CloseCore)) {delete core_;core_=nullptr;}
     IOUserClient::free();
 }
 IOReturn AGXDeviceUserClient::clientMemoryForType(UInt32 type,IOOptionBits *options,IOMemoryDescriptor **memory)
@@ -668,7 +707,7 @@ IOReturn AGXDeviceUserClient::clientMemoryForType(UInt32 type,IOOptionBits *opti
     if(!memory || !options)return kIOReturnBadArgument;
     IOReturn status=kIOReturnNotFound;
     if(type==NativeAdrenoScanoutType) {
-        if(__atomic_load_n(&closing_,__ATOMIC_ACQUIRE) || (!active() && !handoffOnly_))return kIOReturnNotReady;
+        if(closing() || (!handoffOnly_ && !active()))return kIOReturnNotReady;
         IOMemoryDescriptor *scanout=native_gop_handoff_memory();
         if(!scanout)return kIOReturnNotReady;
         *memory=scanout;                        /* already retained for the caller */
