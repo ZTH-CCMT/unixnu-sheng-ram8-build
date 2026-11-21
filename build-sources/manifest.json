@@ -238,7 +238,7 @@
       "repository": "device",
       "path": "package/BootLog.c",
       "before_sha256": "5c880128ff6bd54d60dec13cd9b18acb47d2d801ebfa6aac920b308d74f238c2",
-      "sha256": "86bc7f6f6a42824f900257d7be6a189b1b5f13505cb973ac2649a562f18d7043"
+      "sha256": "cd7b12ae11a8dbcff306b73e82ffb67e805fa104646dcafb769265e1b130558d"
     },
     "device/package/LegacyDisplayProbe.cpp": {
       "repository": "device",
@@ -550,7 +550,7 @@
       "repository": "UniXNU/drivers/Adreno740",
       "path": "NativeAdrenoRingLog.h",
       "before_sha256": null,
-      "sha256": "916020991502005e61e4a44baa8b0eb2dea9963f366ee954a5f1f1ece5d0dc76"
+      "sha256": "07af286a3850972accf1e77547e3f7f2fd02aa4aa878be15e12b1fd4c721dcb9"
     },
     "UniXNU/drivers/Adreno740/NativeAdrenoUserClient.h": {
       "repository": "UniXNU/drivers/Adreno740",
@@ -563,6 +563,12 @@
       "path": "NativeAdrenoUserClient.cpp",
       "before_sha256": "e5ebfed24a9c1b4840706e4a74c428f5437ac28daaf957624fb246cd325a7dd4",
       "sha256": "7f53aca436a839f150c23d37460f95eadc6b7d0af9aed6fe86007610ddeffe48"
+    },
+    "UniXNU/scripts/build-sheng-source-storage.py": {
+      "repository": "UniXNU",
+      "path": "scripts/build-sheng-source-storage.py",
+      "before_sha256": "a5ecbe9e69f120e2670fffbf65623cfb4eb62c03c96f45c53b86d4fd41d3c585",
+      "sha256": "ef954b866a02820e1bb9782920cd79f926957095410c9475fe6a748241abc584"
     }
   },
   "candidate_version": "V6.3",

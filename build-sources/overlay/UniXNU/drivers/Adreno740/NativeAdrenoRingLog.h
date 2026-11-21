@@ -18,12 +18,8 @@ typedef uint32_t NativeAdrenoRingLogRow[NativeAdrenoRingLogRowWords];
 extern "C" {
 #endif
 
-/* Returns up to capacity rows, newest first. The board logger also supports builds without Adreno. */
-uint32_t native_adreno_ring_log_copy(NativeAdrenoRingLogRow *out, uint32_t capacity)
-#ifdef NATIVE_ADRENO_RING_LOG_OPTIONAL
-    __attribute__((weak_import))
-#endif
-    ;
+/* Returns up to capacity rows, newest first. */
+uint32_t native_adreno_ring_log_copy(NativeAdrenoRingLogRow *out, uint32_t capacity);
 
 #ifdef __cplusplus
 }

@@ -14,14 +14,14 @@
 // The header is written last in each round, so a reader never trusts a slot or an export the header does not count yet.
 #include <kern/startup.h>
 #include "BootLatencyFiles.h"
-#define NATIVE_ADRENO_RING_LOG_OPTIONAL
-#include "NativeAdrenoRingLog.h"
+#include <NativeAdrenoRingLog.h>
 #include <kern/thread.h>
 #include <kern/clock.h>
 #include <string.h>
 #include <pexpert/pexpert.h>
 #include <kern/misc_protos.h>
 #include <IOKit/IOLib.h>
+extern uint32_t native_adreno_ring_log_copy(NativeAdrenoRingLogRow *out, uint32_t capacity) __attribute__((weak_import));
 extern void native_wifi_logf(int, const char *, ...) __attribute__((weak_import));
 extern void boot_cache_loader_log_capture(unsigned) __attribute__((weak_import));
 extern uint32_t boot_cache_input_ready(void) __attribute__((weak_import));
