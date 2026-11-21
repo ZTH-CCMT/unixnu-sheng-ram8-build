@@ -1,9 +1,10 @@
 name: UniXNU sheng iPadOS 27 RAM 8 GiB V6.3 Touch
+run-name: "#53 DSH Buttons"
 
 on:
   workflow_dispatch:
   push:
-    branches: [ram8-v6.3-touch-release]
+    branches: [ram8-53-dsh-buttons]
 
 permissions:
   contents: read
@@ -111,7 +112,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: v6.3-touch-build-failure-${{ github.run_id }}-${{ github.run_attempt }}
+          name: 53-dsh-buttons-build-failure-${{ github.run_id }}-${{ github.run_attempt }}
           path: build-failure-logs/
           if-no-files-found: warn
           retention-days: 7
@@ -133,7 +134,7 @@ jobs:
       - name: Upload verified generic boot handoff
         uses: actions/upload-artifact@v4
         with:
-          name: os27-ram8-v6.3-touch-handoff-${{ github.run_id }}-${{ github.run_attempt }}
+          name: os27-ram8-53-dsh-buttons-handoff-${{ github.run_id }}-${{ github.run_attempt }}
           path: os27-ram8-handoff/
           include-hidden-files: true
           if-no-files-found: error
