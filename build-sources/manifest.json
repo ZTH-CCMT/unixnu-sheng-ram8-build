@@ -238,7 +238,7 @@
       "repository": "device",
       "path": "package/BootLog.c",
       "before_sha256": "5c880128ff6bd54d60dec13cd9b18acb47d2d801ebfa6aac920b308d74f238c2",
-      "sha256": "923d3ac5fb0e1c3581277af173947aaf0181ebdddf9e963512f94ea4caa7cfc8"
+      "sha256": "6a6e0f5c618179600c2333210d17e5487e6e08b2c367cb7119c10f89a70c7a8c"
     },
     "device/package/LegacyDisplayProbe.cpp": {
       "repository": "device",
@@ -569,6 +569,18 @@
       "path": "scripts/build-sheng-source-storage.py",
       "before_sha256": "a5ecbe9e69f120e2670fffbf65623cfb4eb62c03c96f45c53b86d4fd41d3c585",
       "sha256": "ef954b866a02820e1bb9782920cd79f926957095410c9475fe6a748241abc584"
+    },
+    "device/package/AppleARMBacklight.cpp": {
+      "repository": "device",
+      "path": "package/AppleARMBacklight.cpp",
+      "before_sha256": "6036394e5e8fb6fbe9bf8c365834626f97d99c249ae1b87fb6db7fabaa8d1ebb",
+      "sha256": "0bc35c2c62125b3ab0715676ac9a2529c364bd89a4f4f102023210b90b066caf"
+    },
+    "device/package/ButtonProbe.cpp": {
+      "repository": "device",
+      "path": "package/ButtonProbe.cpp",
+      "before_sha256": "fe1c39eb478454a0bc8fc169db75f0a94c54d06142ee03315a827e9b7279aa2e",
+      "sha256": "65d8a5271901860117fc0fe24933b85b66e40f0cdd17fb9604ebf27414af8afa"
     }
   },
   "candidate_version": "V6.3",

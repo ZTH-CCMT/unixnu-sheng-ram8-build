@@ -288,7 +288,7 @@ extern volatile uint32_t native_adreno_submit_ibs[4] __attribute__((weak_import)
 extern volatile uint32_t native_touch_edge_stats[4] __attribute__((weak_import));
 extern volatile uint32_t native_touch_edge_install[3] __attribute__((weak_import));
 extern volatile uint32_t native_touch_hid_multi[3] __attribute__((weak_import));
-extern volatile int32_t native_backlight_request[6] __attribute__((weak_import));
+extern volatile int32_t native_backlight_request[10] __attribute__((weak_import));
 extern volatile uint32_t native_usb_stats[54] __attribute__((weak_import));
 extern volatile uint64_t native_adreno_reassert_ticks __attribute__((weak_import));
 extern volatile uint64_t native_adreno_cache_stats[5] __attribute__((weak_import));
@@ -791,6 +791,15 @@ static size_t compose(char *out, size_t cap, uint32_t slot, unsigned now) {
     // attach tries and transfers done.
     snprintf(row, sizeof row, "L2 ia=%d ib=%d mode=%d to=%d tries=%d done=%d", native_backlight_stats[10], native_backlight_stats[11],
              native_backlight_stats[12], native_backlight_stats[13], native_backlight_stats[14], native_backlight_stats[15]);
+    at = put(out, at, cap, row, sizeof row);
+    // Which requests reached the driver and what they carried: all setProperties entries, those with no usable key,
+    // the last entry's key kind (0 none, 1 brightness-nits number, 2 brightness number, 3 brightness-nits data,
+    // 4 brightness data, 5 either key in another type) and the accepted entries.
+    snprintf(row, sizeof row, "L3 calls=%d miss=%d kind=%d acc=%d",
+             &native_backlight_request ? native_backlight_request[6] : -1,
+             &native_backlight_request ? native_backlight_request[7] : -1,
+             &native_backlight_request ? native_backlight_request[8] : -1,
+             &native_backlight_request ? native_backlight_request[9] : -1);
     at = put(out, at, cap, row, sizeof row);
   }
   if (&boot_progress_ext_wide)
