@@ -40,7 +40,7 @@
       "repository": "UniXNU/drivers/Adreno740",
       "path": "NativeAdrenoPublish.cpp",
       "before_sha256": "ffb7601c5c16a44d2dd4e79bfc22024c985ef60680650c42c899c637ec707a48",
-      "sha256": "5705af4e28b5cf9c002213f870de11b5ac7a4e153fb3535b7039092d5b50103b"
+      "sha256": "d27aeb0cd781882203e7698712ba749c5592a5a8e48f90aca37f08e50fc529a9"
     },
     "UniXNU/drivers/Adreno740/NativeAdrenoSubmit.cpp": {
       "repository": "UniXNU/drivers/Adreno740",
@@ -388,7 +388,7 @@
       "repository": "UniXNU/drivers/AdrenoMetal",
       "path": "NativeAdrenoMetalPlugin.mm",
       "before_sha256": "ade7f1657e5979699609d858fd2201df675f4d9fefe40cdf54f312ee1d8f6a0e",
-      "sha256": "66736c8bed0dccf09cbec5294bb59afc954ee22b6c5c8f97ae8f2ea6b45f1044"
+      "sha256": "1104290006812b22d8a34a595ee8d54e1d5641c10aaac6a654cf296209067c63"
     },
     "UniXNU/drivers/AdrenoMetal/NativeBridgeMetalFrontend.mm": {
       "repository": "UniXNU/drivers/AdrenoMetal",

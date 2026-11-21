@@ -1307,7 +1307,7 @@ extern "C" IOReturn native_adreno_new_user_client(IOService *provider,task_t own
             return kIOReturnUnsupported;
         }
         // Keep the render server's one-time result after the rolling markers wrap.
-        if((value>=0x6E40 && value<=0x6E43) || value==0x6E4F || (value>=0x6E51 && value<=0x6E53)) {
+        if((value>=0x6E40 && value<=0x6E43) || value==0x6E4F || (value>=0x6E51 && value<=0x6E55)) {
             char who[20]={};
             proc_selfname(who,sizeof who);
             if(isRenderServer(who,sizeof who))

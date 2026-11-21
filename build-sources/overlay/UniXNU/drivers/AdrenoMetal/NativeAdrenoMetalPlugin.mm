@@ -200,7 +200,9 @@ static bool quartzCoreSlide(uintptr_t &slide) {
 // 40 other places in QuartzCore read the same byte (XR formats, backdrop compute, ASTC ...). Holding the byte at 0 turned all of them, and the
 // tablet drew light blue blocks. Here the byte stays 1 and only this branch is made a NOP, so the framebuffer is chosen as on a real device and
 // nothing else changes. Marks 0x6E40 bad address/read, 0x6E41 other instruction,
-// 0x6E42 patched, 0x6E43 unknown page permissions, 0x6E50|stage failures.
+// 0x6E42 patched, 0x6E43 unknown initial permissions, 0x6E51 make writable,
+// 0x6E52 write, 0x6E53 restore call failed, 0x6E54 restore could not be verified,
+// 0x6E55 observed a permissions mismatch and could not confirm recovery.
 // The boot argument token that starts with prefix (a whole name, or name=value), or nullptr: a name is matched only at the start of the
 // command line or after a space, so "log=1" does not find "cache-log=1".
 static const char *bootArgToken(const char *args, const char *prefix) {
@@ -231,29 +233,39 @@ static bool bootArgSet(const char *key) {
     vm_prot_t protection = 0;
     if (!taskProtection(page, vm_page_size, protection)) return 0x6E43;
     const auto task = mach_task_self();
-    const auto hasOriginalProtection = [&] {
+    enum class ProtectionCheck { Match, Unavailable, Mismatch };
+    const auto checkProtection = [&] {
         vm_prot_t current = 0;
-        return taskProtection(page, vm_page_size, current) && current == protection;
+        if (!taskProtection(page, vm_page_size, current)) return ProtectionCheck::Unavailable;
+        return current == protection ? ProtectionCheck::Match : ProtectionCheck::Mismatch;
     };
-    const auto restoreProtection = [&] {
+    const auto restoreProtection = [&]() -> unsigned {
+        bool sawMismatch = false;
         for (unsigned attempt = 0; attempt < 2; ++attempt) {
-            if (vm_protect(task, page, vm_page_size, FALSE, protection) == KERN_SUCCESS &&
-                hasOriginalProtection()) return;
+            if (vm_protect(task, page, vm_page_size, FALSE, protection) != KERN_SUCCESS) continue;
+            auto observed = checkProtection();
+            if (observed == ProtectionCheck::Unavailable) observed = checkProtection();
+            if (observed == ProtectionCheck::Match) return 0;
+            // Retry an unavailable query without changing the mapping again.
+            // An unknown result cannot clear an already observed mismatch.
+            if (observed == ProtectionCheck::Unavailable && !sawMismatch) return 0x6E54;
+            sawMismatch = true;
         }
         // Let launchd restart the render server with its original mapping.
-        gpu->mark(0x6E53);
+        gpu->mark(sawMismatch ? 0x6E55 : 0x6E53);
         _exit(1);
     };
     if (vm_protect(task, page, vm_page_size, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) != KERN_SUCCESS) {
         // The COW remap can affect protections before the operation fails.
-        if (!hasOriginalProtection()) restoreProtection();
-        return 0x6E51;
+        const unsigned restore = checkProtection() == ProtectionCheck::Match ? 0 : restoreProtection();
+        return restore ? restore : 0x6E51;
     }
 
     const uint32_t nop = 0xd503201f;
     const bool wrote = vm_write(task, site, (vm_offset_t)&nop, sizeof nop) == KERN_SUCCESS;
-    restoreProtection();
+    const unsigned restore = restoreProtection();
     sys_icache_invalidate((void *)site, sizeof nop);
+    if (restore) return restore;
     return wrote ? 0x6E42 : 0x6E52;
 }
 #if defined(__arm64e__) && !TARGET_OS_OSX

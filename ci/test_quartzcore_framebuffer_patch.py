@@ -54,6 +54,8 @@ struct Fixture {
     bool mapped = true, readable = true, fail_protect = false, fail_write = false;
     bool change_before_protect_failure = false;
     unsigned failed_restores = 0, stripped_executables = 0, writes = 0, invalidations = 0;
+    unsigned successful_restores = 0, unavailable_on_restore = 0;
+    unsigned unavailable_queries = 0, observed_unavailable_queries = 0;
     std::vector<vm_prot_t> requests;
 };
 
@@ -78,6 +80,11 @@ static kern_return_t vm_region_recurse_64(unsigned task, vm_address_t *address,
     CHECK(task == mach_task_self() && *address == Page && *depth == UINT32_MAX);
     CHECK(*count == VM_REGION_SUBMAP_SHORT_INFO_COUNT_64);
     if (memory.region == Region::Error) return 1;
+    if (memory.unavailable_on_restore && memory.successful_restores >= memory.unavailable_on_restore &&
+        memory.observed_unavailable_queries < memory.unavailable_queries) {
+        ++memory.observed_unavailable_queries;
+        return 1;
+    }
     auto *mapping = reinterpret_cast<vm_region_submap_short_info_data_64_t *>(info);
     mapping->protection = memory.protection;
     mapping->is_submap = memory.region == Region::Submap;
@@ -101,6 +108,7 @@ static kern_return_t vm_protect(unsigned task, vm_address_t page, size_t size, u
             --memory.failed_restores;
             return 1;
         }
+        ++memory.successful_restores;
         memory.protection = flags;
         if (memory.stripped_executables) {
             --memory.stripped_executables;
@@ -186,6 +194,28 @@ static void testRefusals() {
     }
 }
 
+static void testPostRestoreQueryUnavailable() {
+    const auto original = VM_PROT_READ | VM_PROT_EXECUTE;
+    for (unsigned unavailable : {2u, 1u}) {
+        Gpu gpu;
+        memory = Fixture{original};
+        memory.unavailable_on_restore = 1;
+        memory.unavailable_queries = unavailable;
+        unsigned result = 0;
+        try {
+            result = patch(gpu);
+        } catch (const FixtureExit &exit) {
+            std::fprintf(stderr, "restore succeeded but query was unavailable; exited with %d, marker %04x\n",
+                         exit.status, gpu.last_mark);
+            std::exit(1);
+        }
+        CHECK(result == (unavailable == 2 ? 0x6E54u : 0x6E42u));
+        CHECK(memory.observed_unavailable_queries == unavailable);
+        checkRestored(original);
+        CHECK(memory.instruction == Nop && memory.invalidations == 1);
+    }
+}
+
 static void testMutationFailures() {
     const auto original = VM_PROT_READ | VM_PROT_EXECUTE;
     Gpu gpu;
@@ -221,18 +251,35 @@ static void testMutationFailures() {
     CHECK((memory.requests == std::vector<vm_prot_t>{Temporary, original, original}));
     CHECK(memory.protection == original && memory.writes == 1 && memory.instruction == Nop);
 
-    for (bool silent : {false, true}) {
+    for (unsigned marker : {0x6E53u, 0x6E55u}) {
         memory = Fixture{original};
-        memory.failed_restores = silent ? 0 : 2;
-        memory.stripped_executables = silent ? 2 : 0;
+        memory.failed_restores = marker == 0x6E53 ? 2 : 0;
+        memory.stripped_executables = marker == 0x6E55 ? 2 : 0;
+        gpu.last_mark = 0;
         try {
             (void)patch(gpu);
             CHECK(false);
         } catch (const FixtureExit &exit) {
-            CHECK(exit.status == 1 && gpu.last_mark == 0x6E53);
+            CHECK(exit.status == 1 && gpu.last_mark == marker);
         }
         CHECK((memory.requests == std::vector<vm_prot_t>{Temporary, original, original}));
+        CHECK(memory.invalidations == 0);
     }
+
+    // A later unreadable result cannot clear an observed mismatch.
+    memory = Fixture{original};
+    memory.stripped_executables = 1;
+    memory.unavailable_on_restore = 2;
+    memory.unavailable_queries = 2;
+    gpu.last_mark = 0;
+    try {
+        (void)patch(gpu);
+        CHECK(false);
+    } catch (const FixtureExit &exit) {
+        CHECK(exit.status == 1 && gpu.last_mark == 0x6E55);
+    }
+    CHECK((memory.requests == std::vector<vm_prot_t>{Temporary, original, original}));
+    CHECK(memory.observed_unavailable_queries == 2 && memory.invalidations == 0);
 }
 
 int main() {
@@ -240,8 +287,9 @@ int main() {
     testPatchWithProtection(VM_PROT_WRITE | VM_PROT_EXECUTE);
     testPatchWithProtection(VM_PROT_READ | VM_PROT_WRITE);
     testRefusals();
+    testPostRestoreQueryUnavailable();
     testMutationFailures();
-    std::puts("PASS BGRA patch validates the instruction, restores original protections, and reports Mach VM failures");
+    std::puts("PASS BGRA patch distinguishes failed restoration, unavailable verification, and a verified mismatch");
 }
 """
 
