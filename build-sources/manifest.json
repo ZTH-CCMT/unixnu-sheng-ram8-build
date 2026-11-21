@@ -40,7 +40,7 @@
       "repository": "UniXNU/drivers/Adreno740",
       "path": "NativeAdrenoPublish.cpp",
       "before_sha256": "ffb7601c5c16a44d2dd4e79bfc22024c985ef60680650c42c899c637ec707a48",
-      "sha256": "44d8198a49c8a8ab617f7d6dea88fec826a9acbdf926558372c4265457a27209"
+      "sha256": "5705af4e28b5cf9c002213f870de11b5ac7a4e153fb3535b7039092d5b50103b"
     },
     "UniXNU/drivers/Adreno740/NativeAdrenoSubmit.cpp": {
       "repository": "UniXNU/drivers/Adreno740",
@@ -238,7 +238,7 @@
       "repository": "device",
       "path": "package/BootLog.c",
       "before_sha256": "5c880128ff6bd54d60dec13cd9b18acb47d2d801ebfa6aac920b308d74f238c2",
-      "sha256": "cd7b12ae11a8dbcff306b73e82ffb67e805fa104646dcafb769265e1b130558d"
+      "sha256": "923d3ac5fb0e1c3581277af173947aaf0181ebdddf9e963512f94ea4caa7cfc8"
     },
     "device/package/LegacyDisplayProbe.cpp": {
       "repository": "device",
@@ -388,7 +388,7 @@
       "repository": "UniXNU/drivers/AdrenoMetal",
       "path": "NativeAdrenoMetalPlugin.mm",
       "before_sha256": "ade7f1657e5979699609d858fd2201df675f4d9fefe40cdf54f312ee1d8f6a0e",
-      "sha256": "b130c346b5fc1a21f65280af668a28a614e08fd115cbfe0b25d3ae367c47c4b1"
+      "sha256": "66736c8bed0dccf09cbec5294bb59afc954ee22b6c5c8f97ae8f2ea6b45f1044"
     },
     "UniXNU/drivers/AdrenoMetal/NativeBridgeMetalFrontend.mm": {
       "repository": "UniXNU/drivers/AdrenoMetal",

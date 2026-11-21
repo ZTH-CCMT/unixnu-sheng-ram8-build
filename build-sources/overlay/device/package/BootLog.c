@@ -165,6 +165,7 @@ extern volatile uint32_t native_adreno_stall[24] __attribute__((weak_import));
 extern volatile uint32_t native_adreno_stall_mem[59] __attribute__((weak_import));
 extern volatile uint32_t native_adreno_unstick[15] __attribute__((weak_import));
 extern volatile uint32_t native_adreno_vm_tail_resume[2] __attribute__((weak_import));
+extern volatile uint32_t native_adreno_bgra_patch_result __attribute__((weak_import));
 extern volatile uint32_t native_adreno_fence_pending[8] __attribute__((weak_import));
 extern volatile uint32_t native_adreno_wptr_fence[4] __attribute__((weak_import));
 extern volatile uint64_t native_adreno_wait_outer[5] __attribute__((weak_import));
@@ -2454,6 +2455,14 @@ static size_t compose(char *out, size_t cap, uint32_t slot, unsigned now) {
              &boot_diag_skipped ? boot_diag_skipped : 0, &boot_diag_errors ? boot_diag_errors : 0, diag_bytes, diag_first,
              &boot_diag_alloc ? boot_diag_alloc : 0);
     at = put(out, at, cap, row, sizeof row);
+  }
+  if (&native_adreno_bgra_patch_result) {
+    const uint32_t result = __atomic_load_n(&native_adreno_bgra_patch_result, __ATOMIC_RELAXED);
+    if (result) {
+      char row[48];
+      snprintf(row, sizeof row, "[diag] bgra_patch=%04x", result);
+      at = put(out, at, cap, row, sizeof row);
+    }
   }
   // The signed-text fixups given as text-fixupN boot arguments: how many parsed and how many page writes they made.
   if (&cs_text_fixup_parsed && cs_text_fixup_parsed) {

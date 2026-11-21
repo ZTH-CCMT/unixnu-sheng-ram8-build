@@ -41,6 +41,7 @@ static bool isRenderServer(const char *name,size_t size) {return !strncmp(name,k
 extern "C" volatile uint32_t native_adreno_table_switches[8];
 /* The plugin's telemetry table (rows of text the Metal bridge keeps), sent as markers: 0xC000|row starts a row, 0x8000|(a<<7)|b appends two characters. */
 extern "C" {char native_adreno_metal_rows[48][96];volatile uint32_t native_adreno_metal_rows_seq;}
+extern "C" {volatile uint32_t native_adreno_bgra_patch_result;}
 
 extern "C" {
 /* What the processes that reached this driver did, for the boot diagnostic page. Plain counters and short strings. */
@@ -1304,6 +1305,13 @@ extern "C" IOReturn native_adreno_new_user_client(IOService *provider,task_t own
             }
             else if(value<0x7100 && length<sizeof(native_adreno_metal_diag.report2)-1) {line[length++]=char(value&0xff);line[length]=0;}
             return kIOReturnUnsupported;
+        }
+        // Keep the render server's one-time result after the rolling markers wrap.
+        if((value>=0x6E40 && value<=0x6E43) || value==0x6E4F || (value>=0x6E51 && value<=0x6E53)) {
+            char who[20]={};
+            proc_selfname(who,sizeof who);
+            if(isRenderServer(who,sizeof who))
+                __atomic_store_n(&native_adreno_bgra_patch_result,value,__ATOMIC_RELAXED);
         }
         native_adreno_metal_diag.marks[slot]=value;
         native_adreno_metal_diag.marks_total=native_adreno_metal_diag.marks_total+1;

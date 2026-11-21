@@ -134,19 +134,18 @@ static bool readTask(uintptr_t address, void *out, size_t size) {
     vm_size_t got = 0;
     return vm_read_overwrite(mach_task_self(), address, size, (vm_address_t) out, &got) == KERN_SUCCESS && got == size;
 }
-// The entire range must belong to the reported region. vm_region_64 may instead
-// return the next region when the requested address is unmapped.
+// QuartzCore's shared cache is nested in a read-only submap. Query the leaf
+// mapping to get the actual permissions of the whole range we will touch.
 static bool taskProtection(uintptr_t address, size_t size, vm_prot_t &protection) {
     vm_address_t start = address;
     vm_size_t length = 0;
-    vm_region_basic_info_data_64_t info = {};
-    mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
-    mach_port_t object = MACH_PORT_NULL;
-    const kern_return_t result = vm_region_64(mach_task_self(), &start, &length, VM_REGION_BASIC_INFO_64,
-        reinterpret_cast<vm_region_info_t>(&info), &count, &object);
-    if (object != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), object);
-    if (result != KERN_SUCCESS || start > address || address - start > length ||
-        size > length - (address - start)) return false;
+    natural_t depth = UINT32_MAX;
+    vm_region_submap_short_info_data_64_t info = {};
+    mach_msg_type_number_t count = VM_REGION_SUBMAP_SHORT_INFO_COUNT_64;
+    const kern_return_t result = vm_region_recurse_64(mach_task_self(), &start, &length, &depth,
+        reinterpret_cast<vm_region_recurse_info_t>(&info), &count);
+    if (result != KERN_SUCCESS || count < VM_REGION_SUBMAP_SHORT_INFO_COUNT_64 || info.is_submap ||
+        start > address || address - start > length || size > length - (address - start)) return false;
     protection = info.protection;
     return true;
 }
@@ -200,7 +199,8 @@ static bool quartzCoreSlide(uintptr_t &slide) {
 // framebuffer_pixel_format (24A446 0x184461838) takes RGhA on `tbnz w8, #0` at 0x184461928 when CADeviceIsVirtualized (byte 0x1e701bdd9) is 1;
 // 40 other places in QuartzCore read the same byte (XR formats, backdrop compute, ASTC ...). Holding the byte at 0 turned all of them, and the
 // tablet drew light blue blocks. Here the byte stays 1 and only this branch is made a NOP, so the framebuffer is chosen as on a real device and
-// nothing else changes. Marks 0x6E40 unreadable, 0x6E41 other instruction, 0x6E42 patched, 0x6E50|stage failures.
+// nothing else changes. Marks 0x6E40 bad address/read, 0x6E41 other instruction,
+// 0x6E42 patched, 0x6E43 unknown page permissions, 0x6E50|stage failures.
 // The boot argument token that starts with prefix (a whole name, or name=value), or nullptr: a name is matched only at the start of the
 // command line or after a space, so "log=1" does not find "cache-log=1".
 static const char *bootArgToken(const char *args, const char *prefix) {
@@ -223,28 +223,36 @@ static bool bootArgSet(const char *key) {
     const size_t pageOffset = site % vm_page_size;
     if (pageOffset > vm_page_size - sizeof(uint32_t)) return 0x6E40;
     const vm_address_t page = site - pageOffset;
-    vm_prot_t protection = 0;
-    if (!taskProtection(page, vm_page_size, protection) ||
-        (protection & (VM_PROT_READ | VM_PROT_EXECUTE)) != (VM_PROT_READ | VM_PROT_EXECUTE) ||
-        (protection & VM_PROT_WRITE)) return 0x6E40;
-
     uint32_t word = 0;
     if (!readTask(site, &word, sizeof word)) return 0x6E40;
     if (word == 0xd503201f) return 0x6E42;
     if (word != 0x37000608) return 0x6E41;
+
+    vm_prot_t protection = 0;
+    if (!taskProtection(page, vm_page_size, protection)) return 0x6E43;
     const auto task = mach_task_self();
-    if (vm_protect(task, page, vm_page_size, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) != KERN_SUCCESS)
+    const auto hasOriginalProtection = [&] {
+        vm_prot_t current = 0;
+        return taskProtection(page, vm_page_size, current) && current == protection;
+    };
+    const auto restoreProtection = [&] {
+        for (unsigned attempt = 0; attempt < 2; ++attempt) {
+            if (vm_protect(task, page, vm_page_size, FALSE, protection) == KERN_SUCCESS &&
+                hasOriginalProtection()) return;
+        }
+        // Let launchd restart the render server with its original mapping.
+        gpu->mark(0x6E53);
+        _exit(1);
+    };
+    if (vm_protect(task, page, vm_page_size, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) != KERN_SUCCESS) {
+        // The COW remap can affect protections before the operation fails.
+        if (!hasOriginalProtection()) restoreProtection();
         return 0x6E51;
+    }
 
     const uint32_t nop = 0xd503201f;
     const bool wrote = vm_write(task, site, (vm_offset_t)&nop, sizeof nop) == KERN_SUCCESS;
-    if (vm_protect(task, page, vm_page_size, FALSE, protection) != KERN_SUCCESS &&
-        vm_protect(task, page, vm_page_size, FALSE, protection) != KERN_SUCCESS) {
-        // The render server must not run on the damaged mapping. Launchd
-        // restarts it in a new address space with the original QuartzCore.
-        gpu->mark(0x6E53);
-        _exit(1);
-    }
+    restoreProtection();
     sys_icache_invalidate((void *)site, sizeof nop);
     return wrote ? 0x6E42 : 0x6E52;
 }
@@ -268,7 +276,7 @@ static void configureQuartzCoreFramebuffer(Gpu *gpu) {
         sleep(30);
         Gpu *gpu = static_cast<Gpu *>(arg);
         uintptr_t slide = 0;
-        if (!quartzCoreSlide(slide)) {gpu->mark(0x6E4F); return nullptr;}
+        if (!quartzCoreSlide(slide)) {gpu->mark(0x6E5E); return nullptr;}
         float headroom = 0, threshold = 0;
         uint8_t force = 0, mirroring = 0, virtualized = 0;
         if (!readTask(0x1e7021014 + slide, &headroom, sizeof headroom) ||
