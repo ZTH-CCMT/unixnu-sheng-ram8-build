@@ -1,0 +1,403 @@
+diff --git a/bsd/vfs/native_tz_diag.h b/bsd/vfs/native_tz_diag.h
+new file mode 100644
+--- /dev/null
++++ b/bsd/vfs/native_tz_diag.h
+@@ -0,0 +1,27 @@
++#ifndef _BSD_VFS_NATIVE_TZ_DIAG_H_
++#define _BSD_VFS_NATIVE_TZ_DIAG_H_
++
++#include <sys/types.h>
++
++struct nameidata;
++
++struct native_tz_probe {
++	bool path_seen;
++	bool matched;
++	bool sample_cpu;
++	uint64_t lookup_wall;
++	uint64_t lookup_cpu;
++	uint64_t attrs_wall;
++	uint64_t attrs_cpu;
++	uint64_t root_count;
++	uint64_t root_wall;
++	uint64_t root_cpu;
++	uint64_t recurse_count;
++	uint64_t recurse_wall;
++	uint64_t recurse_cpu;
++};
++
++struct native_tz_probe *native_tz_find(const struct nameidata *ndp);
++void native_tz_snapshot(uint64_t *out);
++
++#endif
+diff --git a/bsd/vfs/vfs_syscalls.c b/bsd/vfs/vfs_syscalls.c
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -125,6 +125,10 @@
+ #include <kern/kern_types.h>
+ #include <kern/kalloc.h>
+ #include <kern/task.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++
++#include "native_tz_diag.h"
+ 
+ #include <vm/vm_pageout.h>
+ #include <vm/vm_protos.h>
+@@ -7378,6 +7382,133 @@
+ 	           uap->path, uap->amode, uap->flag, UIO_USERSPACE);
+ }
+ 
++/* Optional, cumulative diagnostic for launchd's exact timezone lstat64. */
++#define NATIVE_TZ_SLOTS 32
++#define NATIVE_TZ_FIELDS 22
++static struct {
++	struct nameidata *key;
++	struct native_tz_probe *probe;
++} native_tz_slots[NATIVE_TZ_SLOTS];
++static uint64_t native_tz_stats[NATIVE_TZ_FIELDS];
++static uint64_t native_tz_candidates;
++static unsigned int native_tz_state;
++
++enum {
++	TZ_CALL, TZ_OK, TZ_ENOENT, TZ_OTHER, TZ_WALL, TZ_LOOKUP_WALL, TZ_ATTRS_WALL,
++	TZ_ROOT_COUNT, TZ_ROOT_WALL, TZ_RECURSE_COUNT, TZ_RECURSE_WALL,
++	TZ_CPU, TZ_CPU_COUNT, TZ_LOST, TZ_LAST_ERRNO, TZ_ENABLED,
++	TZ_LOOKUP_CPU, TZ_ATTRS_CPU, TZ_ROOT_CPU, TZ_RECURSE_CPU,
++	TZ_ROOT_CPU_COUNT, TZ_RECURSE_CPU_COUNT
++};
++
++static bool
++native_tz_enabled(void)
++{
++	unsigned int state = os_atomic_load(&native_tz_state, relaxed);
++	if (state == 0) {
++		int boot_arg = 0;
++		state = PE_parse_boot_argn("tz-diag", &boot_arg, sizeof(boot_arg)) && boot_arg == 1 ? 2 : 1;
++		os_atomic_store(&native_tz_state, state, relaxed);
++	}
++	return state == 2;
++}
++
++static unsigned int
++native_tz_slot(const struct nameidata *ndp)
++{
++	const uintptr_t key = (uintptr_t)ndp;
++	return ((key >> 4) ^ (key >> 12)) & (NATIVE_TZ_SLOTS - 1);
++}
++
++struct native_tz_probe *
++native_tz_find(const struct nameidata *ndp)
++{
++	if (os_atomic_load(&native_tz_state, relaxed) != 2) {
++		return NULL;
++	}
++	const unsigned int slot = native_tz_slot(ndp);
++	if (os_atomic_load(&native_tz_slots[slot].key, acquire) == ndp) {
++		return native_tz_slots[slot].probe;
++	}
++	return NULL;
++}
++
++static bool
++native_tz_track(struct nameidata *ndp, struct native_tz_probe *probe)
++{
++	const unsigned int slot = native_tz_slot(ndp);
++	if (!os_atomic_cmpxchg(&native_tz_slots[slot].key, NULL, ndp, acquire)) {
++		os_atomic_inc(&native_tz_stats[TZ_LOST], relaxed);
++		return false;
++	}
++	// Only this nameidata's synchronous namei calls read probe. Other threads
++	// check their own nameidata against key and do not touch its observation.
++	native_tz_slots[slot].probe = probe;
++	return true;
++}
++
++static void
++native_tz_untrack(struct nameidata *ndp)
++{
++	const unsigned int slot = native_tz_slot(ndp);
++	native_tz_slots[slot].probe = NULL;
++	os_atomic_store(&native_tz_slots[slot].key, NULL, release);
++}
++
++void
++native_tz_snapshot(uint64_t *out)
++{
++	for (unsigned int i = 0; i < NATIVE_TZ_FIELDS; ++i) {
++		out[i] = os_atomic_load(&native_tz_stats[i], relaxed);
++	}
++	out[TZ_ENABLED] = native_tz_enabled();
++}
++
++static void
++native_tz_finish(const struct native_tz_probe *probe, int error,
++    uint64_t begin_wall, uint64_t begin_cpu)
++{
++	if (!probe->matched) {
++		return;
++	}
++	const uint64_t cpu = probe->sample_cpu ? thread_get_runtime_self() - begin_cpu : 0;
++	const uint64_t wall = mach_absolute_time() - begin_wall;
++	if (error == 0) {
++		os_atomic_inc(&native_tz_stats[TZ_OK], relaxed);
++	} else if (error == ENOENT) {
++		os_atomic_inc(&native_tz_stats[TZ_ENOENT], relaxed);
++	} else {
++		os_atomic_inc(&native_tz_stats[TZ_OTHER], relaxed);
++		os_atomic_store(&native_tz_stats[TZ_LAST_ERRNO], (uint64_t)error, relaxed);
++	}
++	os_atomic_add(&native_tz_stats[TZ_WALL], wall, relaxed);
++	os_atomic_add(&native_tz_stats[TZ_LOOKUP_WALL], probe->lookup_wall, relaxed);
++	os_atomic_add(&native_tz_stats[TZ_ATTRS_WALL], probe->attrs_wall, relaxed);
++	if (probe->root_count) {
++		os_atomic_add(&native_tz_stats[TZ_ROOT_COUNT], probe->root_count, relaxed);
++		os_atomic_add(&native_tz_stats[TZ_ROOT_WALL], probe->root_wall, relaxed);
++	}
++	if (probe->recurse_count) {
++		os_atomic_add(&native_tz_stats[TZ_RECURSE_COUNT], probe->recurse_count, relaxed);
++		os_atomic_add(&native_tz_stats[TZ_RECURSE_WALL], probe->recurse_wall, relaxed);
++	}
++	if (probe->sample_cpu) {
++		os_atomic_add(&native_tz_stats[TZ_CPU], cpu, relaxed);
++		os_atomic_add(&native_tz_stats[TZ_LOOKUP_CPU], probe->lookup_cpu, relaxed);
++		os_atomic_add(&native_tz_stats[TZ_ATTRS_CPU], probe->attrs_cpu, relaxed);
++		if (probe->root_count) {
++			os_atomic_add(&native_tz_stats[TZ_ROOT_CPU], probe->root_cpu, relaxed);
++			os_atomic_add(&native_tz_stats[TZ_ROOT_CPU_COUNT], probe->root_count, relaxed);
++		}
++		if (probe->recurse_count) {
++			os_atomic_add(&native_tz_stats[TZ_RECURSE_CPU], probe->recurse_cpu, relaxed);
++			os_atomic_add(&native_tz_stats[TZ_RECURSE_CPU_COUNT], probe->recurse_count, relaxed);
++		}
++		os_atomic_inc(&native_tz_stats[TZ_CPU_COUNT], relaxed);
++	}
++	os_atomic_inc(&native_tz_stats[TZ_CALL], relaxed);
++}
++
+ /*
+  * Returns:	0			Success
+  *		EFAULT
+@@ -7386,9 +7517,9 @@
+  *	vn_stat:???
+  */
+ static int
+-fstatat_internal(vfs_context_t ctx, user_addr_t path, user_addr_t ub,
++fstatat_internal_with_probe(vfs_context_t ctx, user_addr_t path, user_addr_t ub,
+     user_addr_t xsecurity, user_addr_t xsecurity_size, int isstat64,
+-    enum uio_seg segflg, int fd, int flag)
++    enum uio_seg segflg, int fd, int flag, struct native_tz_probe *probe)
+ {
+ 	struct nameidata *ndp = NULL;
+ 	int follow;
+@@ -7443,7 +7574,19 @@
+ 		}
+ 		ndp->ni_vp = fvp;
+ 	} else {
++		const bool tracked = probe && native_tz_track(ndp, probe);
++		const uint64_t lookup_wall = tracked ? mach_absolute_time() : 0;
++		const uint64_t lookup_cpu = tracked && probe->sample_cpu ? thread_get_runtime_self() : 0;
+ 		error = nameiat(ndp, fd);
++		if (tracked) {
++			native_tz_untrack(ndp);
++			if (probe->matched) {
++				if (probe->sample_cpu) {
++					probe->lookup_cpu = thread_get_runtime_self() - lookup_cpu;
++				}
++				probe->lookup_wall = mach_absolute_time() - lookup_wall;
++			}
++		}
+ 		if (error) {
+ 			goto out;
+ 		}
+@@ -7465,6 +7608,9 @@
+ #endif
+ 
+ 	needsrealdev = flag & AT_REALDEV ? 1 : 0;
++	const bool matched = probe && probe->matched;
++	const uint64_t attrs_wall = matched ? mach_absolute_time() : 0;
++	const uint64_t attrs_cpu = matched && probe->sample_cpu ? thread_get_runtime_self() : 0;
+ 	if (fp && (xsecurity == USER_ADDR_NULL)) {
+ 		/*
+ 		 * If the caller has the file open, and is not
+@@ -7476,6 +7622,12 @@
+ 	} else {
+ 		error = vn_stat(ndp->ni_vp, statptr, (xsecurity != USER_ADDR_NULL ? &fsec : NULL),
+ 		    isstat64, needsrealdev, ctx);
++	}
++	if (matched) {
++		if (probe->sample_cpu) {
++			probe->attrs_cpu = thread_get_runtime_self() - attrs_cpu;
++		}
++		probe->attrs_wall = mach_absolute_time() - attrs_wall;
+ 	}
+ 
+ #if NAMEDRSRCFORK
+@@ -7571,6 +7723,15 @@
+ 		kauth_filesec_free(fsec);
+ 	}
+ 	return error;
++}
++
++static int
++fstatat_internal(vfs_context_t ctx, user_addr_t path, user_addr_t ub,
++    user_addr_t xsecurity, user_addr_t xsecurity_size, int isstat64,
++    enum uio_seg segflg, int fd, int flag)
++{
++	return fstatat_internal_with_probe(ctx, path, ub, xsecurity, xsecurity_size,
++	           isstat64, segflg, fd, flag, NULL);
+ }
+ 
+ /*
+@@ -7675,10 +7836,25 @@
+ }
+ 
+ int
+-lstat64(__unused proc_t p, struct lstat64_args *uap, __unused int32_t *retval)
+-{
+-	return fstatat_internal(vfs_context_current(), uap->path, uap->ub,
+-	           0, 0, 1, UIO_USERSPACE, AT_FDCWD, AT_SYMLINK_NOFOLLOW);
++lstat64(proc_t p, struct lstat64_args *uap, __unused int32_t *retval)
++{
++	vfs_context_t ctx = vfs_context_current();
++	if (proc_pid(p) != 1 || !native_tz_enabled()) {
++		return fstatat_internal(ctx, uap->path, uap->ub,
++		           0, 0, 1, UIO_USERSPACE, AT_FDCWD, AT_SYMLINK_NOFOLLOW);
++	}
++
++	struct native_tz_probe probe = {};
++	const uint64_t candidate = os_atomic_inc_orig(&native_tz_candidates, relaxed);
++	// Mix before selection so interleaving two paths cannot hide all of one.
++	const uint64_t sample_key = (candidate ^ (candidate >> 16)) * 0x9e3779b97f4a7c15ULL;
++	probe.sample_cpu = candidate < 8 || (sample_key >> 59) == 0;
++	const uint64_t wall = mach_absolute_time();
++	const uint64_t cpu = probe.sample_cpu ? thread_get_runtime_self() : 0;
++	const int error = fstatat_internal_with_probe(ctx, uap->path, uap->ub,
++	    0, 0, 1, UIO_USERSPACE, AT_FDCWD, AT_SYMLINK_NOFOLLOW, &probe);
++	native_tz_finish(&probe, error, wall, cpu);
++	return error;
+ }
+ 
+ /*
+diff --git a/bsd/vfs/vfs_lookup.c b/bsd/vfs/vfs_lookup.c
+--- a/bsd/vfs/vfs_lookup.c
++++ b/bsd/vfs/vfs_lookup.c
+@@ -82,6 +82,10 @@
+ #include <sys/mount_internal.h>
+ #include <sys/errno.h>
+ #include <kern/kalloc.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++
++#include "native_tz_diag.h"
+ #include <sys/filedesc.h>
+ #include <sys/proc_internal.h>
+ #include <sys/kdebug.h>
+@@ -123,6 +127,11 @@
+ 
+ #if NAMEDRSRCFORK
+ static int              lookup_handle_rsrc_fork(vnode_t dp, struct nameidata *ndp, struct componentname *cnp, int wantparent, vfs_context_t ctx);
++#endif
++
++#if CONFIG_UNION_MOUNTS
++static int lookup_traverse_union_probed(vnode_t dvp, vnode_t *new_dvp,
++    vfs_context_t ctx, struct native_tz_probe *probe);
+ #endif
+ 
+ extern lck_rw_t rootvnode_rw_lock;
+@@ -396,6 +405,13 @@
+ 		goto error_out;
+ 	}
+ 	assert(bytes_copied <= cnp->cn_pnlen);
++	struct native_tz_probe *probe = native_tz_find(ndp);
++	if (probe && !probe->path_seen) {
++		static const char path[] = "/var/db/timezone/localtime";
++		probe->path_seen = true;
++		probe->matched = bytes_copied == sizeof(path) &&
++		    memcmp(cnp->cn_pnbuf, path, sizeof(path)) == 0;
++	}
+ 	ndp->ni_pathlen = (u_int)bytes_copied;
+ 	bytes_copied = 0;
+ 
+@@ -1703,7 +1719,9 @@
+ 		    (dp->v_mount->mnt_flag & MNT_UNION) &&
+ 		    !(ndp->ni_flag & NAMEI_NOUNION)) {
+ 			tdp = dp;
+-			error = lookup_traverse_union(tdp, &dp, ctx);
++			struct native_tz_probe *probe = native_tz_find(ndp);
++			error = lookup_traverse_union_probed(tdp, &dp, ctx,
++			    probe && probe->matched ? probe : NULL);
+ 			vnode_put(tdp);
+ 			if (error) {
+ 				dp = NULLVP;
+@@ -1828,8 +1846,9 @@
+  */
+ uint32_t native_union_lookup_reentries;
+ 
+-int
+-lookup_traverse_union(vnode_t dvp, vnode_t *new_dvp, vfs_context_t ctx)
++static int
++lookup_traverse_union_probed(vnode_t dvp, vnode_t *new_dvp, vfs_context_t ctx,
++    struct native_tz_probe *probe)
+ {
+ 	char *path = NULL, *pp;
+ 	const char *name, *np;
+@@ -1841,13 +1860,23 @@
+ 	*new_dvp = NULL;
+ 
+ 	if (vp && vp->v_flag & VROOT) {
++		const uint64_t wall = probe ? mach_absolute_time() : 0;
++		const uint64_t cpu = probe && probe->sample_cpu ? thread_get_runtime_self() : 0;
+ 		*new_dvp = vp->v_mount->mnt_vnodecovered;
+-		if (vnode_getwithref(*new_dvp)) {
+-			return ENOENT;
+-		}
+-		return 0;
+-	}
+-
++		error = vnode_getwithref(*new_dvp);
++		if (probe) {
++			if (probe->sample_cpu) {
++				probe->root_cpu += thread_get_runtime_self() - cpu;
++			}
++			probe->root_wall += mach_absolute_time() - wall;
++			++probe->root_count;
++		}
++		return error ? ENOENT : 0;
++	}
++
++	const uint64_t wall = probe ? mach_absolute_time() : 0;
++	const uint64_t cpu = probe && probe->sample_cpu ? thread_get_runtime_self() : 0;
++	bool recursed = false;
+ 	path = namei_alloc(MAXPATHLEN);
+ 
+ 	/*
+@@ -1886,6 +1915,7 @@
+ 	NDINIT(&nd, LOOKUP, OP_LOOKUP, USEDVP, UIO_SYSSPACE, CAST_USER_ADDR_T(pp), ctx);
+ 	nd.ni_dvp = dvp->v_mount->mnt_vnodecovered;
+ 	error = namei(&nd);
++	recursed = true;
+ 	if (error == 0) {
+ 		/*
+ 		 * Only a directory below can hold the name: the base system keeps a symlink where the
+@@ -1914,7 +1944,20 @@
+ 	if (path) {
+ 		namei_free(path, MAXPATHLEN);
+ 	}
++	if (probe && recursed) {
++		if (probe->sample_cpu) {
++			probe->recurse_cpu += thread_get_runtime_self() - cpu;
++		}
++		probe->recurse_wall += mach_absolute_time() - wall;
++		++probe->recurse_count;
++	}
+ 	return error;
++}
++
++int
++lookup_traverse_union(vnode_t dvp, vnode_t *new_dvp, vfs_context_t ctx)
++{
++	return lookup_traverse_union_probed(dvp, new_dvp, ctx, NULL);
+ }
+ #endif /* CONFIG_UNION_MOUNTS */
+ 

@@ -16,7 +16,9 @@
 #include "BootLatencyFiles.h"
 #include <NativeAdrenoRingLog.h>
 #include <kern/thread.h>
+#include <kern/task.h>
 #include <kern/clock.h>
+#include <kern/recount.h>
 #include <string.h>
 #include <pexpert/pexpert.h>
 #include <kern/misc_protos.h>
@@ -115,6 +117,11 @@ extern volatile int native_gpu_addon3_status __attribute__((weak_import));
 extern volatile int native_cryptex_os_stage __attribute__((weak_import));
 extern volatile int native_cryptex_os_status __attribute__((weak_import));
 extern uint32_t native_union_lookup_reentries __attribute__((weak_import));
+extern void native_tz_snapshot(uint64_t *) __attribute__((weak_import));
+struct proc;
+extern struct proc *proc_find(int);
+extern int proc_rele(struct proc *);
+extern task_t proc_task(struct proc *);
 extern volatile int native_gestalt_cache_status __attribute__((weak_import));
 extern volatile int native_ls_store_status __attribute__((weak_import));
 extern volatile uint64_t native_data_persist_present __attribute__((weak_import));
@@ -567,12 +574,58 @@ static const char *log_step_max_where = "";
 #define LOG_AT(step) do {const uint64_t t_ = log_ticks(); \
     if (t_ - log_where_began > log_step_max) {log_step_max = t_ - log_where_began; log_step_max_where = log_where;} \
     log_where = (step); log_where_began = t_;} while (0)
+// Cumulative timezone counters and the PID's own CPU budget, taken in the same log round.
+static size_t tz_log_rows(char *out, size_t at, size_t cap) {
+  if (!native_tz_snapshot) return at;
+  uint64_t tz[22] = {0};
+  native_tz_snapshot(tz);
+  if (!tz[15]) return at;
+
+  struct proc *proc = proc_find(1);
+  task_t task = proc ? proc_task(proc) : TASK_NULL;
+  const bool have_pid1 = task != TASK_NULL;
+  if (have_pid1) task_reference(task);
+  if (proc) proc_rele(proc);
+  struct recount_times_mach pid1 = {0};
+  if (have_pid1) {
+    pid1 = recount_task_times(task);
+    task_deallocate(task);
+  }
+
+  uint64_t uptime_ns, million_ticks_ns;
+  absolutetime_to_nanoseconds(mach_absolute_time(), &uptime_ns);
+  absolutetime_to_nanoseconds(1000000, &million_ticks_ns);
+  const unsigned long long uptime_us = (unsigned long long)(uptime_ns / 1000);
+  char row[384];
+  snprintf(row, sizeof row, "[tz lstat] uptime_us=%llu calls=%llu ok=%llu enoent=%llu other=%llu last_errno=%llu",
+           uptime_us, (unsigned long long)tz[0], (unsigned long long)tz[1], (unsigned long long)tz[2],
+           (unsigned long long)tz[3], (unsigned long long)tz[14]);
+  at = put(out, at, cap, row, sizeof row);
+  snprintf(row, sizeof row, "[tz lstat wall] total_ticks=%llu nameiat_ticks=%llu vn_stat_ticks=%llu root_n=%llu root_ticks=%llu recurse_n=%llu recurse_ticks=%llu",
+           (unsigned long long)tz[4], (unsigned long long)tz[5], (unsigned long long)tz[6], (unsigned long long)tz[7],
+           (unsigned long long)tz[8], (unsigned long long)tz[9], (unsigned long long)tz[10]);
+  at = put(out, at, cap, row, sizeof row);
+  snprintf(row, sizeof row, "[tz lstat cpu] system_ticks=%llu samples=%llu branch_lost=%llu million_ticks_ns=%llu"
+           " nameiat_ticks=%llu vn_stat_ticks=%llu root_ticks=%llu recurse_ticks=%llu root_n=%llu recurse_n=%llu",
+           (unsigned long long)tz[11], (unsigned long long)tz[12], (unsigned long long)tz[13], (unsigned long long)million_ticks_ns,
+           (unsigned long long)tz[16], (unsigned long long)tz[17], (unsigned long long)tz[18], (unsigned long long)tz[19],
+           (unsigned long long)tz[20], (unsigned long long)tz[21]);
+  at = put(out, at, cap, row, sizeof row);
+  if (have_pid1) {
+    snprintf(row, sizeof row, "[tz pid cpu] uptime_us=%llu user_ticks=%llu system_ticks=%llu",
+             uptime_us, (unsigned long long)pid1.rtm_user, (unsigned long long)pid1.rtm_system);
+    at = put(out, at, cap, row, sizeof row);
+  }
+  return at;
+}
+
 static size_t compose(char *out, size_t cap, uint32_t slot, unsigned now) {
   size_t at = 0;
   char head[128];
   const int n = snprintf(head, sizeof head, "#slot %u t=%us tag=%s", slot, now, &boot_progress_tag ? boot_progress_tag() : "");
   if (log_diag_on && n > 0 && (size_t)n < sizeof head) snprintf(head + n, sizeof head - (size_t)n, " diag=1 export-at=%us", log_diag_export_at);
   at = put(out, at, cap, head, sizeof head);
+  at = tz_log_rows(out, at, cap);
   // BEGIN GPU V5.3 LOW LEVEL EVIDENCE FORMAT
   // Immutable snapshots are emitted before the verbose sections can fill this 64 KiB slot.
   // The first word is the schema version; the copy API returns the complete word count, or zero.
@@ -2608,7 +2661,9 @@ static size_t log_groups_filter(char *text, size_t length) {
     size_t end = in; while (end < length && text[end] != '\n') ++end;
     const size_t line = end - in + (end < length ? 1 : 0);
     if (text[in] == '[') {
-      keep = !strncmp(text + in, "[panic]", 7) || (log_diag_on && !strncmp(text + in, "[diag]", 6)) ||
+      keep = !strncmp(text + in, "[panic]", 7) || !strncmp(text + in, "[tz lstat", 9) ||
+             !strncmp(text + in, "[tz pid cpu]", 12) ||
+             (log_diag_on && !strncmp(text + in, "[diag]", 6)) ||
              (log_group_on >> log_tag_group(text + in + 1)) & 1;
     } else if (text[in] == '#') keep = 1;
     if (keep) {if (out != in) memmove(text + out, text + in, line); out += line;}

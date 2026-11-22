@@ -130,7 +130,7 @@
       "repository": "device",
       "path": "board.toml",
       "before_sha256": "88b824800753cc7e79ae9dcd4ea4c92f351228126a3147dfc0ee81de0382e8b2",
-      "sha256": "1e3729c73a6b15d582224afdfc87b35750593c9aebb091bb731e1a2c14a18e92"
+      "sha256": "3abf8368ec9d9d0e5086095954a3117d5f705190d5ec9f0a19b525fe6e3d3572"
     },
     "device/drivers/ShengHidInput/NativeHidInput.cpp": {
       "repository": "device/drivers/ShengHidInput",
@@ -238,7 +238,7 @@
       "repository": "device",
       "path": "package/BootLog.c",
       "before_sha256": "5c880128ff6bd54d60dec13cd9b18acb47d2d801ebfa6aac920b308d74f238c2",
-      "sha256": "923d3ac5fb0e1c3581277af173947aaf0181ebdddf9e963512f94ea4caa7cfc8"
+      "sha256": "05020eea0b9f4f91c248e7df565df96b9f1822f1110a538003981ff88af1b389"
     },
     "device/package/LegacyDisplayProbe.cpp": {
       "repository": "device",
@@ -484,7 +484,7 @@
       "repository": "device",
       "path": "patches/xnu-12377/series",
       "before_sha256": "15d08ffeafa1d29ece607e4f2913c80cb1f403442b0a0cbf9625f8d60a2d2953",
-      "sha256": "90d8f78cf2ee940477fb8ede2d2ec7b96e2d4cefa2c643a0d38aa212607c59cb"
+      "sha256": "7ecc3dee1e8591d3f66cdd776679d0b05cc70732e34225a9fa6081f4713de097"
     },
     "device/patches/xnu-12377/sheng-frame-ipc-trace.patch": {
       "repository": "device",
@@ -569,6 +569,12 @@
       "path": "scripts/build-sheng-source-storage.py",
       "before_sha256": "a5ecbe9e69f120e2670fffbf65623cfb4eb62c03c96f45c53b86d4fd41d3c585",
       "sha256": "ef954b866a02820e1bb9782920cd79f926957095410c9475fe6a748241abc584"
+    },
+    "device/patches/xnu-12377/sheng-timezone-lstat-diag.patch": {
+      "repository": "device",
+      "path": "patches/xnu-12377/sheng-timezone-lstat-diag.patch",
+      "before_sha256": null,
+      "sha256": "8b6933035d06928f6a1635e2c838ce3b6a4344c62cac9c95200b577fb287a97a"
     }
   },
   "candidate_version": "V6.3",
