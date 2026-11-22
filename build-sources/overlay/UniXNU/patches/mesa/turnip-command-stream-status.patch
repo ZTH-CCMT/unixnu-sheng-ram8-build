@@ -1,0 +1,896 @@
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
+index d6f573f..56ec121 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.cc
++++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
+@@ -267,6 +267,9 @@ static void
+ tu_emit_vis_stream_patchpoint(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
+                               uint32_t offset)
+ {
++   if (unlikely(tu_cs_get_status(cs) != VK_SUCCESS))
++      return;
++
+    struct tu_vis_stream_patchpoint patchpoint = {
+       .render_pass_idx = cmd->state.tile_render_pass_count,
+       .data = cs->cur,
+@@ -456,6 +459,8 @@ tu7_set_thread_br_patchpoint(struct tu_cmd_buffer *cmd,
+                              bool force_disable_cb)
+ {
+    tu_cs_emit_pkt7(cs, CP_THREAD_CONTROL, 1);
++   if (unlikely(tu_cs_get_status(cs) != VK_SUCCESS))
++      return;
+ 
+    if (!force_disable_cb) {
+       struct tu_cb_control_point info = {
+@@ -477,6 +482,8 @@ tu7_set_thread_both_patchpoint(struct tu_cmd_buffer *cmd,
+                                struct tu_cs *cs)
+ {
+    tu_cs_emit_pkt7(cs, CP_THREAD_CONTROL, 1);
++   if (unlikely(tu_cs_get_status(cs) != VK_SUCCESS))
++      return;
+ 
+    struct tu_cb_control_point info = {
+       .type = TU_CB_CONTROL_TYPE_PATCHPOINT,
+@@ -4396,6 +4403,9 @@ tu_BeginCommandBuffer(VkCommandBuffer commandBuffer,
+       switch (cmd_buffer->queue_family_index) {
+       case TU_QUEUE_GENERAL:
+          TU_CALLX(cmd_buffer->device, tu_init_hw)(cmd_buffer, &cmd_buffer->cs);
++         result = tu_cs_get_status(&cmd_buffer->cs);
++         if (result != VK_SUCCESS)
++            return vk_command_buffer_set_error(&cmd_buffer->vk, result);
+          break;
+       default:
+          break;
+@@ -5360,6 +5370,18 @@ tu_EndCommandBuffer(VkCommandBuffer commandBuffer)
+    tu_cs_end(&cmd_buffer->draw_cs);
+    tu_cs_end(&cmd_buffer->draw_epilogue_cs);
+ 
++   for (const struct tu_cs *cs : { &cmd_buffer->cs, &cmd_buffer->draw_cs,
++                                    &cmd_buffer->draw_epilogue_cs,
++                                    &cmd_buffer->tile_store_cs, &cmd_buffer->sub_cs,
++                                    &cmd_buffer->pre_chain.draw_cs,
++                                    &cmd_buffer->pre_chain.draw_epilogue_cs }) {
++      VkResult result = tu_cs_get_status(cs);
++      if (result != VK_SUCCESS) {
++         vk_command_buffer_set_error(&cmd_buffer->vk, result);
++         break;
++      }
++   }
++
+    return vk_command_buffer_end(&cmd_buffer->vk);
+ }
+ TU_GENX(tu_EndCommandBuffer);
+@@ -7773,7 +7795,11 @@ tu_emit_consts(struct tu_cmd_buffer *cmd, bool compute)
+       return (struct tu_draw_state) {};
+ 
+    struct tu_cs cs;
+-   tu_cs_begin_sub_stream(&cmd->sub_cs, dwords, &cs);
++   VkResult result = tu_cs_begin_sub_stream(&cmd->sub_cs, dwords, &cs);
++   if (result != VK_SUCCESS) {
++      vk_command_buffer_set_error(&cmd->vk, result);
++      return;
++   }
+ 
+    if (shared_consts->type == IR3_PUSH_CONSTS_SHARED) {
+       tu6_emit_shared_consts(&cs, shared_consts, cmd->push_constants, compute);
+@@ -8768,8 +8794,7 @@ tu6_emit_vs_params(struct tu_cmd_buffer *cmd,
+    cmd->state.last_vs_params.draw_id = draw_id;
+    cmd->state.last_vs_params.empty = false;
+ 
+-   struct tu_cs_entry entry = tu_cs_end_sub_stream(&cmd->sub_cs, &cs);
+-   cmd->state.vs_params = (struct tu_draw_state) {entry.bo->iova + entry.offset, entry.size / 4};
++   cmd->state.vs_params = tu_cs_end_draw_state(&cmd->sub_cs, &cs);
+ 
+    cmd->state.dirty |= TU_CMD_DIRTY_VS_PARAMS;
+ }
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.h b/src/freedreno/vulkan/tu_cmd_buffer.h
+index 33cabf4..ac05291 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.h
++++ b/src/freedreno/vulkan/tu_cmd_buffer.h
+@@ -929,10 +929,19 @@ _tu_create_fdm_bin_patchpoint(struct tu_cmd_buffer *cmd,
+                               void *state,
+                               unsigned state_size)
+ {
++   if (unlikely(tu_cs_get_status(cs) != VK_SUCCESS))
++      return;
++
++   assert(cs->writeable);
++   if (tu_cs_reserve_space(cs, size) != VK_SUCCESS)
++      return;
++
+    void *data = ralloc_size(cmd->patchpoints_ctx, state_size);
++   if (!data) {
++      tu_cs_fail(cs, VK_ERROR_OUT_OF_HOST_MEMORY);
++      return;
++   }
+    memcpy(data, state, state_size);
+-   assert(cs->writeable);
+-   tu_cs_reserve_space(cs, size);
+    struct tu_fdm_bin_patchpoint patch = {
+       .iova = tu_cs_get_cur_iova(cs),
+       .size = size,
+@@ -957,6 +966,8 @@ _tu_create_fdm_bin_patchpoint(struct tu_cmd_buffer *cmd,
+       hw_viewport_offsets[i] = (VkOffset2D) { 0, 0 };
+    }
+    apply(cmd, cs, state, (VkOffset2D) {0, 0}, hw_viewport_offsets, num_views, &dummy_config, bins, false);
++   if (unlikely(tu_cs_get_status(cs) != VK_SUCCESS))
++      return;
+    assert(tu_cs_get_cur_iova(cs) == patch.iova + patch.size * sizeof(uint32_t));
+ 
+    util_dynarray_append(&cmd->fdm_bin_patchpoints, patch);
+diff --git a/src/freedreno/vulkan/tu_cs.cc b/src/freedreno/vulkan/tu_cs.cc
+index 33545dc..2134e27 100644
+--- a/src/freedreno/vulkan/tu_cs.cc
++++ b/src/freedreno/vulkan/tu_cs.cc
+@@ -128,6 +128,9 @@ tu_cs_get_offset(const struct tu_cs *cs)
+ uint64_t
+ tu_cs_get_cur_iova(const struct tu_cs *cs)
+ {
++   if (unlikely(cs->status != VK_SUCCESS || !cs->cur))
++      return 0;
++
+    if (cs->mode == TU_CS_MODE_EXTERNAL)
+       return cs->external_iova + ((char *) cs->cur - (char *) cs->start);
+    return tu_cs_current_bo(cs)->iova + ((char *) cs->cur - (char *) tu_cs_current_bo(cs)->map);
+@@ -257,13 +260,18 @@ tu_cs_add_entries(struct tu_cs *cs, struct tu_cs *target)
+    assert(cs->mode == TU_CS_MODE_GROW);
+    assert(target->mode == TU_CS_MODE_GROW);
+ 
++   if (unlikely(cs->status != VK_SUCCESS))
++      return cs->status;
++   if (unlikely(target->status != VK_SUCCESS))
++      return tu_cs_fail(cs, target->status);
++
+    if (!tu_cs_is_empty(cs))
+       tu_cs_add_entry(cs);
+ 
+    for (unsigned i = 0; i < target->entry_count; i++) {
+       result = tu_cs_reserve_entry(cs);
+       if (result != VK_SUCCESS)
+-         return result;
++         return tu_cs_fail(cs, result);
+       cs->entries[cs->entry_count++] = target->entries[i];
+    }
+ 
+@@ -290,7 +298,8 @@ tu_cs_end(struct tu_cs *cs)
+ {
+    assert(cs->mode != TU_CS_MODE_SUB_STREAM);
+ 
+-   if (cs->mode == TU_CS_MODE_GROW && !tu_cs_is_empty(cs))
++   if (cs->status == VK_SUCCESS && cs->mode == TU_CS_MODE_GROW &&
++       !tu_cs_is_empty(cs))
+       tu_cs_add_entry(cs);
+ }
+ 
+@@ -299,6 +308,9 @@ tu_cs_set_writeable(struct tu_cs *cs, bool writeable)
+ {
+    assert(cs->mode == TU_CS_MODE_GROW || cs->mode == TU_CS_MODE_SUB_STREAM);
+ 
++   if (unlikely(cs->status != VK_SUCCESS))
++      return;
++
+    if (cs->writeable != writeable) {
+       assert(!cs->cond_stack_depth);
+       if (cs->mode == TU_CS_MODE_GROW && !tu_cs_is_empty(cs))
+@@ -335,28 +347,35 @@ tu_cs_begin_sub_stream_aligned(struct tu_cs *cs, uint32_t count,
+    assert(cs->mode == TU_CS_MODE_SUB_STREAM);
+    assert(size);
+ 
+-   VkResult result;
+-   if (tu_cs_get_space(cs) < count * size) {
+-      /* When we have to allocate a new BO, assume that the alignment of the
+-       * BO is sufficient.
+-       */
+-      result = tu_cs_reserve_space(cs, count * size);
+-   } else {
+-      result = tu_cs_reserve_space(cs, count * size + (size - tu_cs_get_offset(cs)) % size);
+-      cs->start += (size - tu_cs_get_offset(cs)) % size;
+-   }
++   /* Keep the external stream safe even when callers ignore an error. */
++   tu_cs_init_external(sub_cs, cs->device, NULL, NULL, 0, cs->writeable);
++   sub_cs->parent = cs;
++   if (unlikely(cs->status != VK_SUCCESS))
++      return tu_cs_fail(sub_cs, cs->status);
++   if (unlikely(count > UINT32_MAX / size))
++      return tu_cs_fail(sub_cs, VK_ERROR_OUT_OF_HOST_MEMORY);
++
++   uint32_t dwords = count * size;
++   uint32_t padding = tu_cs_get_space(cs) < dwords ? 0 :
++      (size - tu_cs_get_offset(cs) % size) % size;
++   if (unlikely(dwords > UINT32_MAX - padding))
++      return tu_cs_fail(sub_cs, VK_ERROR_OUT_OF_HOST_MEMORY);
++
++   const uint32_t *old_end = cs->end;
++   VkResult result = tu_cs_reserve_space(cs, dwords + padding);
+    if (result != VK_SUCCESS)
+-      return result;
++      return tu_cs_fail(sub_cs, result);
+ 
++   /* A new BO already meets the alignment. */
++   if (cs->end == old_end && padding)
++      cs->start += padding;
+    cs->cur = cs->start;
++   cs->reserved_end = dwords ? cs->cur + dwords : cs->cur;
+ 
+    tu_cs_init_external(sub_cs, cs->device, cs->cur, cs->reserved_end,
+                        tu_cs_get_cur_iova(cs), cs->writeable);
+-   tu_cs_begin(sub_cs);
+-   result = tu_cs_reserve_space(sub_cs, count * size);
+-   assert(result == VK_SUCCESS);
+-
+-   return VK_SUCCESS;
++   sub_cs->parent = cs;
++   return tu_cs_reserve_space(sub_cs, dwords);
+ }
+ 
+ /**
+@@ -373,6 +392,11 @@ tu_cs_alloc(struct tu_cs *cs,
+    assert(cs->mode == TU_CS_MODE_SUB_STREAM);
+    assert(size && size <= 1024);
+ 
++   if (unlikely(cs->status != VK_SUCCESS))
++      return cs->status;
++   if (unlikely(count > (UINT32_MAX - (size - 1)) / size))
++      return tu_cs_fail(cs, VK_ERROR_OUT_OF_HOST_MEMORY);
++
+    if (!count) {
+       /* If you allocated no memory, you'd better not use the iova for anything
+        * (but it's left aligned for sanity).
+@@ -412,6 +436,12 @@ struct tu_cs_entry
+ tu_cs_end_sub_stream(struct tu_cs *cs, struct tu_cs *sub_cs)
+ {
+    assert(cs->mode == TU_CS_MODE_SUB_STREAM);
++
++   if (unlikely(cs->status != VK_SUCCESS || sub_cs->status != VK_SUCCESS))
++      return (struct tu_cs_entry) {};
++   if (unlikely(!sub_cs->start))
++      return (struct tu_cs_entry) {};
++
+    assert(sub_cs->start == cs->cur && sub_cs->end == cs->reserved_end);
+    tu_cs_sanity_check(sub_cs);
+ 
+@@ -432,16 +462,21 @@ tu_cs_end_sub_stream(struct tu_cs *cs, struct tu_cs *sub_cs)
+ 
+ /**
+  * Reserve space from a command stream for \a reserved_size uint32_t values.
+- * This never fails when \a cs has mode TU_CS_MODE_EXTERNAL.
++ * External and suballocated streams report failure if they cannot grow.
+  */
+ VkResult
+ tu_cs_reserve_space(struct tu_cs *cs, uint32_t reserved_size)
+ {
++   if (unlikely(cs->status != VK_SUCCESS))
++      return cs->status;
++
+    if (tu_cs_get_space(cs) < reserved_size) {
+-      if (cs->mode == TU_CS_MODE_EXTERNAL) {
+-         UNREACHABLE("cannot grow external buffer");
+-         return VK_ERROR_OUT_OF_HOST_MEMORY;
+-      }
++      if (cs->mode == TU_CS_MODE_EXTERNAL || cs->refcount_bo)
++         return tu_cs_fail(cs, VK_ERROR_OUT_OF_HOST_MEMORY);
++
++      uint32_t reopen_dwords = 3 * cs->cond_stack_depth;
++      if (unlikely(reserved_size > UINT32_MAX - reopen_dwords))
++         return tu_cs_fail(cs, VK_ERROR_OUT_OF_HOST_MEMORY);
+ 
+       /* add an entry for the exiting command packets */
+       if (!tu_cs_is_empty(cs)) {
+@@ -455,23 +490,20 @@ tu_cs_reserve_space(struct tu_cs *cs, uint32_t reserved_size)
+          /* Subtract one here to account for the DWORD field itself. */
+          *cs->cond_dwords[i] = cs->cur - cs->cond_dwords[i] - 1;
+ 
+-         /* space for CP_COND_REG_EXEC in next bo */
+-         reserved_size += 3;
+       }
+ 
+       /* switch to a new BO */
+-      uint32_t new_size = MAX2(cs->next_bo_size, reserved_size);
++      uint32_t new_size = MAX2(cs->next_bo_size, reserved_size + reopen_dwords);
+       VkResult result = tu_cs_add_bo(cs, new_size);
+       if (result != VK_SUCCESS)
+-         return result;
++         return tu_cs_fail(cs, result);
+ 
+-      if (cs->cond_stack_depth) {
+-         cs->reserved_end = cs->cur + reserved_size;
+-      }
+-
+-      /* Re-emit CP_COND_REG_EXECs */
++      /* These packets were included above. Reserving recursively here would
++       * let a failure invalidate the condition pointers being installed.
++       */
++      cs->reserved_end = cs->cur + reopen_dwords;
+       for (uint32_t i = 0; i < cs->cond_stack_depth; i++) {
+-         tu_cs_emit_pkt7(cs, CP_COND_REG_EXEC, 2);
++         tu_cs_emit(cs, pm4_pkt7_hdr(CP_COND_REG_EXEC, 2));
+          tu_cs_emit(cs, cs->cond_flags[i]);
+ 
+          cs->cond_dwords[i] = cs->cur;
+@@ -487,13 +519,15 @@ tu_cs_reserve_space(struct tu_cs *cs, uint32_t reserved_size)
+    }
+ 
+    assert(tu_cs_get_space(cs) >= reserved_size);
+-   cs->reserved_end = cs->cur + reserved_size;
+ 
+    if (cs->mode == TU_CS_MODE_GROW) {
+-      /* reserve an entry for the next call to this function or tu_cs_end */
+-      return tu_cs_reserve_entry(cs);
++      /* Reserve an entry before exposing writable space to the caller. */
++      VkResult result = tu_cs_reserve_entry(cs);
++      if (result != VK_SUCCESS)
++         return tu_cs_fail(cs, result);
+    }
+ 
++   cs->reserved_end = reserved_size ? cs->cur + reserved_size : cs->cur;
+    return VK_SUCCESS;
+ }
+ 
+@@ -504,6 +538,9 @@ tu_cs_reserve_space(struct tu_cs *cs, uint32_t reserved_size)
+ void
+ tu_cs_reset(struct tu_cs *cs)
+ {
++   cs->status = VK_SUCCESS;
++   cs->cond_stack_depth = 0;
++
+    if (cs->mode == TU_CS_MODE_EXTERNAL) {
+       assert(!cs->read_only.bo_count && !cs->read_write.bo_count &&
+              !cs->refcount_bo && !cs->entry_count);
+@@ -521,7 +558,7 @@ tu_cs_reset(struct tu_cs *cs)
+       tu_bo_finish(cs->device, cs->read_write.bos[i]);
+    }
+ 
+-   assert(!cs->writeable);
++   cs->writeable = false;
+ 
+    if (cs->read_only.bo_count) {
+       cs->read_only.bos[0] = cs->read_only.bos[cs->read_only.bo_count - 1];
+@@ -530,11 +567,14 @@ tu_cs_reset(struct tu_cs *cs)
+       cs->start = cs->cur = cs->reserved_end = (uint32_t *) cs->read_only.bos[0]->map;
+       cs->end = cs->start + tu_sanitize_ib_size(cs->read_only.bos[0]->size /
+                                                 sizeof(uint32_t));
++   } else if (!cs->refcount_bo) {
++      cs->start = cs->cur = cs->reserved_end = cs->end = NULL;
+    }
+ 
+    if (cs->read_write.bo_count) {
+       cs->read_write.bos[0] = cs->read_write.bos[cs->read_write.bo_count - 1];
+       cs->read_write.bo_count = 1;
++      cs->read_write.start = (uint32_t *) cs->read_write.bos[0]->map;
+    }
+ 
+    cs->entry_count = 0;
+@@ -548,6 +588,8 @@ tu_cs_emit_data_nop(struct tu_cs *cs,
+ {
+    uint32_t total_size = size + (align_dwords - 1);
+    tu_cs_emit_pkt7(cs, CP_NOP, total_size);
++   if (unlikely(cs->status != VK_SUCCESS))
++      return 0;
+ 
+    uint64_t iova = tu_cs_get_cur_iova(cs);
+    uint64_t iova_aligned = align64(iova, align_dwords * sizeof(uint32_t));
+diff --git a/src/freedreno/vulkan/tu_cs.h b/src/freedreno/vulkan/tu_cs.h
+index 6a66de1..a6964aa 100644
+--- a/src/freedreno/vulkan/tu_cs.h
++++ b/src/freedreno/vulkan/tu_cs.h
+@@ -95,6 +95,9 @@ struct tu_cs
+    enum tu_cs_mode mode;
+    bool writeable;
+    uint32_t next_bo_size;
++   VkResult status;
++   /* A temporary external stream may write into a parent suballocation. */
++   struct tu_cs *parent;
+ 
+    struct tu_cs_entry *entries;
+    uint32_t entry_count;
+@@ -177,6 +180,9 @@ static inline struct tu_draw_state
+ tu_cs_end_draw_state(struct tu_cs *cs, struct tu_cs *sub_cs)
+ {
+    struct tu_cs_entry entry = tu_cs_end_sub_stream(cs, sub_cs);
++   if (!entry.bo)
++      return (struct tu_draw_state) {};
++
+    return (struct tu_draw_state) {
+       .iova = entry.bo->iova + entry.offset,
+       .size = entry.size / sizeof(uint32_t),
+@@ -187,20 +193,44 @@ tu_cs_end_draw_state(struct tu_cs *cs, struct tu_cs *sub_cs)
+ VkResult
+ tu_cs_reserve_space(struct tu_cs *cs, uint32_t reserved_size);
+ 
++static inline VkResult
++tu_cs_fail(struct tu_cs *cs, VkResult error)
++{
++   /* End the writable window and preserve the first failure for the owner. */
++   for (struct tu_cs *stream = cs; stream && stream->status == VK_SUCCESS;
++        stream = stream->parent) {
++      stream->status = error;
++      stream->reserved_end = stream->cur;
++   }
++   return cs->status;
++}
++
++static inline VkResult
++tu_cs_get_status(const struct tu_cs *cs)
++{
++   return cs->status;
++}
++
+ uint64_t
+ tu_cs_get_cur_iova(const struct tu_cs *cs);
+ 
+ static inline struct tu_draw_state
+ tu_cs_draw_state(struct tu_cs *sub_cs, struct tu_cs *cs, uint32_t size)
+ {
+-   struct tu_cs_memory memory;
+-
+-   /* TODO: clean this up */
+-   tu_cs_alloc(sub_cs, size, 1, &memory);
+-   tu_cs_init_external(cs, sub_cs->device, memory.map, memory.map + size,
++   struct tu_cs_memory memory = {};
++   VkResult result = tu_cs_alloc(sub_cs, size, 1, &memory);
++   uint32_t *end = memory.map ? memory.map + size : NULL;
++   tu_cs_init_external(cs, sub_cs->device, memory.map, end,
+                        memory.iova, memory.writeable);
++   cs->parent = sub_cs;
++   if (result != VK_SUCCESS) {
++      tu_cs_fail(cs, result);
++      return (struct tu_draw_state) {};
++   }
++
+    tu_cs_begin(cs);
+-   tu_cs_reserve_space(cs, size);
++   if (tu_cs_reserve_space(cs, size) != VK_SUCCESS)
++      return (struct tu_draw_state) {};
+ 
+    return (struct tu_draw_state) {
+       .iova = memory.iova,
+@@ -222,7 +252,7 @@ tu_cs_add_entries(struct tu_cs *cs, struct tu_cs *target);
+ static inline uint32_t
+ tu_cs_get_size(const struct tu_cs *cs)
+ {
+-   return cs->cur - cs->start;
++   return cs->cur ? cs->cur - cs->start : 0;
+ }
+ 
+ /**
+@@ -254,7 +284,7 @@ tu_cs_get_call_size(const struct tu_cs *cs)
+ {
+    assert(cs->mode == TU_CS_MODE_GROW);
+    /* each CP_INDIRECT_BUFFER needs 4 dwords */
+-   return cs->entry_count * 4;
++   return cs->status == VK_SUCCESS ? cs->entry_count * 4 : 0;
+ }
+ 
+ /**
+@@ -272,12 +302,15 @@ void
+ tu_cs_emit_sync_breadcrumb(struct tu_cs *cs, uint8_t opcode, uint16_t cnt);
+ 
+ /**
+- * Emit a uint32_t value into a command stream, without boundary checking.
++ * Emit a uint32_t value inside the current reservation.
+  */
+ static inline void
+ tu_cs_emit(struct tu_cs *cs, uint32_t value)
+ {
+-   assert(cs->cur < cs->reserved_end);
++   if (unlikely(cs->cur == cs->reserved_end)) {
++      tu_cs_fail(cs, VK_ERROR_OUT_OF_HOST_MEMORY);
++      return;
++   }
+    *cs->cur = value;
+    ++cs->cur;
+ 
+@@ -289,12 +322,17 @@ tu_cs_emit(struct tu_cs *cs, uint32_t value)
+ }
+ 
+ /**
+- * Emit an array of uint32_t into a command stream, without boundary checking.
++ * Emit an array of uint32_t inside the current reservation.
+  */
+ static inline void
+ tu_cs_emit_array(struct tu_cs *cs, const uint32_t *values, uint32_t length)
+ {
+-   assert(cs->cur + length <= cs->reserved_end);
++   if (!length)
++      return;
++   if (unlikely(!cs->cur || length > cs->reserved_end - cs->cur)) {
++      tu_cs_fail(cs, VK_ERROR_OUT_OF_HOST_MEMORY);
++      return;
++   }
+    memcpy(cs->cur, values, sizeof(uint32_t) * length);
+    cs->cur += length;
+ }
+@@ -305,27 +343,28 @@ tu_cs_emit_array(struct tu_cs *cs, const uint32_t *values, uint32_t length)
+ static inline uint32_t
+ tu_cs_get_space(const struct tu_cs *cs)
+ {
+-   return cs->end - cs->cur;
++   return cs->cur ? cs->end - cs->cur : 0;
+ }
+ 
+ static inline void
+ tu_cs_reserve(struct tu_cs *cs, uint32_t reserved_size)
+ {
++   if (unlikely(cs->status != VK_SUCCESS))
++      return;
++
+    if (cs->mode != TU_CS_MODE_GROW) {
+-      assert(tu_cs_get_space(cs) >= reserved_size);
+-      assert(cs->reserved_end == cs->end);
++      if (unlikely(tu_cs_get_space(cs) < reserved_size))
++         tu_cs_fail(cs, VK_ERROR_OUT_OF_HOST_MEMORY);
+       return;
+    }
+ 
+    if (tu_cs_get_space(cs) >= reserved_size &&
+        cs->entry_count < cs->entry_capacity) {
+-      cs->reserved_end = cs->cur + reserved_size;
++      cs->reserved_end = reserved_size ? cs->cur + reserved_size : cs->cur;
+       return;
+    }
+ 
+-   ASSERTED VkResult result = tu_cs_reserve_space(cs, reserved_size);
+-   /* TODO: set this error in tu_cs and use it */
+-   assert(result == VK_SUCCESS);
++   tu_cs_reserve_space(cs, reserved_size);
+ }
+ 
+ /**
+@@ -380,7 +419,10 @@ tu_cs_emit_write_reg(struct tu_cs *cs, uint16_t reg, uint32_t value)
+ static inline void
+ tu_cs_emit_ib(struct tu_cs *cs, const struct tu_cs_entry *entry)
+ {
+-   assert(entry->bo);
++   if (unlikely(!entry->bo)) {
++      tu_cs_fail(cs, VK_ERROR_OUT_OF_HOST_MEMORY);
++      return;
++   }
+    assert(entry->size && entry->offset + entry->size <= entry->bo->size);
+    assert(entry->size % sizeof(uint32_t) == 0);
+    assert(entry->offset % sizeof(uint32_t) == 0);
+@@ -409,6 +451,10 @@ static inline void
+ tu_cs_emit_call(struct tu_cs *cs, const struct tu_cs *target)
+ {
+    assert(target->mode == TU_CS_MODE_GROW);
++   if (unlikely(target->status != VK_SUCCESS)) {
++      tu_cs_fail(cs, target->status);
++      return;
++   }
+    for (uint32_t i = 0; i < target->entry_count; i++)
+       tu_cs_emit_ib(cs, target->entries + i);
+ }
+@@ -466,6 +512,9 @@ static struct tu_cs_patchable_state
+ tu_cs_patchable_start(struct tu_cs *cs, uint32_t reserved_size)
+ {
+    tu_cs_reserve(cs, reserved_size);
++   if (unlikely(cs->status != VK_SUCCESS))
++      return (struct tu_cs_patchable_state) {};
++
+    uint32_t *nop_header = cs->cur;
+    tu_cs_emit_pkt7(cs, CP_NOP, 0);
+    return (struct tu_cs_patchable_state) {
+@@ -482,6 +531,9 @@ tu_cs_patchable_end(struct tu_cs *cs,
+                     bool enabled_by_default,
+                     struct tu_cs_patchable_state *state)
+ {
++   if (unlikely(cs->status != VK_SUCCESS))
++      return;
++
+    assert(cs->end == state->_end);
+    state->dwords = cs->cur - state->nop_header - 1;
+    state->disable_patch = pm4_pkt7_hdr(CP_NOP, state->dwords);
+@@ -495,6 +547,9 @@ tu_cs_patchable_end(struct tu_cs *cs,
+ static inline void
+ tu_cond_exec_start(struct tu_cs *cs, uint32_t cond_flags)
+ {
++   if (unlikely(cs->status != VK_SUCCESS))
++      return;
++
+    assert(cs->cond_stack_depth < TU_COND_EXEC_STACK_SIZE);
+ 
+    ASSERTED enum compare_mode mode =
+@@ -502,6 +557,8 @@ tu_cond_exec_start(struct tu_cs *cs, uint32_t cond_flags)
+    assert(mode == PRED_TEST || mode == RENDER_MODE || mode == THREAD_MODE);
+ 
+    tu_cs_emit_pkt7(cs, CP_COND_REG_EXEC, 2);
++   if (unlikely(cs->status != VK_SUCCESS))
++      return;
+    tu_cs_emit(cs, cond_flags);
+ 
+    cs->cond_flags[cs->cond_stack_depth] = cond_flags;
+@@ -520,6 +577,9 @@ tu_cond_exec_start(struct tu_cs *cs, uint32_t cond_flags)
+ static inline void
+ tu_cond_exec_end(struct tu_cs *cs)
+ {
++   if (unlikely(cs->status != VK_SUCCESS))
++      return;
++
+    assert(cs->cond_stack_depth > 0);
+    cs->cond_stack_depth--;
+ 
+@@ -649,6 +709,8 @@ struct tu_reg_value {
+    STATIC_ASSERT(ARRAY_SIZE(regs) <= 16);               \
+                                                         \
+    tu_cs_emit_pkt4((cs), regs[0].reg, count);             \
++   if (unlikely((cs)->status != VK_SUCCESS))             \
++      break;                                            \
+    uint32_t *p = (cs)->cur;                               \
+    __ONE_REG( 0, regs);                                 \
+    __ONE_REG( 1, regs);                                 \
+@@ -678,6 +740,10 @@ struct tu_pkt {
+        : cs(cs), pkt(pkt)
+    {
+       tu_cs_reserve(cs, ndwords + 1);
++      if (unlikely(cs->status != VK_SUCCESS)) {
++         this->cs = NULL;
++         return;
++      }
+       start = cs->cur;
+       cs->cur++; /* Leave a slot for the packet header when we're done. */
+       assert(!cs->pkt);
+@@ -702,12 +768,14 @@ struct tu_pkt {
+ 
+    void append(uint32_t value)
+    {
+-      tu_cs_emit(cs, value);
++      if (cs)
++         tu_cs_emit(cs, value);
+    }
+ 
+    void append(const uint32_t *dwords, uint32_t sizedwords)
+    {
+-      tu_cs_emit_array(cs, dwords, sizedwords);
++      if (cs)
++         tu_cs_emit_array(cs, dwords, sizedwords);
+    }
+ 
+  public:
+@@ -725,6 +793,12 @@ struct tu_pkt {
+       assert(start);
+       assert(cs->pkt == this);
+ 
++      if (unlikely(cs->status != VK_SUCCESS)) {
++         cs->pkt = NULL;
++         cs = NULL;
++         return;
++      }
++
+       unsigned cnt = cs->cur - start - 1;
+ 
+       if (skip_empty && !cnt) {
+diff --git a/src/freedreno/vulkan/tu_device.cc b/src/freedreno/vulkan/tu_device.cc
+index 3b512f8..b5933c1 100644
+--- a/src/freedreno/vulkan/tu_device.cc
++++ b/src/freedreno/vulkan/tu_device.cc
+@@ -2665,7 +2665,9 @@ static VkResult
+ tu_init_cmdbuf_start_a725_quirk(struct tu_device *device)
+ {
+    struct tu_cs shader_cs;
+-   tu_cs_begin_sub_stream(&device->sub_cs, 10, &shader_cs);
++   VkResult result = tu_cs_begin_sub_stream(&device->sub_cs, 10, &shader_cs);
++   if (result != VK_SUCCESS)
++      return result;
+ 
+    uint32_t raw_shader[] = {
+       0x00040000, 0x40600000, // mul.f hr0.x, hr0.x, hr1.x
+@@ -2677,10 +2679,15 @@ tu_init_cmdbuf_start_a725_quirk(struct tu_device *device)
+ 
+    tu_cs_emit_array(&shader_cs, raw_shader, ARRAY_SIZE(raw_shader));
+    struct tu_cs_entry shader_entry = tu_cs_end_sub_stream(&device->sub_cs, &shader_cs);
++   if (!shader_entry.bo)
++      return tu_cs_get_status(&device->sub_cs);
++
+    uint64_t shader_iova = shader_entry.bo->iova + shader_entry.offset;
+ 
+    struct tu_cs sub_cs;
+-   tu_cs_begin_sub_stream(&device->sub_cs, 47, &sub_cs);
++   result = tu_cs_begin_sub_stream(&device->sub_cs, 47, &sub_cs);
++   if (result != VK_SUCCESS)
++      return result;
+ 
+    tu_cs_emit_regs(&sub_cs, SP_UPDATE_CNTL(A7XX,
+             .vs_state = true, .hs_state = true, .ds_state = true,
+@@ -2746,7 +2753,7 @@ tu_init_cmdbuf_start_a725_quirk(struct tu_device *device)
+    device->cmdbuf_start_a725_quirk_entry =
+       tu_cs_end_sub_stream(&device->sub_cs, &sub_cs);
+ 
+-   return VK_SUCCESS;
++   return tu_cs_get_status(&device->sub_cs);
+ }
+ 
+ static VkResult
+diff --git a/src/freedreno/vulkan/tu_pipeline.cc b/src/freedreno/vulkan/tu_pipeline.cc
+index dba43f9..f0f2d42 100644
+--- a/src/freedreno/vulkan/tu_pipeline.cc
++++ b/src/freedreno/vulkan/tu_pipeline.cc
+@@ -4583,6 +4583,13 @@ tu_pipeline_builder_build(struct tu_pipeline_builder *builder,
+ 
+    tu_pipeline_builder_emit_state<CHIP>(builder, *pipeline);
+ 
++   result = tu_cs_get_status(&(*pipeline)->cs);
++   if (result != VK_SUCCESS) {
++      tu_pipeline_finish(*pipeline, builder->device, builder->alloc);
++      vk_object_free(&builder->device->vk, builder->alloc, *pipeline);
++      return result;
++   }
++
+    if ((*pipeline)->type == TU_PIPELINE_GRAPHICS_LIB) {
+       struct tu_graphics_lib_pipeline *library =
+          tu_pipeline_to_graphics_lib(*pipeline);
+@@ -5033,6 +5040,15 @@ tu_compute_pipeline_create(VkDevice device,
+ 
+    if (CHIP == A6XX) {
+       tu6_emit_load_state(dev, &pipeline->base, layout);
++      result = tu_cs_get_status(&pipeline->base.cs);
++      if (result != VK_SUCCESS) {
++         tu_cs_finish(&pipeline->base.cs);
++         TU_RMV(resource_destroy, dev, &pipeline->base.bo);
++         mtx_lock(&dev->pipeline_mutex);
++         tu_suballoc_bo_free(&dev->pipeline_suballoc, &pipeline->base.bo);
++         mtx_unlock(&dev->pipeline_mutex);
++         goto fail;
++      }
+    }
+ 
+    tu_append_executable(&pipeline->base, v, nir_initial_disasm);
+diff --git a/src/freedreno/vulkan/tu_queue.cc b/src/freedreno/vulkan/tu_queue.cc
+index e06cd57..dd739d7 100644
+--- a/src/freedreno/vulkan/tu_queue.cc
++++ b/src/freedreno/vulkan/tu_queue.cc
+@@ -111,9 +111,13 @@ get_vis_stream_patchpoint_cs(struct tu_cmd_buffer *cmd,
+                           patchpoint_cs) {
+       uint32_t *fence = (uint32_t *)patchpoint_cs->fence_bo.bo->map;
+       if (*fence == 1) {
+-         *fence = 0;
+          tu_cs_init_suballoc(cs, cmd->device, &patchpoint_cs->cs_bo);
+-         tu_cs_begin_sub_stream(cs, cs_size, sub_cs);
++         VkResult result = tu_cs_begin_sub_stream(cs, cs_size, sub_cs);
++         if (result != VK_SUCCESS) {
++            tu_cs_finish(cs);
++            return result;
++         }
++         *fence = 0;
+          *fence_iova = patchpoint_cs->fence_bo.iova;
+          return VK_SUCCESS;
+       }
+@@ -146,10 +150,17 @@ get_vis_stream_patchpoint_cs(struct tu_cmd_buffer *cmd,
+ 
+    mtx_unlock(&cmd->device->vis_stream_suballocator_mtx);
+ 
+-   util_dynarray_append(&cmd->vis_stream_cs_bos, patchpoint_cs);
+-
+    tu_cs_init_suballoc(cs, cmd->device, &patchpoint_cs.cs_bo);
+-   tu_cs_begin_sub_stream(cs, cs_size, sub_cs);
++   result = tu_cs_begin_sub_stream(cs, cs_size, sub_cs);
++   if (result != VK_SUCCESS) {
++      tu_cs_finish(cs);
++      mtx_lock(&cmd->device->vis_stream_suballocator_mtx);
++      tu_suballoc_bo_free(&cmd->device->vis_stream_suballocator, &patchpoint_cs.fence_bo);
++      tu_suballoc_bo_free(&cmd->device->vis_stream_suballocator, &patchpoint_cs.cs_bo);
++      mtx_unlock(&cmd->device->vis_stream_suballocator_mtx);
++      return result;
++   }
++   util_dynarray_append(&cmd->vis_stream_cs_bos, patchpoint_cs);
+    *fence_iova = patchpoint_cs.fence_bo.iova;
+ 
+    return VK_SUCCESS;
+@@ -285,6 +296,11 @@ resolve_vis_stream_patchpoints(struct tu_queue *queue,
+          tu_cs_emit(&sub_cs, 1);
+ 
+          struct tu_cs_entry entry = tu_cs_end_sub_stream(&cs, &sub_cs);
++         if (!entry.bo) {
++            VkResult error = tu_cs_get_status(&cs);
++            tu_cs_finish(&cs);
++            return error == VK_SUCCESS ? VK_ERROR_OUT_OF_HOST_MEMORY : error;
++         }
+          submit_add_entries(queue->device, submit, dump_cmds, &entry, 1);
+       }
+ 
+@@ -441,8 +457,10 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
+ 
+    VkResult result =
+       tu_insert_dynamic_cmdbufs(device, &cmd_buffers, &cmdbuf_count);
+-   if (result != VK_SUCCESS)
++   if (result != VK_SUCCESS) {
++      pthread_mutex_unlock(&device->submit_mutex);
+       return result;
++   }
+ 
+    bool has_trace_points = false;
+    static_assert(offsetof(struct tu_cmd_buffer, vk) == 0,
+@@ -453,21 +471,30 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
+    }
+ 
+    struct tu_u_trace_submission_data *u_trace_submission_data = NULL;
++   void *submit = NULL;
+ 
+-   void *submit = tu_submit_create(device);
+-   if (!submit)
+-      goto fail_create_submit;
++   for (unsigned i = 0; i < cmdbuf_count; i++) {
++      result = tu_cs_get_status(&cmd_buffers[i]->cs);
++      if (result != VK_SUCCESS)
++         goto fail_before_submit;
++   }
++
++   submit = tu_submit_create(device);
++   if (!submit) {
++      result = VK_ERROR_OUT_OF_HOST_MEMORY;
++      goto fail_before_submit;
++   }
+ 
+    result = resolve_vis_stream_patchpoints(queue, submit, &dump_cmds,
+                                            cmd_buffers, cmdbuf_count);
+    if (result != VK_SUCCESS)
+-      goto out;
++      goto fail_before_submit;
+ 
+    result = resolve_cb_control_patchpoints(queue, submit, &dump_cmds,
+                                            cmd_buffers, cmdbuf_count);
+ 
+    if (result != VK_SUCCESS)
+-      goto out;
++      goto fail_before_submit;
+ 
+    if (has_trace_points) {
+       tu_u_trace_submission_data_create(
+@@ -594,13 +621,18 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
+    u_trace_context_process(&device->trace_context, false);
+ 
+ out:
+-   tu_submit_finish(device, submit);
++   if (submit)
++      tu_submit_finish(device, submit);
+ 
+-fail_create_submit:
+    if (cmd_buffers != (struct tu_cmd_buffer **) vk_submit->command_buffers)
+       vk_free(&queue->device->vk.alloc, cmd_buffers);
+ 
+    return result;
++
++fail_before_submit:
++   util_dynarray_fini(&dump_cmds);
++   pthread_mutex_unlock(&device->submit_mutex);
++   goto out;
+ }
+ 
+ VkResult
+diff --git a/src/freedreno/vulkan/tu_shader.cc b/src/freedreno/vulkan/tu_shader.cc
+index 8c228e9..b37d584 100644
+--- a/src/freedreno/vulkan/tu_shader.cc
++++ b/src/freedreno/vulkan/tu_shader.cc
+@@ -2914,7 +2914,8 @@ tu_upload_variant(struct tu_cs *cs,
+     * and total size is always aligned correctly
+     * note: an assert in tu6_emit_xs_config validates the alignment
+     */
+-   tu_cs_alloc(cs, variant->info.size / 4, 1, &memory);
++   if (tu_cs_alloc(cs, variant->info.size / 4, 1, &memory) != VK_SUCCESS)
++      return 0;
+ 
+    memcpy(memory.map, variant->bin, variant->info.size);
+    return memory.iova;
+@@ -3058,7 +3059,24 @@ tu_upload_shader(struct tu_device *dev,
+       }
+    }
+ 
+-   return VK_SUCCESS;
++   result = tu_cs_get_status(&shader->cs);
++   if (result != VK_SUCCESS) {
++      tu_cs_finish(&shader->cs);
++      TU_RMV(resource_destroy, dev, &shader->bo);
++
++      pthread_mutex_lock(&dev->pipeline_mutex);
++      tu_suballoc_bo_free(&dev->pipeline_suballoc, &shader->bo);
++      shader->bo = {};
++      pthread_mutex_unlock(&dev->pipeline_mutex);
++
++      if (shader->pvtmem_bo) {
++         tu_bo_finish(dev, shader->pvtmem_bo);
++         shader->pvtmem_bo = NULL;
++      }
++      memset(&shader->cs, 0, sizeof(shader->cs));
++   }
++
++   return result;
+ }
+ 
+ static bool

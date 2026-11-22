@@ -130,7 +130,7 @@
       "repository": "device",
       "path": "board.toml",
       "before_sha256": "88b824800753cc7e79ae9dcd4ea4c92f351228126a3147dfc0ee81de0382e8b2",
-      "sha256": "fa2e4435c138e68c0e44d40c8214d76cd59951047ff0912f80d75f4ab5480b46"
+      "sha256": "0d032fd49febd7816e1af38367d1ef2f34f47119e30992e1833cb98ba7f1b538"
     },
     "device/drivers/ShengHidInput/NativeHidInput.cpp": {
       "repository": "device/drivers/ShengHidInput",
@@ -430,7 +430,7 @@
       "repository": "UniXNU",
       "path": "scripts/data/adreno-compiler-inputs.json",
       "before_sha256": "add783c19b56cf439470d84640ddc4c14ef8336b12e89c519d6cbc43d53869bb",
-      "sha256": "4070de3f6f71720443e8dde8138e57e51249fd24f95ce1fe72b64601eafb7f11"
+      "sha256": "9955619de1d3217c5823b28e02659c63c9b8fda135c97f437ea4f79fd431701a"
     },
     "UniXNU/patches/mesa/turnip-gmem-interior-blit.patch": {
       "repository": "UniXNU",
@@ -484,7 +484,7 @@
       "repository": "device",
       "path": "patches/xnu-12377/series",
       "before_sha256": "15d08ffeafa1d29ece607e4f2913c80cb1f403442b0a0cbf9625f8d60a2d2953",
-      "sha256": "7ecc3dee1e8591d3f66cdd776679d0b05cc70732e34225a9fa6081f4713de097"
+      "sha256": "0d839d9ded71579d791ac8d23f480eea7c3142cb00bbc99851394bedd7fd1a1b"
     },
     "device/patches/xnu-12377/sheng-frame-ipc-trace.patch": {
       "repository": "device",
@@ -544,7 +544,7 @@
       "repository": "UniXNU",
       "path": "scripts/build-boot-runtime.py",
       "before_sha256": "a3d15831a8e70308dadac39a82701488f63b760352511245b4d551413a5115b6",
-      "sha256": "60a3dc69641b56207b89e4267a5c10e9f44f937370c945c1ba7f70842a1514c8"
+      "sha256": "6d83701039429035dd0f958c44ef4fd86871a9aac4a61cc36b3ec4fabf0f0686"
     },
     "UniXNU/drivers/Adreno740/NativeAdrenoRingLog.h": {
       "repository": "UniXNU/drivers/Adreno740",
@@ -575,6 +575,18 @@
       "path": "patches/xnu-12377/sheng-timezone-lstat-diag.patch",
       "before_sha256": null,
       "sha256": "8b6933035d06928f6a1635e2c838ce3b6a4344c62cac9c95200b577fb287a97a"
+    },
+    "UniXNU/patches/mesa/turnip-command-stream-status.patch": {
+      "repository": "UniXNU",
+      "path": "patches/mesa/turnip-command-stream-status.patch",
+      "before_sha256": null,
+      "sha256": "def5ea677230368f514cbfd613fc72a08397723dd4d5d74486158533357080db"
+    },
+    "device/patches/xnu-12377/sheng-audio-single-copy.patch": {
+      "repository": "device",
+      "path": "patches/xnu-12377/sheng-audio-single-copy.patch",
+      "before_sha256": null,
+      "sha256": "6eee84e0e38417e6715867aa6a05827a8018ab5375c7243e159cce1a92458336"
     }
   },
   "candidate_version": "V6.3",

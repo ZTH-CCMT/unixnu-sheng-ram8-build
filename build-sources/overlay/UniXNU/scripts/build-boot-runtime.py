@@ -259,6 +259,13 @@ def main():
     addon = Path(request['gpu_addon']) if request.get('gpu_addon') else None
     trust = Path(request['trust_cache']) if request.get('trust_cache') else None
     want_addon = request.get('gpu_addon_enabled', True)
+    audio_addon_directory = request.get('audio_addon_directory', 'audio')
+    system_audio_plugins = request.get('audio_system_plugins', ())
+    if audio_addon_directory != 'audio' and (
+        audio_addon_directory != 'audio24A446' or request['target'] != 'ios27'
+        or request['build'] != '24A446' or system_audio_plugins
+    ):
+        raise SystemExit('single-copy audio overlay requires the 24A446 profile and sealed system plugins')
     with tempfile.TemporaryDirectory(prefix='prepare-', dir=out) as td:
         work = Path(td)
         if not seed.is_file() or (addon is None and want_addon):
@@ -291,11 +298,12 @@ def main():
                         run(sys.executable, Path(request['device']) / request['audio_tool'], audio, request['audio_target'])
                         combined = work / 'combined.bin'
                         # macOS: the audio server's own driver directory on Data (Library/ files of the addon).
-                        prefix = ('Library/Audio/Plug-Ins/HAL' if request['target'] == 'macos27' else 'audio')
+                        prefix = ('Library/Audio/Plug-Ins/HAL'
+                                  if request['target'] == 'macos27' else audio_addon_directory)
                         bundles = [f'{prefix}/ShengAudio.driver', audio / 'ShengAudio.driver']
-                        # The overlay hides the system's plug-in directory from the audio server's listing,
-                        # so a system plug-in the board needs is listed by carrying its unchanged bundle.
-                        for name in request.get('audio_system_plugins', []):
+                        # Some profiles need a carried system bundle. 24A446 enumerates the sealed lower
+                        # directory, so including a second copy would expose the same bundle twice.
+                        for name in system_audio_plugins:
                             bundles += [f'audio/{name}', Path(mount) / 'System/Library/Audio/Plug-Ins/HAL' / name]
                         script('addon-add-dir.py', candidate, combined, *bundles)
                         candidate = combined

@@ -1,0 +1,24 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -8995,9 +8995,17 @@ native_gpu_addon_prepare(proc_t p, user_addr_t scratch)
+ 	    "7570.iPadOS_17_Floating-1032w-1376h@2x~ipad.ca/Red-Light.png", &native_gpu_addon5_stage, &native_gpu_addon5_status);
+ 	/* The board's audio server plug-in next to the system's (the audio server loads every driver bundle in this directory). */
+-	static const char audio_source[] = "/private/var/ngpu/audio", audio_point[] = "/System/Library/Audio/Plug-Ins/HAL";
+-	native_gpu_addon_mount(p, scratch, 0xa00, audio_source, sizeof(audio_source), audio_point, sizeof(audio_point),
+-	    "/System/Library/Audio/Plug-Ins/HAL/BuiltinAudioPlugin.driver", "/System/Library/Audio/Plug-Ins/HAL/ShengAudio.driver/Info.plist",
++	static const char audio_point[] = "/System/Library/Audio/Plug-Ins/HAL";
++	uint32_t audio_single_copy = 0;
++	bool sealed_audio = PE_parse_boot_argn("audio-single-copy", &audio_single_copy, sizeof(audio_single_copy)) &&
++	    audio_single_copy == 1;
++	/* A new upper directory keeps old addon copies on Data out of the HAL view. */
++	const char *audio_source = sealed_audio ? "/private/var/ngpu/audio24A446" : "/private/var/ngpu/audio";
++	const char *audio_native = sealed_audio ?
++	    "/System/Library/Audio/Plug-Ins/HAL/BTAudioHALPlugin.driver/Info.plist" :
++	    "/System/Library/Audio/Plug-Ins/HAL/BuiltinAudioPlugin.driver";
++	native_gpu_addon_mount(p, scratch, 0xa00, audio_source, strlen(audio_source) + 1, audio_point, sizeof(audio_point),
++	    audio_native, "/System/Library/Audio/Plug-Ins/HAL/ShengAudio.driver/Info.plist",
+ 	    &native_gpu_addon4_stage, &native_gpu_addon4_status);
+ 	/* iPadOS 27 imports jobs from this precompiled dictionary. The owner
+ 	 * overlay adds its Wi-Fi job while retaining every original entry. */
+ 	static const char wifi_xpc_source[] = "/private/var/ngpu/xpc";
