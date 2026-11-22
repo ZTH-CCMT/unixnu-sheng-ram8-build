@@ -1,10 +1,10 @@
 name: UniXNU sheng iPadOS 27 RAM 8 GiB
-run-name: "Driver first batch (Turnip and audio)"
+run-name: "#57 Backlight wake A/B"
 
 on:
   workflow_dispatch:
   push:
-    branches: [ram8-first-batch-20261122]
+    branches: [ram8-57-backlight-ab-20261122]
 
 permissions:
   contents: read
@@ -113,7 +113,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: 53-timezone-build-failure-${{ github.run_id }}-${{ github.run_attempt }}
+          name: 57-backlight-ab-build-failure-${{ github.run_id }}-${{ github.run_attempt }}
           path: build-failure-logs/
           if-no-files-found: warn
           retention-days: 7
@@ -135,7 +135,7 @@ jobs:
       - name: Upload verified generic boot handoff
         uses: actions/upload-artifact@v4
         with:
-          name: os27-ram8-53-timezone-handoff-${{ github.run_id }}-${{ github.run_attempt }}
+          name: os27-ram8-57-backlight-ab-handoff-${{ github.run_id }}-${{ github.run_attempt }}
           path: os27-ram8-handoff/
           include-hidden-files: true
           if-no-files-found: error

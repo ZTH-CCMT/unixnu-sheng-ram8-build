@@ -296,6 +296,7 @@ extern volatile uint32_t native_touch_edge_stats[4] __attribute__((weak_import))
 extern volatile uint32_t native_touch_edge_install[3] __attribute__((weak_import));
 extern volatile uint32_t native_touch_hid_multi[3] __attribute__((weak_import));
 extern volatile int32_t native_backlight_request[6] __attribute__((weak_import));
+extern volatile int32_t native_backlight_ab[8] __attribute__((weak_import));
 extern volatile uint32_t native_usb_stats[54] __attribute__((weak_import));
 extern volatile uint64_t native_adreno_reassert_ticks __attribute__((weak_import));
 extern volatile uint64_t native_adreno_cache_stats[5] __attribute__((weak_import));
@@ -845,6 +846,15 @@ static size_t compose(char *out, size_t cap, uint32_t slot, unsigned now) {
     snprintf(row, sizeof row, "L2 ia=%d ib=%d mode=%d to=%d tries=%d done=%d", native_backlight_stats[10], native_backlight_stats[11],
              native_backlight_stats[12], native_backlight_stats[13], native_backlight_stats[14], native_backlight_stats[15]);
     at = put(out, at, cap, row, sizeof row);
+    if (&native_backlight_ab) {
+      // The last key kind: 0 absent, 1 nits number, 2 legacy number, 3 nits data, 4 legacy data, 5 another type.
+      snprintf(row, sizeof row, "L3 calls=%d miss=%d kind=%d acc=%d keep=%d pub=%d published=%d skip=%d",
+               __atomic_load_n(&native_backlight_ab[0], __ATOMIC_RELAXED), __atomic_load_n(&native_backlight_ab[1], __ATOMIC_RELAXED),
+               __atomic_load_n(&native_backlight_ab[2], __ATOMIC_RELAXED), __atomic_load_n(&native_backlight_ab[3], __ATOMIC_RELAXED),
+               __atomic_load_n(&native_backlight_ab[4], __ATOMIC_RELAXED), __atomic_load_n(&native_backlight_ab[5], __ATOMIC_RELAXED),
+               __atomic_load_n(&native_backlight_ab[6], __ATOMIC_RELAXED), __atomic_load_n(&native_backlight_ab[7], __ATOMIC_RELAXED));
+      at = put(out, at, cap, row, sizeof row);
+    }
   }
   if (&boot_progress_ext_wide)
     for (unsigned i = 0; i < 2; ++i) {char row[120]; snprintf(row, sizeof row, "W%u %.111s", i, boot_progress_ext_wide[i]); at = put(out, at, cap, row, sizeof row);}

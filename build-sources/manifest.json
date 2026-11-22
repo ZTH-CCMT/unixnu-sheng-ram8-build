@@ -130,7 +130,7 @@
       "repository": "device",
       "path": "board.toml",
       "before_sha256": "88b824800753cc7e79ae9dcd4ea4c92f351228126a3147dfc0ee81de0382e8b2",
-      "sha256": "0d032fd49febd7816e1af38367d1ef2f34f47119e30992e1833cb98ba7f1b538"
+      "sha256": "5b4a1e5651bc8d3bae4eb16028df8677c9ebb5b73c586280cd79a1d3a699c34e"
     },
     "device/drivers/ShengHidInput/NativeHidInput.cpp": {
       "repository": "device/drivers/ShengHidInput",
@@ -238,7 +238,7 @@
       "repository": "device",
       "path": "package/BootLog.c",
       "before_sha256": "5c880128ff6bd54d60dec13cd9b18acb47d2d801ebfa6aac920b308d74f238c2",
-      "sha256": "05020eea0b9f4f91c248e7df565df96b9f1822f1110a538003981ff88af1b389"
+      "sha256": "683b9ca5bbf7c38c74b88d05cf057674e2a7b1d6c95f8708c0c2701c098090ac"
     },
     "device/package/LegacyDisplayProbe.cpp": {
       "repository": "device",
@@ -587,6 +587,12 @@
       "path": "patches/xnu-12377/sheng-audio-single-copy.patch",
       "before_sha256": null,
       "sha256": "6eee84e0e38417e6715867aa6a05827a8018ab5375c7243e159cce1a92458336"
+    },
+    "device/package/AppleARMBacklight.cpp": {
+      "repository": "device",
+      "path": "package/AppleARMBacklight.cpp",
+      "before_sha256": "6036394e5e8fb6fbe9bf8c365834626f97d99c249ae1b87fb6db7fabaa8d1ebb",
+      "sha256": "18e65b6980c40c13179455880d67145bb4721277812ac5285f283f425674a5cf"
     }
   },
   "candidate_version": "V6.3",
