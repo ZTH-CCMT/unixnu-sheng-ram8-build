@@ -580,7 +580,7 @@
       "repository": "UniXNU",
       "path": "patches/mesa/turnip-command-stream-status.patch",
       "before_sha256": null,
-      "sha256": "def5ea677230368f514cbfd613fc72a08397723dd4d5d74486158533357080db"
+      "sha256": "8e85e2d4d0e37848029273347507e6e0faa0285fda4e2ac0d167f80f304fa308"
     },
     "device/patches/xnu-12377/sheng-audio-single-copy.patch": {
       "repository": "device",

@@ -1,5 +1,5 @@
 diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
-index d6f573f..56ec121 100644
+index d6f573f..f0a4a86 100644
 --- a/src/freedreno/vulkan/tu_cmd_buffer.cc
 +++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
 @@ -267,6 +267,9 @@ static void
@@ -40,15 +40,16 @@ index d6f573f..56ec121 100644
           break;
        default:
           break;
-@@ -5360,6 +5370,18 @@ tu_EndCommandBuffer(VkCommandBuffer commandBuffer)
+@@ -5360,6 +5370,19 @@ tu_EndCommandBuffer(VkCommandBuffer commandBuffer)
     tu_cs_end(&cmd_buffer->draw_cs);
     tu_cs_end(&cmd_buffer->draw_epilogue_cs);
  
-+   for (const struct tu_cs *cs : { &cmd_buffer->cs, &cmd_buffer->draw_cs,
-+                                    &cmd_buffer->draw_epilogue_cs,
-+                                    &cmd_buffer->tile_store_cs, &cmd_buffer->sub_cs,
-+                                    &cmd_buffer->pre_chain.draw_cs,
-+                                    &cmd_buffer->pre_chain.draw_epilogue_cs }) {
++   const struct tu_cs *streams[] = {
++      &cmd_buffer->cs, &cmd_buffer->draw_cs, &cmd_buffer->draw_epilogue_cs,
++      &cmd_buffer->tile_store_cs, &cmd_buffer->sub_cs,
++      &cmd_buffer->pre_chain.draw_cs, &cmd_buffer->pre_chain.draw_epilogue_cs,
++   };
++   for (const struct tu_cs *cs : streams) {
 +      VkResult result = tu_cs_get_status(cs);
 +      if (result != VK_SUCCESS) {
 +         vk_command_buffer_set_error(&cmd_buffer->vk, result);
@@ -59,7 +60,7 @@ index d6f573f..56ec121 100644
     return vk_command_buffer_end(&cmd_buffer->vk);
  }
  TU_GENX(tu_EndCommandBuffer);
-@@ -7773,7 +7795,11 @@ tu_emit_consts(struct tu_cmd_buffer *cmd, bool compute)
+@@ -7773,7 +7796,11 @@ tu_emit_consts(struct tu_cmd_buffer *cmd, bool compute)
        return (struct tu_draw_state) {};
  
     struct tu_cs cs;
@@ -67,12 +68,12 @@ index d6f573f..56ec121 100644
 +   VkResult result = tu_cs_begin_sub_stream(&cmd->sub_cs, dwords, &cs);
 +   if (result != VK_SUCCESS) {
 +      vk_command_buffer_set_error(&cmd->vk, result);
-+      return;
++      return (struct tu_draw_state) {};
 +   }
  
     if (shared_consts->type == IR3_PUSH_CONSTS_SHARED) {
        tu6_emit_shared_consts(&cs, shared_consts, cmd->push_constants, compute);
-@@ -8768,8 +8794,7 @@ tu6_emit_vs_params(struct tu_cmd_buffer *cmd,
+@@ -8768,8 +8795,7 @@ tu6_emit_vs_params(struct tu_cmd_buffer *cmd,
     cmd->state.last_vs_params.draw_id = draw_id;
     cmd->state.last_vs_params.empty = false;
  
