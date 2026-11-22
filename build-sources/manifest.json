@@ -130,7 +130,7 @@
       "repository": "device",
       "path": "board.toml",
       "before_sha256": "88b824800753cc7e79ae9dcd4ea4c92f351228126a3147dfc0ee81de0382e8b2",
-      "sha256": "ab42f37a61df4e6bbe141df51b4602314cda889d34647b6232999f20da66dedc"
+      "sha256": "fa2e4435c138e68c0e44d40c8214d76cd59951047ff0912f80d75f4ab5480b46"
     },
     "device/drivers/ShengHidInput/NativeHidInput.cpp": {
       "repository": "device/drivers/ShengHidInput",

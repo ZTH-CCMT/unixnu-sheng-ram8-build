@@ -1,10 +1,10 @@
-name: UniXNU sheng iPadOS 27 RAM 8 GiB V6.3 Touch
-run-name: "#53 Timezone CPU Trace"
+name: UniXNU sheng iPadOS 27 RAM 8 GiB
+run-name: "Driver first batch (Turnip and audio)"
 
 on:
   workflow_dispatch:
   push:
-    branches: [ram8-53-timezone-diag]
+    branches: [ram8-first-batch-20261122]
 
 permissions:
   contents: read
@@ -52,6 +52,7 @@ jobs:
       - name: Apply verified local source overlay
         run: |
           python3 pipeline/ci/materialize.py --top "$GITHUB_WORKSPACE"
+          python3 pipeline/ci/check_text_fixup_profiles.py --top "$GITHUB_WORKSPACE"
           python3 -B -m unittest discover -s UniXNU/kits/XnuPrelink -p 'test_*.py'
           python3 pipeline/ci/check_adreno_preemption.py UniXNU/drivers/Adreno740
           python3 pipeline/ci/test_fetch_adreno_inputs.py
